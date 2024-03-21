@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SizedSample, Stream, StreamConfig};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -86,8 +87,7 @@ fn main() -> Result<()> {
 
             let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
             let addr = format!("0.0.0.0:{}", cmd.src_port);
-            let addr = addr.parse().expect("Failed to parse address");
-            let addr = SocketAddr::new(addr, cmd.src_port);
+            let addr = SocketAddr::from_str(&addr).expect("Invalid address");
             let listener = Arc::new(UdpSocket::bind(addr)?);
 
             println!("Waiting for a client to start sending audio data...");
@@ -99,14 +99,6 @@ fn main() -> Result<()> {
                 "Received {} bytes from {}, starting to send audio data...",
                 len, client_addr
             );
-            // match listener_for_client.recv_from(&mut buf) {
-            //     Ok((_, src_addr)) => {
-            //         println!("Connection established with {}", src_addr);
-            //         let mut client_addr = client_addr_for_thread.lock().unwrap();
-            //         *client_addr = Some(src_addr);
-            //     }
-            //     Err(e) => println!("Error receiving: {}", e),
-            // }
             let stream = match sample_format {
                 cpal::SampleFormat::I8 => {
                     get_stream::<i8, _>(listener, client_addr, &config.into(), device, err_fn)
@@ -140,8 +132,12 @@ fn main() -> Result<()> {
         Commands::Connect(cmd) => {
             let target_ip = SocketAddr::new(cmd.ip.into(), cmd.dest_port);
             let socket = UdpSocket::bind(format!("0.0.0.0:{}", cmd.dest_port))?;
+
             socket.connect(target_ip)?;
-            println!("Connecting to {}...", target_ip);
+
+            println!("Sending initial message to {}...", target_ip);
+            socket.send_to(b"Hello", target_ip)?;
+
             let mut buf = [0u8; 1024];
             loop {
                 let (len, addr) = socket.recv_from(&mut buf)?;
