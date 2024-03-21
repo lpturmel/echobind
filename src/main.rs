@@ -1,9 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SizedSample, Stream, StreamConfig};
+use cpal::{Device, FromSample, SizedSample, Stream, StreamConfig};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 enum Error {
@@ -81,8 +81,6 @@ fn main() -> Result<()> {
             let device = host.default_input_device().ok_or(Error::NotAudioDevice)?;
             let config = device.default_input_config()?;
             let sample_format = config.sample_format();
-            // let sample_rate = config.sample_rate();
-            // let channels = config.channels();
             println!("Recording on port {}", cmd.src_port);
 
             let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
@@ -100,24 +98,48 @@ fn main() -> Result<()> {
                 len, client_addr
             );
             let stream = match sample_format {
-                cpal::SampleFormat::I8 => {
-                    get_stream::<i8, _>(listener, client_addr, &config.into(), device, err_fn)
-                }
-                cpal::SampleFormat::I16 => {
-                    get_stream::<i16, _>(listener, client_addr, &config.into(), device, err_fn)
-                }
-                cpal::SampleFormat::I32 => {
-                    get_stream::<i32, _>(listener, client_addr, &config.into(), device, err_fn)
-                }
-                cpal::SampleFormat::I64 => {
-                    get_stream::<i64, _>(listener, client_addr, &config.into(), device, err_fn)
-                }
-                cpal::SampleFormat::F32 => {
-                    get_stream::<f32, _>(listener, client_addr, &config.into(), device, err_fn)
-                }
-                cpal::SampleFormat::F64 => {
-                    get_stream::<f64, _>(listener, client_addr, &config.into(), device, err_fn)
-                }
+                cpal::SampleFormat::I8 => create_input_stream::<i8, _>(
+                    listener,
+                    client_addr,
+                    &config.into(),
+                    device,
+                    err_fn,
+                ),
+                cpal::SampleFormat::I16 => create_input_stream::<i16, _>(
+                    listener,
+                    client_addr,
+                    &config.into(),
+                    device,
+                    err_fn,
+                ),
+                cpal::SampleFormat::I32 => create_input_stream::<i32, _>(
+                    listener,
+                    client_addr,
+                    &config.into(),
+                    device,
+                    err_fn,
+                ),
+                cpal::SampleFormat::I64 => create_input_stream::<i64, _>(
+                    listener,
+                    client_addr,
+                    &config.into(),
+                    device,
+                    err_fn,
+                ),
+                cpal::SampleFormat::F32 => create_input_stream::<f32, _>(
+                    listener,
+                    client_addr,
+                    &config.into(),
+                    device,
+                    err_fn,
+                ),
+                cpal::SampleFormat::F64 => create_input_stream::<f64, _>(
+                    listener,
+                    client_addr,
+                    &config.into(),
+                    device,
+                    err_fn,
+                ),
                 sample_format => {
                     return Err(Error::UnsupportedSampleFormat(sample_format));
                 }
@@ -130,6 +152,11 @@ fn main() -> Result<()> {
             }
         }
         Commands::Connect(cmd) => {
+            let host = cpal::default_host();
+            let device = host.default_output_device().ok_or(Error::NotAudioDevice)?;
+            let config = device.default_output_config()?;
+            let sample_format = config.sample_format();
+
             let target_ip = SocketAddr::new(cmd.ip.into(), cmd.dest_port);
             let socket = UdpSocket::bind(format!("0.0.0.0:{}", cmd.dest_port))?;
 
@@ -138,16 +165,92 @@ fn main() -> Result<()> {
             println!("Sending initial message to {}...", target_ip);
             socket.send_to(b"Hello", target_ip)?;
 
-            let mut buf = [0u8; 1024];
-            loop {
-                let (len, addr) = socket.recv_from(&mut buf)?;
-                println!("Received {} bytes from {}", len, addr);
+            match sample_format {
+                cpal::SampleFormat::I8 => {
+                    run::<i8>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::I16 => {
+                    run::<i16>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::I32 => {
+                    run::<i32>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::I64 => {
+                    run::<i64>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::U8 => {
+                    run::<u8>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::U16 => {
+                    run::<u16>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::U32 => {
+                    run::<u32>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::U64 => {
+                    run::<u64>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::F32 => {
+                    run::<f32>(&device, &config.into(), &socket)?;
+                }
+                cpal::SampleFormat::F64 => {
+                    run::<f64>(&device, &config.into(), &socket)?;
+                }
+                _ => return Err(Error::UnsupportedSampleFormat(sample_format)),
             }
+            Ok(())
         }
     }
 }
 
-fn get_stream<I, F>(
+fn run<T>(device: &cpal::Device, config: &StreamConfig, socket: &UdpSocket) -> Result<()>
+where
+    T: cpal::SizedSample + FromSample<f32> + Send + 'static,
+{
+    println!("Processing T: {:?}", std::any::type_name::<T>());
+    let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+
+    let socket = socket.try_clone().expect("Failed to clone socket");
+    let socket = Arc::new(Mutex::new(socket));
+    let channels = config.channels as usize;
+
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            let socket_lock = socket.lock().unwrap();
+            let mut buf = vec![0u8; std::mem::size_of_val(data)];
+            match socket_lock.recv(&mut buf) {
+                Ok(size) => {
+                    let received_bytes = &buf[..size];
+                    for (sample_chunk, output_frame) in received_bytes
+                        .chunks_exact(std::mem::size_of::<T>())
+                        .zip(data.chunks_mut(channels))
+                    {
+                        let sample = T::from_sample(f32::from_ne_bytes(
+                            sample_chunk.try_into().expect("Invalid sample size"),
+                        ));
+                        for out in output_frame.iter_mut() {
+                            *out = sample;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Socket receive error: {}", e);
+                }
+            }
+        },
+        err_fn,
+        None,
+    )?;
+
+    stream.play()?;
+
+    // Keep the thread alive. You might want to handle this differently, depending on your app structure.
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+    }
+}
+fn create_input_stream<I, F>(
     socket: Arc<UdpSocket>,
     client_addr: SocketAddr,
     config: &StreamConfig,
@@ -158,6 +261,10 @@ where
     F: FnMut(cpal::StreamError) + Send + 'static,
     I: SizedSample + ByteRep,
 {
+    println!(
+        "Creating input stream in Sample Format: {:?}",
+        std::any::type_name::<I>()
+    );
     device.build_input_stream(
         config,
         move |data: &[I], _: &_| {
