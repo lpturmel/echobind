@@ -1,7 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, FromSample, SizedSample, Stream, StreamConfig};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use cpal::{Device, FromSample, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -11,6 +13,7 @@ enum Error {
     Config(cpal::DefaultStreamConfigError),
     BuildStream(cpal::BuildStreamError),
     PlayStream(cpal::PlayStreamError),
+    Json(serde_json::Error),
     NotAudioDevice,
     UnsupportedSampleFormat(cpal::SampleFormat),
 }
@@ -18,6 +21,12 @@ enum Error {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Error::Json(value)
     }
 }
 
@@ -73,6 +82,38 @@ struct ConnectCmd {
     /// The destination IP to connect to
     ip: Ipv4Addr,
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Config {
+    sample_format: String,
+    sample_rate: u32,
+    channels: u16,
+    buffer_size: BufferSize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BufferSize {
+    min: u32,
+    max: u32,
+}
+
+impl From<Config> for SupportedStreamConfig {
+    fn from(value: Config) -> Self {
+        let BufferSize { min, max } = value.buffer_size;
+        let buffer_size = cpal::SupportedBufferSize::Range { min, max };
+        let sample_format = match value.sample_format.as_str() {
+            "I8" => cpal::SampleFormat::I8,
+            "I16" => cpal::SampleFormat::I16,
+            "I32" => cpal::SampleFormat::I32,
+            "I64" => cpal::SampleFormat::I64,
+            "F32" => cpal::SampleFormat::F32,
+            "F64" => cpal::SampleFormat::F64,
+            _ => panic!("Invalid sample format"),
+        };
+        let sample_rate = cpal::SampleRate(value.sample_rate);
+        SupportedStreamConfig::new(value.channels, sample_rate, buffer_size, sample_format)
+    }
+}
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.commands {
@@ -93,9 +134,26 @@ fn main() -> Result<()> {
             let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
             let addr = format!("0.0.0.0:{}", cmd.src_port);
             let addr = SocketAddr::from_str(&addr).expect("Invalid address");
+            let tcp_listener = TcpListener::bind(addr)?;
+            let (mut tcp_stream, _client_addr) = tcp_listener.accept()?;
+            let (min, max) = match config.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } => (*min, *max),
+                cpal::SupportedBufferSize::Unknown => (0_u32, 0_u32),
+            };
+            let config_data = serde_json::to_string(&Config {
+                sample_format: format!("{:?}", sample_format),
+                sample_rate: config.sample_rate().0,
+                channels: config.channels(),
+                buffer_size: BufferSize { min, max },
+            })?;
+            println!("Sending config data through TCP...");
+            tcp_stream.write_all(config_data.as_bytes())?; // Send serialized config data over TCP
+            tcp_stream.flush()?;
+            drop(tcp_listener);
+
             let listener = Arc::new(UdpSocket::bind(addr)?);
 
-            println!("Waiting for a client to start sending audio data...");
+            println!("Waiting for a client to start sending UDP data...");
 
             let mut buf = [0; 1024]; // Buffer for the initial message
             let (len, client_addr) = listener.recv_from(&mut buf)?;
@@ -159,18 +217,32 @@ fn main() -> Result<()> {
             }
         }
         Commands::Connect(cmd) => {
+            println!("Connecting via TCP to receive config...");
+            let target_ip = SocketAddr::new(cmd.ip.into(), cmd.dest_port);
+            let mut tcp_stream = TcpStream::connect(target_ip)?;
+
+            let mut config_data = String::new();
+            tcp_stream.read_to_string(&mut config_data)?; // Read the configuration data
+            let config: Config = serde_json::from_str(&config_data)?;
+            println!("Received config data: {:?}", config);
+
             let host = cpal::default_host();
             let device = host.default_output_device().ok_or(Error::NotAudioDevice)?;
-            let config = device.default_output_config()?;
+            let config = SupportedStreamConfig::from(config);
             let sample_format = config.sample_format();
+            println!(
+                "Client is configured to process audio: Sample format: {:?}, Sample rate: {:?}, Channels: {:?}, Buffer size: {:?}",
+                sample_format,
+                config.sample_rate(),
+                config.channels(),
+                config.buffer_size()
+            );
 
-            let target_ip = SocketAddr::new(cmd.ip.into(), cmd.dest_port);
             let socket = UdpSocket::bind(format!("0.0.0.0:{}", cmd.dest_port))?;
-
             socket.connect(target_ip)?;
 
             println!("Sending initial message to {}...", target_ip);
-            socket.send_to(b"Hello", target_ip)?;
+            socket.send_to(b"OK", target_ip)?;
 
             match sample_format {
                 cpal::SampleFormat::I8 => {
