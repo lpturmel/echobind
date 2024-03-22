@@ -157,6 +157,10 @@ fn main() -> Result<()> {
             let config = device.default_output_config()?;
             let sample_format = config.sample_format();
 
+            println!(
+                "Server is configured to send audio: Sample format: {:?}, {:?}",
+                sample_format, config
+            );
             let target_ip = SocketAddr::new(cmd.ip.into(), cmd.dest_port);
             let socket = UdpSocket::bind(format!("0.0.0.0:{}", cmd.dest_port))?;
 
@@ -219,9 +223,12 @@ where
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             let socket_lock = socket.lock().unwrap();
             let mut buf = vec![0u8; std::mem::size_of_val(data)];
+
             match socket_lock.recv(&mut buf) {
                 Ok(size) => {
                     let received_bytes = &buf[..size];
+                    println!("Received {} bytes", size);
+                    println!("Truncated bytes size: {}", received_bytes.len());
                     for (sample_chunk, output_frame) in received_bytes
                         .chunks_exact(std::mem::size_of::<T>())
                         .zip(data.chunks_mut(channels))
