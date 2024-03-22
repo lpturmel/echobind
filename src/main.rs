@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const DEFAULT_TCP_PORT: u16 = 3012;
 const DEFAULT_UDP_PORT: u16 = 3013;
@@ -17,7 +17,7 @@ enum Error {
     BuildStream(cpal::BuildStreamError),
     PlayStream(cpal::PlayStreamError),
     Json(serde_json::Error),
-    NotAudioDevice,
+    NoAudioDevice,
     UnsupportedSampleFormat(cpal::SampleFormat),
 }
 
@@ -132,8 +132,12 @@ fn main() -> Result<()> {
     match &cli.commands {
         Commands::Record(cmd) => {
             let host = cpal::default_host();
-            let device = host.default_input_device().ok_or(Error::NotAudioDevice)?;
-            let config = device.default_input_config()?;
+            let device = host.default_output_device().ok_or(Error::NoAudioDevice)?;
+            println!(
+                "Using input device: {}",
+                device.name().expect("Invalid device name")
+            );
+            let config = device.default_output_config()?;
             let sample_format = config.sample_format();
             println!(
                 "Server is configured to send audio: Sample format: {:?}, Sample rate: {:?}, Channels: {:?}, Buffer size: {:?}",
@@ -244,14 +248,13 @@ fn main() -> Result<()> {
             let mut buffer = Vec::new();
             tcp_stream.read_to_end(&mut buffer)?;
 
-            // close the connection
             drop(tcp_stream);
 
             let buffer = String::from_utf8(buffer).expect("Invalid UTF-8 data");
             let config: Config = serde_json::from_str(&buffer)?;
 
             let host = cpal::default_host();
-            let device = host.default_output_device().ok_or(Error::NotAudioDevice)?;
+            let device = host.default_output_device().ok_or(Error::NoAudioDevice)?;
             let config = SupportedStreamConfig::from(config);
             let sample_format = config.sample_format();
             println!(
@@ -314,32 +317,25 @@ fn run<T>(device: &cpal::Device, config: &StreamConfig, socket: &UdpSocket) -> R
 where
     T: cpal::SizedSample + FromSample<f32> + Send + 'static,
 {
-    println!("Processing T: {:?}", std::any::type_name::<T>());
     let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
 
     let socket = socket.try_clone().expect("Failed to clone socket");
-    let socket = Arc::new(Mutex::new(socket));
     let channels = config.channels as usize;
 
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let socket_lock = socket.lock().unwrap();
-            let mut buf = vec![0u8; std::mem::size_of_val(data)];
+            // let mut buf = vec![0u8; std::mem::size_of_val(data)];
+            let mut buf = [0u8; 4096];
 
-            match socket_lock.recv(&mut buf) {
+            match socket.recv(&mut buf) {
                 Ok(size) => {
                     let received_bytes = &buf[..size];
                     for (sample_chunk, output_frame) in received_bytes
-                        .chunks_exact(4)
+                        .chunks_exact(std::mem::size_of::<T>())
                         .zip(data.chunks_mut(channels))
                     {
-                        let sample = f32::from_be_bytes(
-                            sample_chunk.try_into().expect("Invalid sample size"),
-                        );
-                        assert!((-1.0..=1.0).contains(&sample), "Sample out of range");
-                        assert_eq!(output_frame.len(), channels, "Output frame size mismatch");
-                        let sample = T::from_sample(f32::from_be_bytes(
+                        let sample = T::from_sample(f32::from_ne_bytes(
                             sample_chunk.try_into().expect("Invalid sample size"),
                         ));
                         for out in output_frame.iter_mut() {
@@ -374,16 +370,12 @@ where
     F: FnMut(cpal::StreamError) + Send + 'static,
     I: SizedSample + ByteRep,
 {
-    println!(
-        "Creating input stream in Sample Format: {:?}",
-        std::any::type_name::<I>()
-    );
     device.build_input_stream(
         config,
         move |data: &[I], _: &_| {
             let bytes = data
                 .iter()
-                .flat_map(|&x| x.to_local_be_bytes().to_vec())
+                .flat_map(|&x| x.to_local_ne_bytes().to_vec())
                 .collect::<Vec<u8>>();
             let _ = socket.send_to(&bytes, client_addr);
         },
