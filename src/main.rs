@@ -82,6 +82,13 @@ fn main() -> Result<()> {
             let config = device.default_input_config()?;
             let sample_format = config.sample_format();
             println!("Recording on port {}", cmd.src_port);
+            println!(
+                "Server is configured to send audio: Sample format: {:?}, Sample rate: {:?}, Channels: {:?}, Buffer size: {:?}",
+                sample_format,
+                config.sample_rate(),
+                config.channels(),
+                config.buffer_size()
+            );
 
             let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
             let addr = format!("0.0.0.0:{}", cmd.src_port);
@@ -157,13 +164,6 @@ fn main() -> Result<()> {
             let config = device.default_output_config()?;
             let sample_format = config.sample_format();
 
-            println!(
-                "Server is configured to send audio: Sample format: {:?}, Sample rate: {:?}, Channels: {:?}, Buffer size: {:?}",
-                sample_format,
-                config.sample_rate(),
-                config.channels(),
-                config.buffer_size()
-            );
             let target_ip = SocketAddr::new(cmd.ip.into(), cmd.dest_port);
             let socket = UdpSocket::bind(format!("0.0.0.0:{}", cmd.dest_port))?;
 
