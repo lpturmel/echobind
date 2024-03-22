@@ -1,0 +1,44 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 1
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+
+    # - name: Install CMake and Visual Studio Build Tools
+    #   run: |
+    #     choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+    #     choco install visualstudio2019buildtools --package-parameters "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+      
+    # - name: Check if Opus is in PATH
+    #   run: |
+    #     echo "Checking Opus..."
+    #     where opus
+      
+    - name: Build
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --release
+
+    - name: Run tests
+      uses: actions-rs/cargo@v1
+      with:
+        command: test
