@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, FromSample, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{Device, FromSample, Sample, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -313,6 +313,13 @@ fn main() -> Result<()> {
     }
 }
 
+fn count_to_channels(count: u16) -> opus::Channels {
+    match count {
+        1 => opus::Channels::Mono,
+        2 => opus::Channels::Stereo,
+        _ => panic!("Unsupported channel count"),
+    }
+}
 fn run<T>(device: &cpal::Device, config: &StreamConfig, socket: &UdpSocket) -> Result<()>
 where
     T: cpal::SizedSample + FromSample<f32> + Send + 'static,
@@ -320,33 +327,51 @@ where
     let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
 
     let socket = socket.try_clone().expect("Failed to clone socket");
-    let channels = config.channels as usize;
+
+    // let sample_size = std::mem::size_of::<T>();
+
+    let mut tmp_buf = Vec::new();
+
+    let channels = count_to_channels(config.channels);
+    let channel_count = config.channels as usize;
+
+    let mut decoder =
+        opus::Decoder::new(config.sample_rate.0, channels).expect("Failed to create decoder");
 
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            // let mut buf = vec![0u8; std::mem::size_of_val(data)];
-            let mut buf = [0u8; 4096];
-
-            match socket.recv(&mut buf) {
-                Ok(size) => {
-                    let received_bytes = &buf[..size];
-                    for (sample_chunk, output_frame) in received_bytes
-                        .chunks_exact(std::mem::size_of::<T>())
-                        .zip(data.chunks_mut(channels))
-                    {
-                        let sample = T::from_sample(f32::from_ne_bytes(
-                            sample_chunk.try_into().expect("Invalid sample size"),
-                        ));
-                        for out in output_frame.iter_mut() {
-                            *out = sample;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Socket receive error: {}", e);
+            let needed_bytes = std::mem::size_of_val(data); // Calculate the total bytes needed for the current frame
+            while tmp_buf.len() < needed_bytes {
+                let mut buf = vec![0u8; 4096]; // Adjust this size based on your network characteristics
+                match socket.recv(&mut buf) {
+                    Ok(size) => tmp_buf.extend_from_slice(&buf[..size]),
+                    Err(e) => eprintln!("Socket receive error: {}", e),
                 }
             }
+
+            // Decode the data
+            let mut pcm_samples = vec![0i16; data.len() * channel_count]; // Temporary buffer for decoded samples
+            let decoded_samples = decoder.decode(&tmp_buf, &mut pcm_samples, false).unwrap();
+            pcm_samples.truncate(decoded_samples * channel_count); // Truncate to actual decoded sample count
+
+            // Clear the input buffer to receive new data
+            tmp_buf.clear();
+
+            // Convert decoded i16 samples to the target sample format and fill the output buffer
+            for (output_sample, &pcm_sample) in data.iter_mut().zip(pcm_samples.iter()) {
+                *output_sample = T::from_sample(pcm_sample as f32);
+            }
+            // // TODO old uncompressed data receiving
+            // let (frame_bytes, leftover) = tmp_buf.split_at(needed_bytes);
+            //
+            // // Convert bytes to samples
+            // for (i, frame_chunk) in frame_bytes.chunks_exact(sample_size).enumerate() {
+            //     if let Ok(sample) = frame_chunk.try_into() {
+            //         data[i] = T::from_sample(f32::from_ne_bytes(sample));
+            //     }
+            // }
+            // tmp_buf = leftover.to_vec();
         },
         err_fn,
         None,
@@ -368,16 +393,43 @@ fn create_input_stream<I, F>(
 ) -> std::result::Result<Stream, cpal::BuildStreamError>
 where
     F: FnMut(cpal::StreamError) + Send + 'static,
-    I: SizedSample + ByteRep,
+    I: SizedSample + ByteRep + FromSample<i16>,
+    i16: cpal::FromSample<I>,
 {
+    let sample_rate = config.sample_rate.0;
+    // let channel_count = config.channels as usize;
+
+    let channels = count_to_channels(config.channels);
+    let mut encoder = opus::Encoder::new(sample_rate, channels, opus::Application::LowDelay)
+        .expect("Failed to create encoder");
     device.build_input_stream(
         config,
         move |data: &[I], _: &_| {
-            let bytes = data
+            // Convert each sample to f32, then scale to i16 and collect into a Vec<i16>
+            let samples_i16: Vec<i16> = data
                 .iter()
-                .flat_map(|&x| x.to_local_ne_bytes().to_vec())
-                .collect::<Vec<u8>>();
-            let _ = socket.send_to(&bytes, client_addr);
+                .map(|&sample| i16::from_sample(sample))
+                .collect();
+
+            let mut output = vec![0; samples_i16.len() * 2]; // Output buffer for encoded data
+            let len = encoder
+                .encode(&samples_i16, &mut output)
+                .expect("Failed to encode data");
+
+            // Trim the output buffer to the actual length returned by the encoder
+            output.truncate(len);
+
+            // Send the encoded data
+            let _ = socket.send_to(&output, client_addr);
+
+            // TODO: old uncompressed data sending
+            // let mut output = vec![0; data.len() * channel_count];
+            //
+            // let bytes = data
+            //     .iter()
+            //     .flat_map(|&x| x.to_local_ne_bytes().to_vec())
+            //     .collect::<Vec<u8>>();
+            // let _ = socket.send_to(&bytes, client_addr);
         },
         err_fn,
         None,
