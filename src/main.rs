@@ -343,7 +343,7 @@ where
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             let needed_bytes = std::mem::size_of_val(data); // Calculate the total bytes needed for the current frame
             while tmp_buf.len() < needed_bytes {
-                let mut buf = vec![0u8; 1024];
+                let mut buf = vec![0u8; 4096];
                 match socket.recv(&mut buf) {
                     Ok(size) => tmp_buf.extend_from_slice(&buf[..size]),
                     Err(e) => eprintln!("Socket receive error: {}", e),
