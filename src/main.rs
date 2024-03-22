@@ -158,8 +158,11 @@ fn main() -> Result<()> {
             let sample_format = config.sample_format();
 
             println!(
-                "Server is configured to send audio: Sample format: {:?}, {:?}",
-                sample_format, config
+                "Server is configured to send audio: Sample format: {:?}, Sample rate: {:?}, Channels: {:?}, Buffer size: {:?}",
+                sample_format,
+                config.sample_rate(),
+                config.channels(),
+                config.buffer_size()
             );
             let target_ip = SocketAddr::new(cmd.ip.into(), cmd.dest_port);
             let socket = UdpSocket::bind(format!("0.0.0.0:{}", cmd.dest_port))?;
