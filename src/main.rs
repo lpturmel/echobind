@@ -139,6 +139,7 @@ fn main() -> Result<()> {
             );
             let config = device.default_output_config()?;
             let sample_format = config.sample_format();
+            let stream_config: StreamConfig = config.clone().into();
             println!(
                 "Server is configured to send audio: Sample format: {:?}, Sample rate: {:?}, Channels: {:?}, Buffer size: {:?}",
                 sample_format,
@@ -158,7 +159,6 @@ fn main() -> Result<()> {
             let udp_listener = Arc::new(UdpSocket::bind(udp_addr)?);
 
             loop {
-                let config = config.clone();
                 let udp_listener = udp_listener.clone();
                 println!("Waiting for client to connect...");
                 let (mut tcp_stream, client_addr) = tcp_listener.accept()?;
@@ -188,48 +188,38 @@ fn main() -> Result<()> {
                 );
                 let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
                 let stream = match sample_format {
-                    cpal::SampleFormat::I8 => create_input_stream::<i8, _>(
-                        udp_listener,
-                        client_addr,
-                        &config.into(),
-                        &device,
-                        err_fn,
-                    ),
-                    cpal::SampleFormat::I16 => create_input_stream::<i16, _>(
-                        udp_listener,
-                        client_addr,
-                        &config.into(),
-                        &device,
-                        err_fn,
-                    ),
-                    cpal::SampleFormat::I32 => create_input_stream::<i32, _>(
-                        udp_listener,
-                        client_addr,
-                        &config.into(),
-                        &device,
-                        err_fn,
-                    ),
-                    cpal::SampleFormat::I64 => create_input_stream::<i64, _>(
-                        udp_listener,
-                        client_addr,
-                        &config.into(),
-                        &device,
-                        err_fn,
-                    ),
-                    cpal::SampleFormat::F32 => create_input_stream::<f32, _>(
-                        udp_listener,
-                        client_addr,
-                        &config.into(),
-                        &device,
-                        err_fn,
-                    ),
-                    cpal::SampleFormat::F64 => create_input_stream::<f64, _>(
-                        udp_listener,
-                        client_addr,
-                        &config.into(),
-                        &device,
-                        err_fn,
-                    ),
+                    // cpal::SampleFormat::F32 => create_input_stream::<f32, _>(
+                    //     udp_listener,
+                    //     client_addr,
+                    //     &config.into(),
+                    //     &device,
+                    //     err_fn,
+                    // ),
+                    cpal::SampleFormat::F32 => {
+                        let sample_rate = stream_config.sample_rate.0;
+                        let channels = count_to_channels(stream_config.channels);
+                        let mut encoder =
+                            opus::Encoder::new(sample_rate, channels, opus::Application::LowDelay)
+                                .expect("Failed to create encoder");
+                        device.build_input_stream(
+                            &stream_config,
+                            move |data: &[f32], _: &_| {
+                                let samples = data
+                                    .iter()
+                                    .map(|&x| (x * i16::MAX as f32) as i16)
+                                    .collect::<Vec<i16>>();
+                                let mut output = vec![0; samples.len() * 2]; // Output buffer for encoded data
+                                let len = encoder
+                                    .encode(&samples, &mut output)
+                                    .expect("Failed to encode data");
+                                output.truncate(len);
+                                println!("Sending frame of size: {}", output.len());
+                                let _ = udp_listener.send_to(&output, client_addr);
+                            },
+                            err_fn,
+                            None,
+                        )
+                    }
                     sample_format => {
                         return Err(Error::UnsupportedSampleFormat(sample_format));
                     }
@@ -295,51 +285,76 @@ fn main() -> Result<()> {
             println!("[UDP] Sending UDP startup to {}...", udp_target_ip);
             socket.send(b"OK").expect("Failed to send UDP startup");
 
+            let stream_config: StreamConfig = config.clone().into();
             match sample_format {
-                cpal::SampleFormat::I8 => {
-                    run::<i8>(&device, &config.into(), &socket)?;
-                }
-                cpal::SampleFormat::I16 => {
-                    run::<i16>(&device, &config.into(), &socket)?;
-                }
-                cpal::SampleFormat::I32 => {
-                    run::<i32>(&device, &config.into(), &socket)?;
-                }
-                cpal::SampleFormat::I64 => {
-                    run::<i64>(&device, &config.into(), &socket)?;
-                }
-                cpal::SampleFormat::U8 => {
-                    run::<u8>(&device, &config.into(), &socket)?;
-                }
-                cpal::SampleFormat::U16 => {
-                    run::<u16>(&device, &config.into(), &socket)?;
-                }
-                cpal::SampleFormat::U32 => {
-                    run::<u32>(&device, &config.into(), &socket)?;
-                }
-                cpal::SampleFormat::U64 => {
-                    run::<u64>(&device, &config.into(), &socket)?;
-                }
                 cpal::SampleFormat::F32 => {
-                    run::<f32>(&device, &config.into(), &socket)?;
+                    // run::<f32>(&device, &config.into(), &socket)?;
+
+                    let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+
+                    let socket = socket.try_clone().expect("Failed to clone socket");
+
+                    let mut tmp_buf = Vec::new();
+
+                    let channels = count_to_channels(stream_config.channels);
+                    let channel_count = stream_config.channels as usize;
+
+                    // let sample_size = std::mem::size_of::<f32>();
+
+                    let mut decoder = opus::Decoder::new(stream_config.sample_rate.0, channels)
+                        .expect("Failed to create decoder");
+
+                    println!("Stream has started. Press Ctrl+C to terminate.");
+                    let stream = device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            let needed_samples = data.len(); // Calculate the total bytes needed for the current frame
+                            let needed_bytes = needed_samples * std::mem::size_of::<i16>();
+                            while tmp_buf.len() < needed_bytes {
+                                let mut buf = vec![0u8; 2048];
+                                match socket.recv(&mut buf) {
+                                    Ok(size) => tmp_buf.extend_from_slice(&buf[..size]),
+                                    Err(e) => eprintln!("Socket receive error: {}", e),
+                                }
+                            }
+
+                            let mut pcm_samples = vec![0i16; data.len() * channel_count]; // Temporary buffer for decoded samples
+                            let len = decoder
+                                .decode(&tmp_buf, &mut pcm_samples, false)
+                                .expect("Failed to decode data");
+
+                            println!("Decoded {} samples", len);
+
+                            for (i, sample) in pcm_samples.iter().enumerate() {
+                                data[i] = f32::from(*sample) / i16::MAX as f32;
+                            }
+
+                            tmp_buf = tmp_buf.split_at(len).1.to_vec();
+                        },
+                        err_fn,
+                        None,
+                    )?;
+
+                    stream.play()?;
+
+                    // Keep the thread alive. You might want to handle this differently, depending on your app structure.
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
                 }
-                cpal::SampleFormat::F64 => {
-                    run::<f64>(&device, &config.into(), &socket)?;
-                }
-                _ => return Err(Error::UnsupportedSampleFormat(sample_format)),
+                _ => Err(Error::UnsupportedSampleFormat(sample_format)),
             }
-            Ok(())
         }
     }
 }
 
-// fn count_to_channels(count: u16) -> opus::Channels {
-//     match count {
-//         1 => opus::Channels::Mono,
-//         2 => opus::Channels::Stereo,
-//         _ => panic!("Unsupported channel count"),
-//     }
-// }
+fn count_to_channels(count: u16) -> opus::Channels {
+    match count {
+        1 => opus::Channels::Mono,
+        2 => opus::Channels::Stereo,
+        _ => panic!("Unsupported channel count"),
+    }
+}
 fn run<T>(device: &cpal::Device, config: &StreamConfig, socket: &UdpSocket) -> Result<()>
 where
     T: cpal::SizedSample + FromSample<f32> + Send + 'static,
@@ -351,12 +366,6 @@ where
     let sample_size = std::mem::size_of::<T>();
 
     let mut tmp_buf = Vec::new();
-
-    // let channels = count_to_channels(config.channels);
-    // let channel_count = config.channels as usize;
-
-    // let mut decoder =
-    //     opus::Decoder::new(config.sample_rate.0, channels).expect("Failed to create decoder");
 
     println!("Stream has started. Press Ctrl+C to terminate.");
     let stream = device.build_output_stream(
@@ -370,23 +379,8 @@ where
                     Err(e) => eprintln!("Socket receive error: {}", e),
                 }
             }
-
-            // Decode the data
-            // let mut pcm_samples = vec![0i16; data.len() * channel_count]; // Temporary buffer for decoded samples
-            // let decoded_samples = decoder.decode(&tmp_buf, &mut pcm_samples, false).unwrap();
-            // pcm_samples.truncate(decoded_samples * channel_count); // Truncate to actual decoded sample count
-
-            // Clear the input buffer to receive new data
-            // tmp_buf.clear();
-
-            // Convert decoded i16 samples to the target sample format and fill the output buffer
-            // for (output_sample, &pcm_sample) in data.iter_mut().zip(pcm_samples.iter()) {
-            //     *output_sample = T::from_sample(pcm_sample as f32);
-            // }
-            // // TODO old uncompressed data receiving
             let (frame_bytes, leftover) = tmp_buf.split_at(needed_bytes);
 
-            // Convert bytes to samples
             for (i, frame_chunk) in frame_bytes.chunks_exact(sample_size).enumerate() {
                 if let Ok(sample) = frame_chunk.try_into() {
                     data[i] = T::from_sample(f32::from_ne_bytes(sample));
@@ -417,12 +411,6 @@ where
     I: SizedSample + ByteRep + FromSample<i16>,
     i16: cpal::FromSample<I>,
 {
-    // let sample_rate = config.sample_rate.0;
-    // let channel_count = config.channels as usize;
-
-    // let channels = count_to_channels(config.channels);
-    // let mut encoder = opus::Encoder::new(sample_rate, channels, opus::Application::LowDelay)
-    //     .expect("Failed to create encoder");
     device.build_input_stream(
         config,
         move |data: &[I], _: &_| {
