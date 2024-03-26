@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, FromSample, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{StreamConfig, SupportedStreamConfig};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -188,13 +188,6 @@ fn main() -> Result<()> {
                 );
                 let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
                 let stream = match sample_format {
-                    // cpal::SampleFormat::F32 => create_input_stream::<f32, _>(
-                    //     udp_listener,
-                    //     client_addr,
-                    //     &config.into(),
-                    //     &device,
-                    //     err_fn,
-                    // ),
                     cpal::SampleFormat::F32 => {
                         let sample_rate = stream_config.sample_rate.0;
                         let channels = count_to_channels(stream_config.channels);
@@ -213,7 +206,6 @@ fn main() -> Result<()> {
                                     .encode(&samples, &mut output)
                                     .expect("Failed to encode data");
                                 output.truncate(len);
-                                println!("Sending frame of size: {}", output.len());
                                 let _ = udp_listener.send_to(&output, client_addr);
                             },
                             err_fn,
@@ -288,42 +280,51 @@ fn main() -> Result<()> {
             let stream_config: StreamConfig = config.clone().into();
             match sample_format {
                 cpal::SampleFormat::F32 => {
-                    // run::<f32>(&device, &config.into(), &socket)?;
-
                     let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
 
                     let socket = socket.try_clone().expect("Failed to clone socket");
 
-                    let mut decode_buf = Vec::new();
+                    let mut decode_buf = vec![0i16; 2048]; // Adjust buffer size as needed
                     let channels = count_to_channels(stream_config.channels);
                     let channel_count = stream_config.channels as usize;
-
-                    // let sample_size = std::mem::size_of::<f32>();
 
                     let mut decoder = opus::Decoder::new(stream_config.sample_rate.0, channels)
                         .expect("Failed to create decoder");
 
+                    let mut tmp_buf: Vec<f32> = Vec::new();
                     println!("Stream has started. Press Ctrl+C to terminate.");
                     let stream = device.build_output_stream(
                         &stream_config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            let mut buffer = [0u8; 480]; // Adjust buffer size as needed
-                            match socket.recv(&mut buffer) {
-                                Ok(size) => {
-                                    let samples = decoder
-                                        .decode(&buffer[..size], &mut decode_buf, false)
-                                        .expect("Failed to decode data");
-                                    decode_buf.resize(samples * channel_count, 0);
-
-                                    for (i, chunk) in
-                                        decode_buf.chunks_exact(channel_count).enumerate()
-                                    {
-                                        let sample = chunk[0] as f32 / i16::MAX as f32;
-                                        data[i] = sample;
+                            let needed_frames = data.len();
+                            while tmp_buf.len() < needed_frames {
+                                let mut buffer = [0u8; 2048]; // UDP receive buffer size
+                                match socket.recv(&mut buffer) {
+                                    Ok(size) => {
+                                        let received_data = &buffer[..size];
+                                        let size = decoder
+                                            .decode(received_data, &mut decode_buf, false)
+                                            .expect("Failed to decode data");
+                                        let decoded_data = &decode_buf[..size * channel_count]
+                                            .iter()
+                                            .map(|&x| x as f32 / i16::MAX as f32)
+                                            .collect::<Vec<f32>>();
+                                        tmp_buf.extend_from_slice(decoded_data);
+                                        decode_buf.resize(size * channel_count, 0);
+                                    }
+                                    Err(e) => {
+                                        writeln!(std::io::stderr(), "Socket receive error: {}", e)
+                                            .expect("Failed to write to stderr")
                                     }
                                 }
-                                Err(e) => eprintln!("Socket receive error: {}", e),
                             }
+
+                            let (frame_bytes, leftover) = tmp_buf.split_at(needed_frames);
+
+                            for (i, &sample) in frame_bytes.iter().enumerate() {
+                                data[i] = sample;
+                            }
+                            tmp_buf = leftover.to_vec();
                         },
                         err_fn,
                         None,
@@ -349,151 +350,132 @@ fn count_to_channels(count: u16) -> opus::Channels {
         _ => panic!("Unsupported channel count"),
     }
 }
-fn run<T>(device: &cpal::Device, config: &StreamConfig, socket: &UdpSocket) -> Result<()>
-where
-    T: cpal::SizedSample + FromSample<f32> + Send + 'static,
-{
-    let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+// fn run<T>(device: &cpal::Device, config: &StreamConfig, socket: &UdpSocket) -> Result<()>
+// where
+//     T: cpal::SizedSample + FromSample<f32> + Send + 'static,
+// {
+//     let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+//
+//     let socket = socket.try_clone().expect("Failed to clone socket");
+//
+//     let sample_size = std::mem::size_of::<T>();
+//
+//     let mut tmp_buf = Vec::new();
+//
+//     println!("Stream has started. Press Ctrl+C to terminate.");
+//     let stream = device.build_output_stream(
+//         config,
+//         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+//             let needed_bytes = std::mem::size_of_val(data); // Calculate the total bytes needed for the current frame
+//             while tmp_buf.len() < needed_bytes {
+//                 let mut buf = vec![0u8; 4096];
+//                 match socket.recv(&mut buf) {
+//                     Ok(size) => tmp_buf.extend_from_slice(&buf[..size]),
+//                     Err(e) => eprintln!("Socket receive error: {}", e),
+//                 }
+//             }
+//             let (frame_bytes, leftover) = tmp_buf.split_at(needed_bytes);
+//
+//             for (i, frame_chunk) in frame_bytes.chunks_exact(sample_size).enumerate() {
+//                 if let Ok(sample) = frame_chunk.try_into() {
+//                     data[i] = T::from_sample(f32::from_ne_bytes(sample));
+//                 }
+//             }
+//             tmp_buf = leftover.to_vec();
+//         },
+//         err_fn,
+//         None,
+//     )?;
+//
+//     stream.play()?;
+//
+//     // Keep the thread alive. You might want to handle this differently, depending on your app structure.
+//     loop {
+//         std::thread::sleep(std::time::Duration::from_millis(1000));
+//     }
+// }
+// fn create_input_stream<I, F>(
+//     socket: Arc<UdpSocket>,
+//     client_addr: SocketAddr,
+//     config: &StreamConfig,
+//     device: &Device,
+//     err_fn: F,
+// ) -> std::result::Result<Stream, cpal::BuildStreamError>
+// where
+//     F: FnMut(cpal::StreamError) + Send + 'static,
+//     I: SizedSample + ByteRep + FromSample<i16>,
+//     i16: cpal::FromSample<I>,
+// {
+//     device.build_input_stream(
+//         config,
+//         move |data: &[I], _: &_| {
+//             let bytes = data
+//                 .iter()
+//                 .flat_map(|&x| x.to_local_ne_bytes().to_vec())
+//                 .collect::<Vec<u8>>();
+//
+//             let _ = socket.send_to(&bytes, client_addr);
+//         },
+//         err_fn,
+//         None,
+//     )
+// }
 
-    let socket = socket.try_clone().expect("Failed to clone socket");
-
-    let sample_size = std::mem::size_of::<T>();
-
-    let mut tmp_buf = Vec::new();
-
-    println!("Stream has started. Press Ctrl+C to terminate.");
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let needed_bytes = std::mem::size_of_val(data); // Calculate the total bytes needed for the current frame
-            while tmp_buf.len() < needed_bytes {
-                let mut buf = vec![0u8; 4096];
-                match socket.recv(&mut buf) {
-                    Ok(size) => tmp_buf.extend_from_slice(&buf[..size]),
-                    Err(e) => eprintln!("Socket receive error: {}", e),
-                }
-            }
-            let (frame_bytes, leftover) = tmp_buf.split_at(needed_bytes);
-
-            for (i, frame_chunk) in frame_bytes.chunks_exact(sample_size).enumerate() {
-                if let Ok(sample) = frame_chunk.try_into() {
-                    data[i] = T::from_sample(f32::from_ne_bytes(sample));
-                }
-            }
-            tmp_buf = leftover.to_vec();
-        },
-        err_fn,
-        None,
-    )?;
-
-    stream.play()?;
-
-    // Keep the thread alive. You might want to handle this differently, depending on your app structure.
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-    }
-}
-fn create_input_stream<I, F>(
-    socket: Arc<UdpSocket>,
-    client_addr: SocketAddr,
-    config: &StreamConfig,
-    device: &Device,
-    err_fn: F,
-) -> std::result::Result<Stream, cpal::BuildStreamError>
-where
-    F: FnMut(cpal::StreamError) + Send + 'static,
-    I: SizedSample + ByteRep + FromSample<i16>,
-    i16: cpal::FromSample<I>,
-{
-    device.build_input_stream(
-        config,
-        move |data: &[I], _: &_| {
-            // Convert each sample to f32, then scale to i16 and collect into a Vec<i16>
-            // let samples_i16: Vec<i16> = data
-            //     .iter()
-            //     .map(|&sample| i16::from_sample(sample))
-            //     .collect();
-            //
-            // let mut output = vec![0; samples_i16.len() * 2]; // Output buffer for encoded data
-            // let len = encoder
-            //     .encode(&samples_i16, &mut output)
-            //     .expect("Failed to encode data");
-
-            // Trim the output buffer to the actual length returned by the encoder
-            // output.truncate(len);
-
-            // println!("Sending frame of size: {}", output.len());
-            // Send the encoded data
-            // let _ = socket.send_to(&output, client_addr);
-
-            // TODO: old uncompressed data sending
-            let bytes = data
-                .iter()
-                .flat_map(|&x| x.to_local_ne_bytes().to_vec())
-                .collect::<Vec<u8>>();
-
-            let _ = socket.send_to(&bytes, client_addr);
-        },
-        err_fn,
-        None,
-    )
-}
-
-trait ByteRep {
-    fn to_local_ne_bytes(&self) -> Vec<u8>;
-    fn to_local_be_bytes(&self) -> Vec<u8>;
-}
-
-impl ByteRep for i8 {
-    fn to_local_ne_bytes(&self) -> Vec<u8> {
-        self.to_ne_bytes().to_vec()
-    }
-    fn to_local_be_bytes(&self) -> Vec<u8> {
-        self.to_be_bytes().to_vec()
-    }
-}
-
-impl ByteRep for i16 {
-    fn to_local_ne_bytes(&self) -> Vec<u8> {
-        self.to_ne_bytes().to_vec()
-    }
-    fn to_local_be_bytes(&self) -> Vec<u8> {
-        self.to_be_bytes().to_vec()
-    }
-}
-
-impl ByteRep for i32 {
-    fn to_local_ne_bytes(&self) -> Vec<u8> {
-        self.to_ne_bytes().to_vec()
-    }
-    fn to_local_be_bytes(&self) -> Vec<u8> {
-        self.to_be_bytes().to_vec()
-    }
-}
-
-impl ByteRep for i64 {
-    fn to_local_ne_bytes(&self) -> Vec<u8> {
-        self.to_ne_bytes().to_vec()
-    }
-    fn to_local_be_bytes(&self) -> Vec<u8> {
-        self.to_be_bytes().to_vec()
-    }
-}
-
-impl ByteRep for f32 {
-    fn to_local_ne_bytes(&self) -> Vec<u8> {
-        self.to_ne_bytes().to_vec()
-    }
-    fn to_local_be_bytes(&self) -> Vec<u8> {
-        self.to_be_bytes().to_vec()
-    }
-}
-
-impl ByteRep for f64 {
-    fn to_local_ne_bytes(&self) -> Vec<u8> {
-        self.to_ne_bytes().to_vec()
-    }
-    fn to_local_be_bytes(&self) -> Vec<u8> {
-        self.to_be_bytes().to_vec()
-    }
-}
+// trait ByteRep {
+//     fn to_local_ne_bytes(&self) -> Vec<u8>;
+//     fn to_local_be_bytes(&self) -> Vec<u8>;
+// }
+//
+// impl ByteRep for i8 {
+//     fn to_local_ne_bytes(&self) -> Vec<u8> {
+//         self.to_ne_bytes().to_vec()
+//     }
+//     fn to_local_be_bytes(&self) -> Vec<u8> {
+//         self.to_be_bytes().to_vec()
+//     }
+// }
+//
+// impl ByteRep for i16 {
+//     fn to_local_ne_bytes(&self) -> Vec<u8> {
+//         self.to_ne_bytes().to_vec()
+//     }
+//     fn to_local_be_bytes(&self) -> Vec<u8> {
+//         self.to_be_bytes().to_vec()
+//     }
+// }
+//
+// impl ByteRep for i32 {
+//     fn to_local_ne_bytes(&self) -> Vec<u8> {
+//         self.to_ne_bytes().to_vec()
+//     }
+//     fn to_local_be_bytes(&self) -> Vec<u8> {
+//         self.to_be_bytes().to_vec()
+//     }
+// }
+//
+// impl ByteRep for i64 {
+//     fn to_local_ne_bytes(&self) -> Vec<u8> {
+//         self.to_ne_bytes().to_vec()
+//     }
+//     fn to_local_be_bytes(&self) -> Vec<u8> {
+//         self.to_be_bytes().to_vec()
+//     }
+// }
+//
+// impl ByteRep for f32 {
+//     fn to_local_ne_bytes(&self) -> Vec<u8> {
+//         self.to_ne_bytes().to_vec()
+//     }
+//     fn to_local_be_bytes(&self) -> Vec<u8> {
+//         self.to_be_bytes().to_vec()
+//     }
+// }
+//
+// impl ByteRep for f64 {
+//     fn to_local_ne_bytes(&self) -> Vec<u8> {
+//         self.to_ne_bytes().to_vec()
+//     }
+//     fn to_local_be_bytes(&self) -> Vec<u8> {
+//         self.to_be_bytes().to_vec()
+//     }
+// }
