@@ -206,7 +206,7 @@ fn main() -> Result<()> {
                             move |data: &[f32], _: &_| {
                                 let samples = data
                                     .iter()
-                                    .map(|&x| (x * i16::MAX as f32) as i16)
+                                    .map(|&sample| (sample * i16::MAX as f32) as i16)
                                     .collect::<Vec<i16>>();
                                 let mut output = vec![0; samples.len() * 2]; // Output buffer for encoded data
                                 let len = encoder
@@ -294,7 +294,6 @@ fn main() -> Result<()> {
 
                     let socket = socket.try_clone().expect("Failed to clone socket");
 
-                    let mut tmp_buf = Vec::new();
                     let mut decode_buf = Vec::new();
                     let channels = count_to_channels(stream_config.channels);
                     let channel_count = stream_config.channels as usize;
@@ -308,34 +307,22 @@ fn main() -> Result<()> {
                     let stream = device.build_output_stream(
                         &stream_config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            let needed_samples = data.len(); // Calculate the total bytes needed for the current frame
-                            let needed_bytes = needed_samples * std::mem::size_of::<i16>();
-                            while tmp_buf.len() < needed_bytes {
-                                let mut buf = vec![0u8; 2048];
-                                match socket.recv(&mut buf) {
-                                    Ok(size) => {
-                                        tmp_buf.extend_from_slice(&buf[..size]);
-                                        while tmp_buf.len() >= 2 {
-                                            let decode_result =
-                                                decoder.decode(&tmp_buf, &mut decode_buf, false);
-                                            match decode_result {
-                                                Ok(len) => {
-                                                    tmp_buf = tmp_buf.split_at(len).1.to_vec();
-                                                    for (i, sample) in decode_buf.iter().enumerate()
-                                                    {
-                                                        data[i] =
-                                                            f32::from(*sample) / i16::MAX as f32;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("Failed to decode data: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                        }
+                            let mut buffer = [0u8; 480]; // Adjust buffer size as needed
+                            match socket.recv(&mut buffer) {
+                                Ok(size) => {
+                                    let samples = decoder
+                                        .decode(&buffer[..size], &mut decode_buf, false)
+                                        .expect("Failed to decode data");
+                                    decode_buf.resize(samples * channel_count, 0);
+
+                                    for (i, chunk) in
+                                        decode_buf.chunks_exact(channel_count).enumerate()
+                                    {
+                                        let sample = chunk[0] as f32 / i16::MAX as f32;
+                                        data[i] = sample;
                                     }
-                                    Err(e) => eprintln!("Socket receive error: {}", e),
                                 }
+                                Err(e) => eprintln!("Socket receive error: {}", e),
                             }
                         },
                         err_fn,
