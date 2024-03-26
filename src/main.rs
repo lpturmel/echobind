@@ -295,7 +295,7 @@ fn main() -> Result<()> {
                     let socket = socket.try_clone().expect("Failed to clone socket");
 
                     let mut tmp_buf = Vec::new();
-
+                    let mut decode_buf = Vec::new();
                     let channels = count_to_channels(stream_config.channels);
                     let channel_count = stream_config.channels as usize;
 
@@ -313,23 +313,30 @@ fn main() -> Result<()> {
                             while tmp_buf.len() < needed_bytes {
                                 let mut buf = vec![0u8; 2048];
                                 match socket.recv(&mut buf) {
-                                    Ok(size) => tmp_buf.extend_from_slice(&buf[..size]),
+                                    Ok(size) => {
+                                        tmp_buf.extend_from_slice(&buf[..size]);
+                                        while tmp_buf.len() >= 2 {
+                                            let decode_result =
+                                                decoder.decode(&tmp_buf, &mut decode_buf, false);
+                                            match decode_result {
+                                                Ok(len) => {
+                                                    tmp_buf = tmp_buf.split_at(len).1.to_vec();
+                                                    for (i, sample) in decode_buf.iter().enumerate()
+                                                    {
+                                                        data[i] =
+                                                            f32::from(*sample) / i16::MAX as f32;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("Failed to decode data: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
                                     Err(e) => eprintln!("Socket receive error: {}", e),
                                 }
                             }
-
-                            let mut pcm_samples = vec![0i16; data.len() * channel_count]; // Temporary buffer for decoded samples
-                            let len = decoder
-                                .decode(&tmp_buf, &mut pcm_samples, false)
-                                .expect("Failed to decode data");
-
-                            println!("Decoded {} samples", len);
-
-                            for (i, sample) in pcm_samples.iter().enumerate() {
-                                data[i] = f32::from(*sample) / i16::MAX as f32;
-                            }
-
-                            tmp_buf = tmp_buf.split_at(len).1.to_vec();
                         },
                         err_fn,
                         None,
