@@ -170,8 +170,18 @@ fn main() -> Result<()> {
             let tcp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.tcp_dest_port);
             let udp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.udp_dest_port);
             println!("[TCP] Connecting to {}...", tcp_target_ip);
-            let mut tcp_stream =
-                TcpStream::connect(tcp_target_ip).expect("Failed to connect to TCP server");
+            let mut tcp_stream = loop {
+                match TcpStream::connect(tcp_target_ip) {
+                    Ok(stream) => break stream,
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to connect to server: {} retrying in 5 seconds...",
+                            e
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                }
+            };
             println!("[TCP] Connected to server");
 
             println!("[TCP] Sending UDP port to server...");
@@ -206,9 +216,6 @@ fn main() -> Result<()> {
             socket
                 .connect(udp_target_ip)
                 .expect("Failed to connect to UDP target");
-
-            println!("[UDP] Sending UDP startup to {}...", udp_target_ip);
-            socket.send(b"OK").expect("Failed to send UDP startup");
 
             let stream_config: StreamConfig = config.clone().into();
             match sample_format {
