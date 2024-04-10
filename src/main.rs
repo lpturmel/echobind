@@ -1,100 +1,19 @@
-use clap::{Args, Parser, Subcommand};
+use clap::Parser;
+use cli::{Cli, Commands};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{StreamConfig, SupportedStreamConfig};
+use error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::str::FromStr;
 use std::sync::Arc;
 
+pub mod cli;
+pub mod error;
+
 const DEFAULT_TCP_PORT: u16 = 3012;
 const DEFAULT_UDP_PORT: u16 = 3013;
-
-#[derive(Debug)]
-enum Error {
-    Io(std::io::Error),
-    Config(cpal::DefaultStreamConfigError),
-    BuildStream(cpal::BuildStreamError),
-    PlayStream(cpal::PlayStreamError),
-    Json(serde_json::Error),
-    NoAudioDevice,
-    UnsupportedSampleFormat(cpal::SampleFormat),
-}
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::Io(err)
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(value: serde_json::Error) -> Self {
-        Error::Json(value)
-    }
-}
-
-impl From<cpal::DefaultStreamConfigError> for Error {
-    fn from(err: cpal::DefaultStreamConfigError) -> Self {
-        Error::Config(err)
-    }
-}
-
-impl From<cpal::BuildStreamError> for Error {
-    fn from(err: cpal::BuildStreamError) -> Self {
-        Error::BuildStream(err)
-    }
-}
-
-impl From<cpal::PlayStreamError> for Error {
-    fn from(err: cpal::PlayStreamError) -> Self {
-        Error::PlayStream(err)
-    }
-}
-
-type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Parser)]
-#[clap(author = "Louis-Philippe Turmel", version, about, long_about = None)]
-struct Cli {
-    #[clap(subcommand)]
-    commands: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Record system audio
-    Record(RecordCmd),
-    /// Connect to a remote audio server
-    Connect(ConnectCmd),
-}
-
-#[derive(Args, Debug)]
-struct RecordCmd {
-    #[arg(short, long, default_value_t = DEFAULT_TCP_PORT)]
-    /// The TCP source port to record on
-    tcp_port: u16,
-    #[arg(short, long, default_value_t = DEFAULT_UDP_PORT)]
-    /// The UDP source port to record on
-    udp_port: u16,
-}
-
-#[derive(Args, Debug)]
-struct ConnectCmd {
-    #[arg(short, long, default_value_t = DEFAULT_TCP_PORT)]
-    /// The destination TCP port to connect to
-    tcp_dest_port: u16,
-    #[arg(long, default_value_t = DEFAULT_UDP_PORT)]
-    /// The destination UDP port to connect to
-    udp_dest_port: u16,
-
-    #[arg(long, default_value_t = DEFAULT_UDP_PORT)]
-    /// The UDP source port to use
-    udp_src_port: u16,
-
-    #[arg(short, long)]
-    /// The destination IP to connect to
-    ip: Ipv4Addr,
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
@@ -160,9 +79,19 @@ fn main() -> Result<()> {
 
             loop {
                 let udp_listener = udp_listener.clone();
-                println!("Waiting for client to connect...");
+                println!("[TCP] Waiting for client to connect...");
                 let (mut tcp_stream, client_addr) = tcp_listener.accept()?;
-                println!("Client connected from {}", client_addr);
+                println!("[TCP] Client connected from {}", client_addr);
+
+                println!("[UDP] Waiting for client to send UDP port...");
+                let mut udp_port_buf = [0; 2];
+                tcp_stream.read_exact(&mut udp_port_buf)?;
+                let udp_port = u16::from_be_bytes(udp_port_buf);
+                println!("[UDP] Client using UDP port: {}", udp_port);
+
+                let udp_addr = format!("{}:{}", client_addr.ip(), udp_port);
+                let udp_addr = SocketAddr::from_str(&udp_addr).expect("Invalid address");
+
                 let (min, max) = match config.buffer_size() {
                     cpal::SupportedBufferSize::Range { min, max } => (*min, *max),
                     cpal::SupportedBufferSize::Unknown => (0_u32, 0_u32),
@@ -178,14 +107,8 @@ fn main() -> Result<()> {
                 tcp_stream.write_all(&data_length.to_be_bytes())?; // Send the length of the config data
                 tcp_stream.write_all(config_data)?; // Send the config data
                 tcp_stream.flush()?;
-                println!("Sent config data to client");
+                println!("Sent stream configuration to client");
 
-                let mut buf = [0; 1024]; // Buffer for the initial message
-                let (len, client_addr) = udp_listener.recv_from(&mut buf)?;
-                println!(
-                    "Received {} bytes from {}, starting to send audio data...",
-                    len, client_addr
-                );
                 let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
                 let stream = match sample_format {
                     cpal::SampleFormat::F32 => {
@@ -202,11 +125,15 @@ fn main() -> Result<()> {
                                     .map(|&sample| (sample * i16::MAX as f32) as i16)
                                     .collect::<Vec<i16>>();
                                 let mut output = vec![0; samples.len() * 2]; // Output buffer for encoded data
-                                let len = encoder
-                                    .encode(&samples, &mut output)
-                                    .expect("Failed to encode data");
-                                output.truncate(len);
-                                let _ = udp_listener.send_to(&output, client_addr);
+                                match encoder.encode(&samples, &mut output) {
+                                    Ok(len) => {
+                                        output.truncate(len);
+                                        let _ = udp_listener.send_to(&output, udp_addr);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error encoding bytes... {}", e);
+                                    }
+                                }
                             },
                             err_fn,
                             None,
@@ -242,9 +169,24 @@ fn main() -> Result<()> {
             let tcp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.tcp_dest_port);
             let udp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.udp_dest_port);
             println!("[TCP] Connecting to {}...", tcp_target_ip);
-            let mut tcp_stream =
-                TcpStream::connect(tcp_target_ip).expect("Failed to connect to TCP server");
+            let mut tcp_stream = loop {
+                match TcpStream::connect(tcp_target_ip) {
+                    Ok(stream) => break stream,
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to connect to server: {} retrying in 5 seconds...",
+                            e
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                }
+            };
             println!("[TCP] Connected to server");
+
+            println!("[TCP] Sending UDP port to server...");
+            tcp_stream
+                .write_all(&cmd.udp_src_port.to_be_bytes())
+                .expect("Failed to send UDP port to server");
 
             let mut length_bytes = [0u8; 4]; // Buffer for the length, assuming we use u64
             tcp_stream.read_exact(&mut length_bytes)?;
@@ -274,9 +216,6 @@ fn main() -> Result<()> {
                 .connect(udp_target_ip)
                 .expect("Failed to connect to UDP target");
 
-            println!("[UDP] Sending UDP startup to {}...", udp_target_ip);
-            socket.send(b"OK").expect("Failed to send UDP startup");
-
             let stream_config: StreamConfig = config.clone().into();
             match sample_format {
                 cpal::SampleFormat::F32 => {
@@ -298,7 +237,7 @@ fn main() -> Result<()> {
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                             let needed_frames = data.len();
                             while tmp_buf.len() < needed_frames {
-                                let mut buffer = [0u8; 2048]; // UDP receive buffer size
+                                let mut buffer = [0u8; 1024]; // UDP receive buffer size
                                 match socket.recv(&mut buffer) {
                                     Ok(size) => {
                                         let received_data = &buffer[..size];
@@ -332,7 +271,6 @@ fn main() -> Result<()> {
 
                     stream.play()?;
 
-                    // Keep the thread alive. You might want to handle this differently, depending on your app structure.
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(1000));
                     }
@@ -350,132 +288,3 @@ fn count_to_channels(count: u16) -> opus::Channels {
         _ => panic!("Unsupported channel count"),
     }
 }
-// fn run<T>(device: &cpal::Device, config: &StreamConfig, socket: &UdpSocket) -> Result<()>
-// where
-//     T: cpal::SizedSample + FromSample<f32> + Send + 'static,
-// {
-//     let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
-//
-//     let socket = socket.try_clone().expect("Failed to clone socket");
-//
-//     let sample_size = std::mem::size_of::<T>();
-//
-//     let mut tmp_buf = Vec::new();
-//
-//     println!("Stream has started. Press Ctrl+C to terminate.");
-//     let stream = device.build_output_stream(
-//         config,
-//         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-//             let needed_bytes = std::mem::size_of_val(data); // Calculate the total bytes needed for the current frame
-//             while tmp_buf.len() < needed_bytes {
-//                 let mut buf = vec![0u8; 4096];
-//                 match socket.recv(&mut buf) {
-//                     Ok(size) => tmp_buf.extend_from_slice(&buf[..size]),
-//                     Err(e) => eprintln!("Socket receive error: {}", e),
-//                 }
-//             }
-//             let (frame_bytes, leftover) = tmp_buf.split_at(needed_bytes);
-//
-//             for (i, frame_chunk) in frame_bytes.chunks_exact(sample_size).enumerate() {
-//                 if let Ok(sample) = frame_chunk.try_into() {
-//                     data[i] = T::from_sample(f32::from_ne_bytes(sample));
-//                 }
-//             }
-//             tmp_buf = leftover.to_vec();
-//         },
-//         err_fn,
-//         None,
-//     )?;
-//
-//     stream.play()?;
-//
-//     // Keep the thread alive. You might want to handle this differently, depending on your app structure.
-//     loop {
-//         std::thread::sleep(std::time::Duration::from_millis(1000));
-//     }
-// }
-// fn create_input_stream<I, F>(
-//     socket: Arc<UdpSocket>,
-//     client_addr: SocketAddr,
-//     config: &StreamConfig,
-//     device: &Device,
-//     err_fn: F,
-// ) -> std::result::Result<Stream, cpal::BuildStreamError>
-// where
-//     F: FnMut(cpal::StreamError) + Send + 'static,
-//     I: SizedSample + ByteRep + FromSample<i16>,
-//     i16: cpal::FromSample<I>,
-// {
-//     device.build_input_stream(
-//         config,
-//         move |data: &[I], _: &_| {
-//             let bytes = data
-//                 .iter()
-//                 .flat_map(|&x| x.to_local_ne_bytes().to_vec())
-//                 .collect::<Vec<u8>>();
-//
-//             let _ = socket.send_to(&bytes, client_addr);
-//         },
-//         err_fn,
-//         None,
-//     )
-// }
-
-// trait ByteRep {
-//     fn to_local_ne_bytes(&self) -> Vec<u8>;
-//     fn to_local_be_bytes(&self) -> Vec<u8>;
-// }
-//
-// impl ByteRep for i8 {
-//     fn to_local_ne_bytes(&self) -> Vec<u8> {
-//         self.to_ne_bytes().to_vec()
-//     }
-//     fn to_local_be_bytes(&self) -> Vec<u8> {
-//         self.to_be_bytes().to_vec()
-//     }
-// }
-//
-// impl ByteRep for i16 {
-//     fn to_local_ne_bytes(&self) -> Vec<u8> {
-//         self.to_ne_bytes().to_vec()
-//     }
-//     fn to_local_be_bytes(&self) -> Vec<u8> {
-//         self.to_be_bytes().to_vec()
-//     }
-// }
-//
-// impl ByteRep for i32 {
-//     fn to_local_ne_bytes(&self) -> Vec<u8> {
-//         self.to_ne_bytes().to_vec()
-//     }
-//     fn to_local_be_bytes(&self) -> Vec<u8> {
-//         self.to_be_bytes().to_vec()
-//     }
-// }
-//
-// impl ByteRep for i64 {
-//     fn to_local_ne_bytes(&self) -> Vec<u8> {
-//         self.to_ne_bytes().to_vec()
-//     }
-//     fn to_local_be_bytes(&self) -> Vec<u8> {
-//         self.to_be_bytes().to_vec()
-//     }
-// }
-//
-// impl ByteRep for f32 {
-//     fn to_local_ne_bytes(&self) -> Vec<u8> {
-//         self.to_ne_bytes().to_vec()
-//     }
-//     fn to_local_be_bytes(&self) -> Vec<u8> {
-//         self.to_be_bytes().to_vec()
-//     }
-// }
-//
-// impl ByteRep for f64 {
-//     fn to_local_ne_bytes(&self) -> Vec<u8> {
-//         self.to_ne_bytes().to_vec()
-//     }
-//     fn to_local_be_bytes(&self) -> Vec<u8> {
-//         self.to_be_bytes().to_vec()
-//     }
-// }
