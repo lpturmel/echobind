@@ -84,7 +84,6 @@ fn main() -> Result<()> {
                 println!("[TCP] Client connected from {}", client_addr);
 
                 println!("[UDP] Waiting for client to send UDP port...");
-                // Receive the UDP port sent by the client
                 let mut udp_port_buf = [0; 2];
                 tcp_stream.read_exact(&mut udp_port_buf)?;
                 let udp_port = u16::from_be_bytes(udp_port_buf);
@@ -272,7 +271,6 @@ fn main() -> Result<()> {
 
                     stream.play()?;
 
-                    // Keep the thread alive.
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(1000));
                     }
