@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub mod cli;
 pub mod error;
@@ -155,8 +156,14 @@ fn main() -> Result<()> {
                         );
                         drop(stream);
                     }
-                    Ok(e) => {
-                        println!("Received {} bytes from client: {:?}", e, &tcp_buf[..e]);
+                    Ok(len) => {
+                        println!("Received {} bytes from client: {:?}", len, &tcp_buf[..len]);
+                        let data = &tcp_buf[..len];
+                        let str = std::str::from_utf8(data).expect("Invalid UTF-8 data");
+                        if str == "ping" {
+                            tcp_stream.write_all(b"pong")?;
+                            tcp_stream.flush()?;
+                        }
                     }
                     Err(e) => {
                         eprintln!("Error reading from TCP stream: {}", e);
@@ -169,9 +176,9 @@ fn main() -> Result<()> {
             let tcp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.tcp_dest_port);
             let udp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.udp_dest_port);
             println!("[TCP] Connecting to {}...", tcp_target_ip);
-            let mut tcp_stream = loop {
+            let tcp_stream = loop {
                 match TcpStream::connect(tcp_target_ip) {
-                    Ok(stream) => break stream,
+                    Ok(stream) => break Arc::new(Mutex::new(stream)),
                     Err(e) => {
                         eprintln!(
                             "Failed to connect to server: {} retrying in 5 seconds...",
@@ -181,19 +188,41 @@ fn main() -> Result<()> {
                     }
                 }
             };
+
+            let tcp_stream_clone = tcp_stream.clone();
+            std::thread::spawn(move || loop {
+                let start = Instant::now();
+                let mut guard = tcp_stream_clone.lock().expect("Failed to lock TCP stream");
+                guard
+                    .write_all(b"ping")
+                    .expect("Failed to send ping to server");
+                let mut buf = [0; 4];
+                guard
+                    .read_exact(&mut buf)
+                    .expect("Failed to read pong from server");
+                let end = Instant::now();
+                let latency = end.duration_since(start).as_millis();
+                println!("[TCP] Latency: {}ms", latency);
+                drop(guard);
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            });
             println!("[TCP] Connected to server");
 
             println!("[TCP] Sending UDP port to server...");
-            tcp_stream
+            let mut guard = tcp_stream.lock().expect("Failed to lock TCP stream");
+            guard
                 .write_all(&cmd.udp_src_port.to_be_bytes())
                 .expect("Failed to send UDP port to server");
 
             let mut length_bytes = [0u8; 4]; // Buffer for the length, assuming we use u64
-            tcp_stream.read_exact(&mut length_bytes)?;
+            guard.read_exact(&mut length_bytes)?;
             let message_length = u32::from_be_bytes(length_bytes);
 
             let mut config_data_bytes = vec![0u8; message_length as usize];
-            tcp_stream.read_exact(&mut config_data_bytes)?;
+            guard.read_exact(&mut config_data_bytes)?;
+
+            drop(guard);
+
             let config_data = String::from_utf8(config_data_bytes).expect("Invalid config data");
             let config: Config = serde_json::from_str(&config_data)?;
 
