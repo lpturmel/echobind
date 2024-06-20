@@ -6,7 +6,11 @@ use cpal::StreamConfig;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::str::FromStr;
+use std::sync::mpsc::channel;
 use std::sync::Arc;
+use std::thread;
+
+const MAX_RETRIES: usize = 3;
 
 pub fn exec(cmd: &RecordCmd) -> Result<()> {
     let host = cpal::default_host();
@@ -69,6 +73,7 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
         println!("Sent stream configuration to client");
 
         let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
+        let (tx, rx) = channel::<Vec<f32>>();
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
                 let sample_rate = stream_config.sample_rate.0;
@@ -76,23 +81,39 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                 let mut encoder =
                     opus::Encoder::new(sample_rate, channels, opus::Application::LowDelay)
                         .expect("Failed to create encoder");
-                device.build_input_stream(
-                    &stream_config,
-                    move |data: &[f32], _: &_| {
+                let udp_listener_clone = udp_listener.clone();
+                thread::spawn(move || {
+                    for data in rx {
                         let samples = data
                             .iter()
                             .map(|&sample| (sample * i16::MAX as f32) as i16)
                             .collect::<Vec<i16>>();
                         let mut output = vec![0; samples.len() * 2]; // Output buffer for encoded data
-                        match encoder.encode(&samples, &mut output) {
-                            Ok(len) => {
-                                output.truncate(len);
-                                let _ = udp_listener.send_to(&output, udp_addr);
-                            }
-                            Err(e) => {
-                                eprintln!("Error encoding bytes... {}", e);
+                        let mut retries = 0;
+                        loop {
+                            match encoder.encode(&samples, &mut output) {
+                                Ok(len) => {
+                                    output.truncate(len);
+                                    let _ = udp_listener_clone.send_to(&output, udp_addr);
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("Error encoding bytes... {}", e);
+                                    retries += 1;
+                                    if retries >= MAX_RETRIES {
+                                        eprintln!("Max retries reached, dropping frame.");
+                                        break;
+                                    }
+                                }
                             }
                         }
+                    }
+                });
+
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _: &_| {
+                        let _ = tx.send(data.to_vec());
                     },
                     err_fn,
                     None,
