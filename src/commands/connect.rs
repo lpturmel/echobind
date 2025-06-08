@@ -68,8 +68,8 @@ pub fn exec(cmd: &ConnectCmd) -> Result<()> {
             break;
         }
         let end = Instant::now();
-        let latency = end.duration_since(start).as_millis();
-        info!("[TCP] Latency: {}ms", latency);
+        let latency = end.duration_since(start);
+        info!("[TCP] Latency: {:?}", latency);
         drop(guard);
     });
     let config_data = String::from_utf8(config_data_bytes).expect("Invalid config data");
