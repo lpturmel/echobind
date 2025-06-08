@@ -1,22 +1,29 @@
-use crate::cli::ConnectCmd;
-use crate::config::{count_to_channels, Config};
-use crate::error::{Error, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{StreamConfig, SupportedStreamConfig};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use crate::{
+    cli::ConnectCmd,
+    config::{count_to_channels, Config},
+    error::{Error, Result},
+};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    StreamConfig, SupportedStreamConfig,
+};
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream, UdpSocket},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+use tracing::{error, info};
 
 pub fn exec(cmd: &ConnectCmd) -> Result<()> {
     let tcp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.tcp_dest_port);
     let udp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.udp_dest_port);
-    println!("[TCP] Connecting to {}...", tcp_target_ip);
+    info!("[TCP] Connecting to {}...", tcp_target_ip);
     let tcp_stream = loop {
         match TcpStream::connect(tcp_target_ip) {
             Ok(stream) => break Arc::new(Mutex::new(stream)),
             Err(e) => {
-                eprintln!(
+                error!(
                     "Failed to connect to server: {} retrying in 5 seconds...",
                     e
                 );
@@ -26,15 +33,15 @@ pub fn exec(cmd: &ConnectCmd) -> Result<()> {
     };
 
     let tcp_stream_clone = tcp_stream.clone();
-    println!("[TCP] Connected to server");
+    info!("[TCP] Connected to server");
 
-    println!("[TCP] Sending UDP port to server...");
+    info!("[TCP] Sending UDP port to server...");
     let mut guard = tcp_stream.lock().expect("Failed to lock TCP stream");
     guard
         .write_all(&cmd.udp_src_port.to_be_bytes())
         .expect("Failed to send UDP port to server");
 
-    let mut length_bytes = [0u8; 4]; // Buffer for the length, assuming we use u64
+    let mut length_bytes = [0u8; 4];
     guard.read_exact(&mut length_bytes)?;
     let message_length = u32::from_be_bytes(length_bytes);
 
@@ -48,21 +55,21 @@ pub fn exec(cmd: &ConnectCmd) -> Result<()> {
         let start = Instant::now();
         let mut guard = tcp_stream_clone.lock().expect("Failed to lock TCP stream");
         if let Err(e) = guard.write_all(b"ping") {
-            eprintln!("Failed to send ping: {}", e);
+            error!("Failed to send ping: {}", e);
             break;
         }
         if let Err(e) = guard.flush() {
-            eprintln!("Failed to flush stream: {}", e);
+            error!("Failed to flush stream: {}", e);
             break;
         }
         let mut buf = [0; 4];
         if let Err(e) = guard.read_exact(&mut buf) {
-            eprintln!("Failed to read pong: {}", e);
+            error!("Failed to read pong: {}", e);
             break;
         }
         let end = Instant::now();
         let latency = end.duration_since(start).as_millis();
-        println!("[TCP] Latency: {}ms", latency);
+        info!("[TCP] Latency: {}ms", latency);
         drop(guard);
     });
     let config_data = String::from_utf8(config_data_bytes).expect("Invalid config data");
@@ -72,7 +79,7 @@ pub fn exec(cmd: &ConnectCmd) -> Result<()> {
     let device = host.default_output_device().ok_or(Error::NoAudioDevice)?;
     let config = SupportedStreamConfig::from(config);
     let sample_format = config.sample_format();
-    println!(
+    info!(
                 "Client is configured to process audio: Sample format: {:?}, Sample rate: {:?}, Channels: {:?}, Buffer size: {:?}",
                 sample_format,
                 config.sample_rate(),
@@ -80,7 +87,7 @@ pub fn exec(cmd: &ConnectCmd) -> Result<()> {
                 config.buffer_size()
             );
 
-    println!("[UDP] Binding to {}...", cmd.udp_src_port);
+    info!("[UDP] Binding to {}...", cmd.udp_src_port);
     let socket = UdpSocket::bind(format!("0.0.0.0:{}", cmd.udp_src_port))
         .expect("Failed to bind UDP socket");
     socket
@@ -90,7 +97,7 @@ pub fn exec(cmd: &ConnectCmd) -> Result<()> {
     let stream_config: StreamConfig = config.clone().into();
     match sample_format {
         cpal::SampleFormat::F32 => {
-            let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+            let err_fn = |err| error!("an error occurred on stream: {}", err);
 
             let socket = socket.try_clone().expect("Failed to clone socket");
 
@@ -102,7 +109,7 @@ pub fn exec(cmd: &ConnectCmd) -> Result<()> {
                 .expect("Failed to create decoder");
 
             let mut tmp_buf: Vec<f32> = Vec::new();
-            println!("Stream has started. Press Ctrl+C to terminate.");
+            info!("Stream has started. Press Ctrl+C to terminate.");
             let stream = device.build_output_stream(
                 &stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {

@@ -1,28 +1,34 @@
-use crate::cli::RecordCmd;
-use crate::config::{count_to_channels, BufferSize, Config};
-use crate::error::{Error, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::StreamConfig;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, UdpSocket};
-use std::str::FromStr;
-use std::sync::mpsc::channel;
-use std::sync::Arc;
-use std::thread;
+use crate::{
+    cli::RecordCmd,
+    config::{count_to_channels, BufferSize, Config},
+    error::{Error, Result},
+};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    StreamConfig,
+};
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, UdpSocket},
+    str::FromStr,
+    sync::{mpsc::channel, Arc},
+    thread,
+};
+use tracing::{error, info, warn};
 
 const MAX_RETRIES: usize = 3;
 
 pub fn exec(cmd: &RecordCmd) -> Result<()> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or(Error::NoAudioDevice)?;
-    println!(
+    info!(
         "Using input device: {}",
         device.name().expect("Invalid device name")
     );
     let config = device.default_output_config()?;
     let sample_format = config.sample_format();
     let stream_config: StreamConfig = config.clone().into();
-    println!(
+    info!(
                 "Server is configured to send audio: Sample format: {:?}, Sample rate: {:?}, Channels: {:?}, Buffer size: {:?}",
                 sample_format,
                 config.sample_rate(),
@@ -32,25 +38,25 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
 
     let tcp_addr = format!("0.0.0.0:{}", cmd.tcp_port);
     let tcp_addr = SocketAddr::from_str(&tcp_addr).expect("Invalid address");
-    println!("[TCP] Listening on {}...", tcp_addr);
+    info!("[TCP] Listening on {}...", tcp_addr);
     let udp_addr = format!("0.0.0.0:{}", cmd.udp_port);
     let udp_addr = SocketAddr::from_str(&udp_addr).expect("Invalid address");
-    println!("[UDP] Listening on {}...", udp_addr);
+    info!("[UDP] Listening on {}...", udp_addr);
 
     let tcp_listener = TcpListener::bind(tcp_addr)?;
     let udp_listener = Arc::new(UdpSocket::bind(udp_addr)?);
 
     loop {
         let udp_listener = udp_listener.clone();
-        println!("[TCP] Waiting for client to connect...");
+        info!("[TCP] Waiting for client to connect...");
         let (mut tcp_stream, client_addr) = tcp_listener.accept()?;
-        println!("[TCP] Client connected from {}", client_addr);
+        info!("[TCP] Client connected from {}", client_addr);
 
-        println!("[UDP] Waiting for client to send UDP port...");
+        info!("[UDP] Waiting for client to send UDP port...");
         let mut udp_port_buf = [0; 2];
         tcp_stream.read_exact(&mut udp_port_buf)?;
         let udp_port = u16::from_be_bytes(udp_port_buf);
-        println!("[UDP] Client using UDP port: {}", udp_port);
+        info!("[UDP] Client using UDP port: {}", udp_port);
 
         let udp_addr = format!("{}:{}", client_addr.ip(), udp_port);
         let udp_addr = SocketAddr::from_str(&udp_addr).expect("Invalid address");
@@ -70,9 +76,8 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
         tcp_stream.write_all(&data_length.to_be_bytes())?; // Send the length of the config data
         tcp_stream.write_all(config_data)?; // Send the config data
         tcp_stream.flush()?;
-        println!("Sent stream configuration to client");
 
-        let err_fn = |err| eprintln!("an error occurred on the audio stream: {}", err);
+        let err_fn = |err| error!("an error occurred on the audio stream: {}", err);
         let (tx, rx) = channel::<Vec<f32>>();
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
@@ -97,11 +102,10 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                                     let _ = udp_listener_clone.send_to(&output, udp_addr);
                                     break;
                                 }
-                                Err(e) => {
-                                    eprintln!("Error encoding bytes... {}", e);
+                                Err(_) => {
                                     retries += 1;
                                     if retries >= MAX_RETRIES {
-                                        eprintln!("Max retries reached, dropping frame.");
+                                        warn!("Max retries reached, dropping frame.");
                                         break;
                                     }
                                 }
@@ -125,35 +129,35 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
         }?;
 
         stream.play()?;
-        println!("Audio stream started. Press Ctrl+C to terminate.");
+        info!("Audio stream started. Press Ctrl+C to terminate.");
         let mut tcp_buf = [0; 512];
         let mut connected = true;
         while connected {
             match tcp_stream.read(&mut tcp_buf) {
                 Ok(0) => {
-                    println!(
+                    info!(
                         "Client {} disconnected, stopping audio stream...",
                         client_addr
                     );
                     connected = false;
                 }
                 Ok(len) => {
-                    println!("Received {} bytes from client: {:?}", len, &tcp_buf[..len]);
+                    info!("Received {} bytes from client: {:?}", len, &tcp_buf[..len]);
                     let data = &tcp_buf[..len];
                     let str = std::str::from_utf8(data).expect("Invalid UTF-8 data");
                     if str == "ping" {
-                        println!("Received ping from client, sending pong...");
+                        info!("Received ping from client, sending pong...");
                         tcp_stream.write_all(b"pong")?;
                         tcp_stream.flush()?;
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from TCP stream: {}", e);
+                    error!("Error reading from TCP stream: {}", e);
                 }
             }
         }
         drop(tcp_stream);
         drop(stream);
-        println!("Audio stream stopped.");
+        info!("Audio stream stopped.");
     }
 }
