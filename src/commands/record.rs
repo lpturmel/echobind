@@ -73,8 +73,8 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
         })?;
         let config_data = config_data.as_bytes();
         let data_length = config_data.len() as u32;
-        tcp_stream.write_all(&data_length.to_be_bytes())?; // Send the length of the config data
-        tcp_stream.write_all(config_data)?; // Send the config data
+        tcp_stream.write_all(&data_length.to_be_bytes())?;
+        tcp_stream.write_all(config_data)?;
         tcp_stream.flush()?;
 
         let err_fn = |err| error!("an error occurred on the audio stream: {}", err);
@@ -89,14 +89,10 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                 let udp_listener_clone = udp_listener.clone();
                 thread::spawn(move || {
                     for data in rx {
-                        let samples = data
-                            .iter()
-                            .map(|&sample| (sample * i16::MAX as f32) as i16)
-                            .collect::<Vec<i16>>();
-                        let mut output = vec![0; samples.len() * 2]; // Output buffer for encoded data
+                        let mut output = vec![0; 2048]; // Output buffer for encoded data
                         let mut retries = 0;
                         loop {
-                            match encoder.encode(&samples, &mut output) {
+                            match encoder.encode_float(&data, &mut output) {
                                 Ok(len) => {
                                     output.truncate(len);
                                     let _ = udp_listener_clone.send_to(&output, udp_addr);
