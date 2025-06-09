@@ -89,7 +89,7 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                 let udp_listener_clone = udp_listener.clone();
                 thread::spawn(move || {
                     for data in rx {
-                        let mut output = vec![0; 2048]; // Output buffer for encoded data
+                        let mut output = vec![0; 2048];
                         let mut retries = 0;
                         loop {
                             match encoder.encode_float(&data, &mut output) {
@@ -137,16 +137,7 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                     );
                     connected = false;
                 }
-                Ok(len) => {
-                    info!("Received {} bytes from client: {:?}", len, &tcp_buf[..len]);
-                    let data = &tcp_buf[..len];
-                    let str = std::str::from_utf8(data).expect("Invalid UTF-8 data");
-                    if str == "ping" {
-                        info!("Received ping from client, sending pong...");
-                        tcp_stream.write_all(b"pong")?;
-                        tcp_stream.flush()?;
-                    }
-                }
+                Ok(_) => {}
                 Err(e) => {
                     error!("Error reading from TCP stream: {}", e);
                 }

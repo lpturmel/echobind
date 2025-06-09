@@ -10,6 +10,7 @@ pub enum Error {
     Json(serde_json::Error),
     NoAudioDevice,
     UnsupportedSampleFormat(cpal::SampleFormat),
+    ServerDisconnected,
 }
 
 impl std::fmt::Display for Error {
@@ -22,6 +23,7 @@ impl std::fmt::Display for Error {
             Error::SupportedConfigs(e) => write!(f, "Failed to get supported configs: {}", e),
             Error::Json(e) => write!(f, "Failed to parse JSON: {}", e),
             Error::NoAudioDevice => write!(f, "No audio device found"),
+            Error::ServerDisconnected => write!(f, "Server disconnected"),
             Error::UnsupportedSampleFormat(e) => {
                 write!(f, "Unsupported sample format: {:?}", e)
             }
