@@ -11,6 +11,7 @@ pub enum Error {
     NoAudioDevice,
     UnsupportedSampleFormat(cpal::SampleFormat),
     ServerDisconnected,
+    Opus(opus::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -27,6 +28,7 @@ impl std::fmt::Display for Error {
             Error::UnsupportedSampleFormat(e) => {
                 write!(f, "Unsupported sample format: {:?}", e)
             }
+            Error::Opus(e) => write!(f, "Opus error: {}", e),
         }
     }
 }
@@ -46,6 +48,12 @@ impl From<std::io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Error::Json(value)
+    }
+}
+
+impl From<opus::Error> for Error {
+    fn from(err: opus::Error) -> Self {
+        Error::Opus(err)
     }
 }
 

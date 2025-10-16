@@ -1,7 +1,6 @@
-use std::net::Ipv4Addr;
-
 use crate::{DEFAULT_TCP_PORT, DEFAULT_UDP_PORT};
 use clap::{Args, Parser, Subcommand};
+use std::net::Ipv4Addr;
 
 #[derive(Parser)]
 #[clap(author = "Louis-Philippe Turmel", version, about, long_about = None)]
