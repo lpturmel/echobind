@@ -1,7 +1,9 @@
 use crate::{
     cli::ConnectCmd,
+    commands::record::DISCONNECT_TIMEOUT,
     config::{count_to_channels, Config},
     error::{Error, Result},
+    protocol::Packet,
 };
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -9,8 +11,7 @@ use cpal::{
 };
 use std::{
     collections::VecDeque,
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream, UdpSocket},
+    net::{SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -21,9 +22,11 @@ use std::{
 use tracing::{error, info, warn};
 
 const MAX_BUFFER_MS: u32 = 250;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 type Shared<T> = Arc<Mutex<T>>;
 type AudioBuf = Shared<VecDeque<f32>>;
+type SharedInstant = Arc<Mutex<Instant>>;
 
 #[derive(Copy, Clone, Debug)]
 enum Ctrl {
@@ -76,42 +79,15 @@ fn run_once(
     ctrl_tx: &mpsc::Sender<Ctrl>,
     ctrl_rx: &mpsc::Receiver<Ctrl>,
 ) -> Result<()> {
-    let tcp_target_ip = SocketAddr::new(cmd.ip.into(), cmd.tcp_dest_port);
-    info!("[TCP] Connecting to {tcp_target_ip} …");
-
-    let tcp_stream = loop {
-        match TcpStream::connect_timeout(&tcp_target_ip, Duration::from_secs(3)) {
-            Ok(s) => break Arc::new(Mutex::new(s)),
-            Err(e) => {
-                error!("TCP connect failed: {e} – retrying");
-                thread::sleep(Duration::from_secs(2));
-            }
-        }
-    };
-    info!("[TCP] Connected");
-
-    tcp_stream
-        .lock()
-        .unwrap()
-        .write_all(&cmd.udp_src_port.to_be_bytes())?;
-
-    let cfg: Config = {
-        let mut g = tcp_stream.lock().unwrap();
-        let mut len = [0u8; 4];
-        g.read_exact(&mut len)?;
-        let json_len = u32::from_be_bytes(len) as usize;
-        let mut json = vec![0u8; json_len];
-        g.read_exact(&mut json)?;
-        serde_json::from_slice(&json)?
-    };
-
     info!(
-        "[UDP] Binding 0.0.0.0:{} → {}:{}",
-        cmd.udp_src_port, cmd.ip, cmd.udp_dest_port
+        "[UDP] Binding 0.0.0.0:{} -> {}:{}",
+        cmd.src_port, cmd.ip, cmd.dest_port
     );
-    let udp_socket = UdpSocket::bind(("0.0.0.0", cmd.udp_src_port))?;
+    let udp_socket = UdpSocket::bind(("0.0.0.0", cmd.src_port))?;
     udp_socket.set_read_timeout(Some(Duration::from_millis(200)))?;
-    udp_socket.connect(SocketAddr::new(cmd.ip.into(), cmd.udp_dest_port))?;
+    udp_socket.connect(SocketAddr::new(cmd.ip.into(), cmd.dest_port))?;
+
+    let cfg = request_config(&udp_socket)?;
 
     let host_rate = SampleRate(cfg.sample_rate);
     let opus_ch = count_to_channels(cfg.channels);
@@ -121,37 +97,59 @@ fn run_once(
     let buffer: AudioBuf = Arc::new(Mutex::new(VecDeque::with_capacity(buf_cap)));
     let playing = Arc::new(AtomicBool::new(true));
     let running = Arc::new(AtomicBool::new(true));
+    let last_server_response: SharedInstant = Arc::new(Mutex::new(Instant::now()));
+
+    let mut stream = Some(build_stream(
+        host,
+        &StreamConfig {
+            channels: cfg.channels,
+            sample_rate: host_rate,
+            buffer_size: BufferSize::Default,
+        },
+        buffer.clone(),
+        playing.clone(),
+    )?);
 
     let prod_handle = {
         let sock = udp_socket.try_clone()?;
         let buf = buffer.clone();
         let play = playing.clone();
         let run = running.clone();
+        let last_response = last_server_response.clone();
         thread::spawn(move || {
             let mut pkt = [0u8; 1500];
             let mut tmp = vec![0.0f32; 4096];
             while run.load(Ordering::Relaxed) {
-                if !play.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
                 match sock.recv(&mut pkt) {
-                    Ok(sz) => match opus_decoder.decode_float(&pkt[..sz], &mut tmp, false) {
-                        Ok(fr) => {
-                            let mut g = buf.lock().unwrap();
-                            let samples = &tmp[..fr * opus_ch as usize];
-                            while g.len() + samples.len() > buf_cap {
-                                g.pop_front();
+                    Ok(sz) => match Packet::try_from(&pkt[..sz]) {
+                        Ok(Packet::Audio(payload)) => {
+                            *last_response.lock().unwrap() = Instant::now();
+                            if !play.load(Ordering::Relaxed) {
+                                continue;
                             }
-                            g.extend(samples);
-                        }
-                        Err(e) => {
-                            let code = e.code();
-                            if let opus::ErrorCode::BufferTooSmall = code {
-                                tmp.resize(tmp.len() * 2, 0.0);
+                            match opus_decoder.decode_float(payload, &mut tmp, false) {
+                                Ok(fr) => {
+                                    let mut g = buf.lock().unwrap();
+                                    let samples = &tmp[..fr * opus_ch as usize];
+                                    while g.len() + samples.len() > buf_cap {
+                                        g.pop_front();
+                                    }
+                                    g.extend(samples);
+                                }
+                                Err(e) => {
+                                    let code = e.code();
+                                    if let opus::ErrorCode::BufferTooSmall = code {
+                                        tmp.resize(tmp.len() * 2, 0.0);
+                                    }
+                                    warn!("Opus err: {e}")
+                                }
                             }
-                            warn!("Opus err: {e}")
                         }
+                        Ok(Packet::Pong(_)) | Ok(Packet::Config(_)) => {
+                            *last_response.lock().unwrap() = Instant::now();
+                        }
+                        Ok(Packet::Hello) | Ok(Packet::Ping(_)) => {}
+                        Err(_) => warn!("Ignoring invalid UDP packet from server"),
                     },
                     Err(ref e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
@@ -169,39 +167,38 @@ fn run_once(
         })
     };
 
-    {
-        let stream = tcp_stream.clone();
-        let tx = ctrl_tx.clone();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(5));
-            let start = Instant::now();
-            let mut g = match stream.lock() {
-                Ok(guard) => guard,
-                Err(_) => break,
-            };
-            if g.write_all(b"ping").is_err() || g.flush().is_err() {
-                let _ = tx.send(Ctrl::ServerLost);
-                break;
+    let heartbeat_handle = {
+        let sock = udp_socket.try_clone()?;
+        let run = running.clone();
+        thread::spawn(move || {
+            let mut packet = Vec::new();
+            let mut id = 0_u64;
+            while run.load(Ordering::Relaxed) {
+                Packet::Ping(id).encode(&mut packet);
+                if let Err(err) = sock.send(&packet) {
+                    warn!("UDP ping failed: {err}");
+                }
+                id = id.wrapping_add(1);
+                thread::sleep(HEARTBEAT_INTERVAL);
             }
-            let mut pong = [0u8; 4];
-            if g.read_exact(&mut pong).is_err() {
-                let _ = tx.send(Ctrl::ServerLost);
-                break;
-            }
-            let _ = start.elapsed();
-        });
-    }
+        })
+    };
 
-    let mut stream = Some(build_stream(
-        host,
-        &StreamConfig {
-            channels: cfg.channels,
-            sample_rate: host_rate,
-            buffer_size: BufferSize::Default,
-        },
-        buffer.clone(),
-        playing.clone(),
-    )?);
+    let monitor_handle = {
+        let tx = ctrl_tx.clone();
+        let run = running.clone();
+        let last_response = last_server_response.clone();
+        thread::spawn(move || {
+            while run.load(Ordering::Relaxed) {
+                let elapsed = last_response.lock().unwrap().elapsed();
+                if elapsed >= DISCONNECT_TIMEOUT {
+                    let _ = tx.send(Ctrl::ServerLost);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
 
     info!("🔊 Playback started – awaiting events");
 
@@ -211,7 +208,7 @@ fn run_once(
                 playing.store(false, Ordering::Relaxed);
                 buffer.lock().unwrap().clear();
                 stream.take();
-                stream = Some(build_stream(
+                let rebuilt = build_stream(
                     host,
                     &StreamConfig {
                         channels: cfg.channels,
@@ -220,21 +217,73 @@ fn run_once(
                     },
                     buffer.clone(),
                     playing.clone(),
-                )?);
-                playing.store(true, Ordering::Relaxed);
+                );
+                match rebuilt {
+                    Ok(new_stream) => {
+                        stream = Some(new_stream);
+                        playing.store(true, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        running.store(false, Ordering::Relaxed);
+                        prod_handle.join().unwrap();
+                        heartbeat_handle.join().unwrap();
+                        monitor_handle.join().unwrap();
+                        return Err(err);
+                    }
+                }
             }
             Ctrl::ServerLost => {
-                info!("Control connection dropped – cleaning up");
+                info!("UDP server timed out – cleaning up");
                 playing.store(false, Ordering::Relaxed);
                 running.store(false, Ordering::Relaxed);
                 buffer.lock().unwrap().clear();
                 prod_handle.join().unwrap();
+                heartbeat_handle.join().unwrap();
+                monitor_handle.join().unwrap();
                 stream.take();
                 return Err(Error::ServerDisconnected);
             }
         }
     }
 }
+
+fn request_config(socket: &UdpSocket) -> Result<Config> {
+    let mut hello = Vec::new();
+    let mut pkt = [0u8; 1500];
+    let mut last_hello = None::<Instant>;
+    let started = Instant::now();
+
+    Packet::Hello.encode(&mut hello);
+    info!("[UDP] Sending hello and waiting for audio config");
+
+    loop {
+        if last_hello
+            .map(|sent| sent.elapsed() >= Duration::from_millis(500))
+            .unwrap_or(true)
+        {
+            socket.send(&hello)?;
+            last_hello = Some(Instant::now());
+        }
+
+        match socket.recv(&mut pkt) {
+            Ok(sz) => match Packet::try_from(&pkt[..sz]) {
+                Ok(Packet::Config(json)) => return Ok(serde_json::from_slice(json)?),
+                Ok(Packet::Pong(_)) | Ok(Packet::Audio(_)) => {}
+                Ok(Packet::Hello) | Ok(Packet::Ping(_)) => {}
+                Err(_) => warn!("Ignoring invalid UDP packet while waiting for config"),
+            },
+            Err(ref err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        if started.elapsed() >= DISCONNECT_TIMEOUT {
+            return Err(Error::ServerDisconnected);
+        }
+    }
+}
+
 fn build_stream(
     host: &cpal::Host,
     template: &StreamConfig,

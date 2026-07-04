@@ -2,22 +2,24 @@ use crate::{
     cli::RecordCmd,
     config::{count_to_channels, BufferSize, Config},
     error::{Error, Result},
+    protocol::Packet,
 };
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     StreamConfig,
 };
 use std::{
-    io::{Read, Write},
-    net::{SocketAddr, TcpListener, UdpSocket},
+    net::{SocketAddr, UdpSocket},
     str::FromStr,
     sync::{mpsc::channel, Arc},
     thread,
+    time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
 
 const MAX_RETRIES: usize = 3;
 const OPUS_FRAME_MS: usize = 20;
+pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn exec(cmd: &RecordCmd) -> Result<()> {
     let host = cpal::default_host();
@@ -88,55 +90,39 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
         config.buffer_size()
     );
 
-    let tcp_addr = format!("0.0.0.0:{}", cmd.tcp_port);
-    let tcp_addr = SocketAddr::from_str(&tcp_addr).expect("Invalid address");
-    info!("[TCP] Listening on {}...", tcp_addr);
-    let udp_addr = format!("0.0.0.0:{}", cmd.udp_port);
+    let udp_addr = format!("0.0.0.0:{}", cmd.port);
     let udp_addr = SocketAddr::from_str(&udp_addr).expect("Invalid address");
     info!("[UDP] Listening on {}...", udp_addr);
 
-    let tcp_listener = TcpListener::bind(tcp_addr)?;
     let udp_listener = Arc::new(UdpSocket::bind(udp_addr)?);
+    udp_listener.set_read_timeout(Some(Duration::from_millis(200)))?;
+
+    let (min, max) = match config.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => (*min, *max),
+        cpal::SupportedBufferSize::Unknown => (0_u32, 0_u32),
+    };
+    let config_data = serde_json::to_vec(&Config {
+        sample_format: format!("{}", sample_format),
+        sample_rate: negotiated_sample_rate,
+        channels: stream_config.channels,
+        buffer_size: BufferSize { min, max },
+    })?;
+    let mut config_packet = Vec::new();
+    Packet::Config(&config_data).encode(&mut config_packet);
 
     loop {
-        let udp_listener = udp_listener.clone();
-        info!("[TCP] Waiting for client to connect...");
-        let (mut tcp_stream, client_addr) = tcp_listener.accept()?;
-        info!("[TCP] Client connected from {}", client_addr);
-
-        info!("[UDP] Waiting for client to send UDP port...");
-        let mut udp_port_buf = [0; 2];
-        tcp_stream.read_exact(&mut udp_port_buf)?;
-        let udp_port = u16::from_be_bytes(udp_port_buf);
-        info!("[UDP] Client using UDP port: {}", udp_port);
-
-        let udp_addr = format!("{}:{}", client_addr.ip(), udp_port);
-        let udp_addr = SocketAddr::from_str(&udp_addr).expect("Invalid address");
-
-        let (min, max) = match config.buffer_size() {
-            cpal::SupportedBufferSize::Range { min, max } => (*min, *max),
-            cpal::SupportedBufferSize::Unknown => (0_u32, 0_u32),
-        };
-        let config_data = serde_json::to_string(&Config {
-            sample_format: format!("{}", sample_format),
-            sample_rate: negotiated_sample_rate,
-            channels: stream_config.channels,
-            buffer_size: BufferSize { min, max },
-        })?;
-        let config_data = config_data.as_bytes();
-        let data_length = config_data.len() as u32;
-        tcp_stream.write_all(&data_length.to_be_bytes())?;
-        tcp_stream.write_all(config_data)?;
-        tcp_stream.flush()?;
+        info!("[UDP] Waiting for client hello...");
+        let client_addr = wait_for_client(&udp_listener, &config_packet)?;
+        info!("[UDP] Client connected from {}", client_addr);
 
         let err_fn = |err| error!("an error occurred on the audio stream: {}", err);
         let (tx, rx) = channel::<Vec<f32>>();
-        let stream = match sample_format {
+        match sample_format {
             cpal::SampleFormat::F32 => {
                 let sample_rate = negotiated_sample_rate;
                 let channels = count_to_channels(stream_config.channels);
                 let channel_count = stream_config.channels as usize;
-                if sample_rate % 50 != 0 {
+                if !sample_rate.is_multiple_of(50) {
                     warn!(
                         "Sample rate {} does not align perfectly with 20ms Opus frames; audio may be degraded",
                         sample_rate
@@ -146,9 +132,10 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                 let mut encoder =
                     opus::Encoder::new(sample_rate, channels, opus::Application::LowDelay)?;
                 let udp_listener_clone = udp_listener.clone();
-                thread::spawn(move || {
+                let encoder_handle = thread::spawn(move || {
                     let mut pending = Vec::<f32>::with_capacity(frame_len * 2);
                     let mut output = vec![0; 2048];
+                    let mut packet = Vec::with_capacity(output.len() + 5);
                     for data in rx {
                         pending.extend(data);
                         while pending.len() >= frame_len {
@@ -157,7 +144,8 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                                 match encoder.encode_float(&pending[..frame_len], &mut output) {
                                     Ok(len) => {
                                         output.truncate(len);
-                                        let _ = udp_listener_clone.send_to(&output, udp_addr);
+                                        Packet::Audio(&output).encode(&mut packet);
+                                        let _ = udp_listener_clone.send_to(&packet, client_addr);
                                         output.resize(2048, 0);
                                         break;
                                     }
@@ -183,41 +171,101 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                     }
                 });
 
-                device.build_input_stream(
+                let stream = device.build_input_stream(
                     &stream_config,
                     move |data: &[f32], _: &_| {
                         let _ = tx.send(data.to_vec());
                     },
                     err_fn,
                     None,
-                )
+                )?;
+                stream.play()?;
+                info!("Audio stream started. Press Ctrl+C to terminate.");
+                monitor_client(&udp_listener, client_addr, &config_packet);
+                drop(stream);
+                let _ = encoder_handle.join();
+                info!("Audio stream stopped.");
+                continue;
             }
             sample_format => {
                 return Err(Error::UnsupportedSampleFormat(sample_format));
             }
-        }?;
+        }
+    }
+}
 
-        stream.play()?;
-        info!("Audio stream started. Press Ctrl+C to terminate.");
-        let mut tcp_buf = [0; 512];
-        let mut connected = true;
-        while connected {
-            match tcp_stream.read(&mut tcp_buf) {
-                Ok(0) => {
-                    info!(
-                        "Client {} disconnected, stopping audio stream...",
-                        client_addr
-                    );
-                    connected = false;
+fn wait_for_client(socket: &UdpSocket, config_packet: &[u8]) -> Result<SocketAddr> {
+    let mut pkt = [0u8; 1500];
+    loop {
+        let (sz, addr) = match socket.recv_from(&mut pkt) {
+            Ok(packet) => packet,
+            Err(ref err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        match Packet::try_from(&pkt[..sz]) {
+            Ok(Packet::Hello) => {
+                socket.send_to(config_packet, addr)?;
+                return Ok(addr);
+            }
+            Ok(Packet::Ping(id)) => {
+                let mut pong = Vec::new();
+                Packet::Pong(id).encode(&mut pong);
+                socket.send_to(&pong, addr)?;
+            }
+            Ok(_) => {}
+            Err(_) => warn!("Ignoring invalid UDP packet from {addr}"),
+        }
+    }
+}
+
+fn monitor_client(socket: &UdpSocket, client_addr: SocketAddr, config_packet: &[u8]) {
+    let mut pkt = [0u8; 1500];
+    let mut response = Vec::new();
+    let mut last_seen = Instant::now();
+
+    loop {
+        if last_seen.elapsed() >= DISCONNECT_TIMEOUT {
+            info!(
+                "Client {} timed out after {} seconds without a UDP answer",
+                client_addr,
+                DISCONNECT_TIMEOUT.as_secs()
+            );
+            break;
+        }
+
+        match socket.recv_from(&mut pkt) {
+            Ok((sz, addr)) if addr == client_addr => match Packet::try_from(&pkt[..sz]) {
+                Ok(Packet::Hello) => {
+                    last_seen = Instant::now();
+                    if let Err(err) = socket.send_to(config_packet, client_addr) {
+                        warn!("Failed to resend config to {client_addr}: {err}");
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    error!("Error reading from TCP stream: {}", e);
+                Ok(Packet::Ping(id)) => {
+                    last_seen = Instant::now();
+                    Packet::Pong(id).encode(&mut response);
+                    if let Err(err) = socket.send_to(&response, client_addr) {
+                        warn!("Failed to send pong to {client_addr}: {err}");
+                    }
                 }
+                Ok(_) => {
+                    last_seen = Instant::now();
+                }
+                Err(_) => warn!("Ignoring invalid UDP packet from {addr}"),
+            },
+            Ok((_, addr)) => warn!("Ignoring UDP packet from non-active client {addr}"),
+            Err(ref err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(err) => {
+                warn!("UDP receive error while monitoring {client_addr}: {err}");
+                break;
             }
         }
-        drop(tcp_stream);
-        drop(stream);
-        info!("Audio stream stopped.");
     }
 }

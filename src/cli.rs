@@ -1,4 +1,4 @@
-use crate::{DEFAULT_TCP_PORT, DEFAULT_UDP_PORT};
+use crate::DEFAULT_UDP_PORT;
 use clap::{Args, Parser, Subcommand};
 use std::net::Ipv4Addr;
 
@@ -19,26 +19,20 @@ pub enum Commands {
 
 #[derive(Args, Debug)]
 pub struct RecordCmd {
-    #[arg(short, long, default_value_t = DEFAULT_TCP_PORT)]
-    /// The TCP source port to record on
-    pub tcp_port: u16,
     #[arg(short, long, default_value_t = DEFAULT_UDP_PORT)]
-    /// The UDP source port to record on
-    pub udp_port: u16,
+    /// The UDP port to record on
+    pub port: u16,
 }
 
 #[derive(Args, Debug)]
 pub struct ConnectCmd {
-    #[arg(short, long, default_value_t = DEFAULT_TCP_PORT)]
-    /// The destination TCP port to connect to
-    pub tcp_dest_port: u16,
-    #[arg(long, default_value_t = DEFAULT_UDP_PORT)]
+    #[arg(short, long, default_value_t = DEFAULT_UDP_PORT)]
     /// The destination UDP port to connect to
-    pub udp_dest_port: u16,
+    pub dest_port: u16,
 
     #[arg(long, default_value_t = DEFAULT_UDP_PORT)]
     /// The UDP source port to use
-    pub udp_src_port: u16,
+    pub src_port: u16,
 
     #[arg(short, long)]
     /// The destination IP to connect to
