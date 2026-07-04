@@ -6,8 +6,8 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod protocol;
 
-const DEFAULT_TCP_PORT: u16 = 3012;
 const DEFAULT_UDP_PORT: u16 = 3013;
 
 fn main() -> Result<()> {

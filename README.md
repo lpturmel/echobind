@@ -16,19 +16,20 @@ Add `./target/release/echobind` to your `PATH` variable.
 ## Server
 
 ```
-echobind record
+echobind record --port 3013
 ```
 
 
 ## Client
 
 ```
-echobind connect --ip X.X.X.X
+echobind connect --ip X.X.X.X --dest-port 3013 --src-port 3013
 ```
 
 ## Default ports
 
-TCP: 3012
 UDP: 3013
 
-Both can be overrided with cli parameters to both commands
+Echobind now uses UDP for setup, heartbeat, and audio. The client sends a
+UDP hello to receive the audio config, then sends periodic UDP pings; either
+side treats 3 seconds without a UDP response as a disconnect.
