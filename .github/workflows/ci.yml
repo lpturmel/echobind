@@ -20,7 +20,8 @@ jobs:
       run: cargo test --release
 
     - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: echobind-windows
         path: target/release/echobind.exe
+        if-no-files-found: error
