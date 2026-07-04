@@ -1,5 +1,6 @@
 use crate::{
     cli::RecordCmd,
+    clipboard::{self, ClipboardBehavior, SystemClipboard},
     config::{count_to_channels, BufferSize, Config},
     error::{Error, Result},
     protocol::Packet,
@@ -11,7 +12,11 @@ use cpal::{
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
-    sync::{mpsc::channel, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::channel,
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -114,6 +119,14 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
         info!("[UDP] Waiting for client hello...");
         let client_addr = wait_for_client(&udp_listener, &config_packet)?;
         info!("[UDP] Client connected from {}", client_addr);
+        let clipboard_running = cmd.clipboard.then(|| Arc::new(AtomicBool::new(true)));
+        let clipboard = cmd
+            .clipboard
+            .then(|| clipboard::peer_clipboard(udp_listener.clone(), client_addr));
+        let clipboard_handle = clipboard
+            .as_ref()
+            .zip(clipboard_running.as_ref())
+            .map(|(clipboard, running)| clipboard.spawn_polling(running.clone()));
 
         let err_fn = |err| error!("an error occurred on the audio stream: {}", err);
         let (tx, rx) = channel::<Vec<f32>>();
@@ -181,13 +194,25 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                 )?;
                 stream.play()?;
                 info!("Audio stream started. Press Ctrl+C to terminate.");
-                monitor_client(&udp_listener, client_addr, &config_packet);
+                monitor_client(&udp_listener, client_addr, &config_packet, clipboard);
+                if let Some(running) = clipboard_running {
+                    running.store(false, Ordering::Relaxed);
+                }
                 drop(stream);
                 let _ = encoder_handle.join();
+                if let Some(clipboard_handle) = clipboard_handle {
+                    let _ = clipboard_handle.join();
+                }
                 info!("Audio stream stopped.");
                 continue;
             }
             sample_format => {
+                if let Some(running) = clipboard_running {
+                    running.store(false, Ordering::Relaxed);
+                }
+                if let Some(clipboard_handle) = clipboard_handle {
+                    let _ = clipboard_handle.join();
+                }
                 return Err(Error::UnsupportedSampleFormat(sample_format));
             }
         }
@@ -223,7 +248,12 @@ fn wait_for_client(socket: &UdpSocket, config_packet: &[u8]) -> Result<SocketAdd
     }
 }
 
-fn monitor_client(socket: &UdpSocket, client_addr: SocketAddr, config_packet: &[u8]) {
+fn monitor_client(
+    socket: &UdpSocket,
+    client_addr: SocketAddr,
+    config_packet: &[u8],
+    clipboard: Option<SystemClipboard>,
+) {
     let mut pkt = [0u8; 1500];
     let mut response = Vec::new();
     let mut last_seen = Instant::now();
@@ -251,6 +281,14 @@ fn monitor_client(socket: &UdpSocket, client_addr: SocketAddr, config_packet: &[
                     Packet::Pong(id).encode(&mut response);
                     if let Err(err) = socket.send_to(&response, client_addr) {
                         warn!("Failed to send pong to {client_addr}: {err}");
+                    }
+                }
+                Ok(Packet::Clipboard(chunk)) => {
+                    last_seen = Instant::now();
+                    if let Some(clipboard) = &clipboard {
+                        if let Err(err) = clipboard.receive_chunk(chunk) {
+                            warn!("Failed to apply remote clipboard from {client_addr}: {err}");
+                        }
                     }
                 }
                 Ok(_) => {

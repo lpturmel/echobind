@@ -22,6 +22,10 @@ pub struct RecordCmd {
     #[arg(short, long, default_value_t = DEFAULT_UDP_PORT)]
     /// The UDP port to record on
     pub port: u16,
+
+    #[arg(short, long)]
+    /// Sync text clipboard changes with the remote peer
+    pub clipboard: bool,
 }
 
 #[derive(Args, Debug)]
@@ -37,4 +41,8 @@ pub struct ConnectCmd {
     #[arg(short, long)]
     /// The destination IP to connect to
     pub ip: Ipv4Addr,
+
+    #[arg(short, long)]
+    /// Sync text clipboard changes with the remote peer
+    pub clipboard: bool,
 }

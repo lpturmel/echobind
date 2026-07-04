@@ -1,5 +1,6 @@
 use crate::{
     cli::ConnectCmd,
+    clipboard::{self, ClipboardBehavior},
     commands::record::DISCONNECT_TIMEOUT,
     config::{count_to_channels, Config},
     error::{Error, Result},
@@ -86,6 +87,7 @@ fn run_once(
     let udp_socket = UdpSocket::bind(("0.0.0.0", cmd.src_port))?;
     udp_socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     udp_socket.connect(SocketAddr::new(cmd.ip.into(), cmd.dest_port))?;
+    let udp_socket = Arc::new(udp_socket);
 
     let cfg = request_config(&udp_socket)?;
 
@@ -98,6 +100,12 @@ fn run_once(
     let playing = Arc::new(AtomicBool::new(true));
     let running = Arc::new(AtomicBool::new(true));
     let last_server_response: SharedInstant = Arc::new(Mutex::new(Instant::now()));
+    let clipboard = cmd
+        .clipboard
+        .then(|| clipboard::connected_clipboard(udp_socket.clone()));
+    let mut clipboard_handle = clipboard
+        .as_ref()
+        .map(|clipboard| clipboard.spawn_polling(running.clone()));
 
     let mut stream = Some(build_stream(
         host,
@@ -116,6 +124,7 @@ fn run_once(
         let play = playing.clone();
         let run = running.clone();
         let last_response = last_server_response.clone();
+        let clipboard = clipboard.clone();
         thread::spawn(move || {
             let mut pkt = [0u8; 1500];
             let mut tmp = vec![0.0f32; 4096];
@@ -147,6 +156,14 @@ fn run_once(
                         }
                         Ok(Packet::Pong(_)) | Ok(Packet::Config(_)) => {
                             *last_response.lock().unwrap() = Instant::now();
+                        }
+                        Ok(Packet::Clipboard(chunk)) => {
+                            *last_response.lock().unwrap() = Instant::now();
+                            if let Some(clipboard) = &clipboard {
+                                if let Err(err) = clipboard.receive_chunk(chunk) {
+                                    warn!("Failed to apply remote clipboard: {err}");
+                                }
+                            }
                         }
                         Ok(Packet::Hello) | Ok(Packet::Ping(_)) => {}
                         Err(_) => warn!("Ignoring invalid UDP packet from server"),
@@ -228,6 +245,9 @@ fn run_once(
                         prod_handle.join().unwrap();
                         heartbeat_handle.join().unwrap();
                         monitor_handle.join().unwrap();
+                        if let Some(clipboard_handle) = clipboard_handle.take() {
+                            clipboard_handle.join().unwrap();
+                        }
                         return Err(err);
                     }
                 }
@@ -240,6 +260,9 @@ fn run_once(
                 prod_handle.join().unwrap();
                 heartbeat_handle.join().unwrap();
                 monitor_handle.join().unwrap();
+                if let Some(clipboard_handle) = clipboard_handle.take() {
+                    clipboard_handle.join().unwrap();
+                }
                 stream.take();
                 return Err(Error::ServerDisconnected);
             }
@@ -268,7 +291,7 @@ fn request_config(socket: &UdpSocket) -> Result<Config> {
         match socket.recv(&mut pkt) {
             Ok(sz) => match Packet::try_from(&pkt[..sz]) {
                 Ok(Packet::Config(json)) => return Ok(serde_json::from_slice(json)?),
-                Ok(Packet::Pong(_)) | Ok(Packet::Audio(_)) => {}
+                Ok(Packet::Pong(_)) | Ok(Packet::Audio(_)) | Ok(Packet::Clipboard(_)) => {}
                 Ok(Packet::Hello) | Ok(Packet::Ping(_)) => {}
                 Err(_) => warn!("Ignoring invalid UDP packet while waiting for config"),
             },
