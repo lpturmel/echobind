@@ -68,6 +68,7 @@ impl<B: ClipboardBackend> ClipboardBehavior for Clipboard<B> {
             while running.load(Ordering::Relaxed) {
                 thread::sleep(CLIPBOARD_POLL_INTERVAL);
 
+                let mut last = last_text.lock().unwrap();
                 let text = match backend.lock().unwrap().get_text() {
                     Ok(Some(text)) => text,
                     Ok(None) => continue,
@@ -77,7 +78,6 @@ impl<B: ClipboardBackend> ClipboardBehavior for Clipboard<B> {
                     }
                 };
 
-                let mut last = last_text.lock().unwrap();
                 if last.as_deref() == Some(text.as_str()) {
                     continue;
                 }
@@ -96,8 +96,13 @@ impl<B: ClipboardBackend> ClipboardBehavior for Clipboard<B> {
             return Ok(());
         };
 
+        let mut last = self.last_text.lock().unwrap();
+        if last.as_deref() == Some(text.as_str()) {
+            return Ok(());
+        }
+
         self.backend.lock().unwrap().set_text(&text)?;
-        *self.last_text.lock().unwrap() = Some(text);
+        *last = Some(text);
         Ok(())
     }
 }
