@@ -3,6 +3,7 @@ use cli::{Cli, Commands};
 use error::Result;
 
 pub mod cli;
+pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod error;

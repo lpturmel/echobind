@@ -12,6 +12,7 @@ pub enum Error {
     UnsupportedSampleFormat(cpal::SampleFormat),
     ServerDisconnected,
     Opus(opus::Error),
+    Clipboard(String),
 }
 
 impl std::fmt::Display for Error {
@@ -29,6 +30,7 @@ impl std::fmt::Display for Error {
                 write!(f, "Unsupported sample format: {:?}", e)
             }
             Error::Opus(e) => write!(f, "Opus error: {}", e),
+            Error::Clipboard(e) => write!(f, "Clipboard error: {}", e),
         }
     }
 }
