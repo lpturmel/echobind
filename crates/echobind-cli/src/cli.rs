@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 
 #[derive(Parser)]
 #[clap(author = "Louis-Philippe Turmel", version, about, long_about = None)]
-pub struct Cli {
+pub(crate) struct Cli {
     #[clap(subcommand)]
     pub commands: Commands,
 }

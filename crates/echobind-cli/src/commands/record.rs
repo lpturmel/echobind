@@ -3,12 +3,12 @@ use crate::{
     clipboard::{self, ClipboardBehavior, SystemClipboard},
     config::{count_to_channels, BufferSize, Config},
     error::{Error, Result},
-    protocol::Packet,
 };
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     StreamConfig,
 };
+use echobind_core::protocol::{AudioFrame, Packet, MAX_AUDIO_FRAME_PAYLOAD, MAX_DATAGRAM_SIZE};
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
@@ -111,6 +111,7 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
         sample_rate: negotiated_sample_rate,
         channels: stream_config.channels,
         buffer_size: BufferSize { min, max },
+        video: None,
     })?;
     let mut config_packet = Vec::new();
     Packet::Config(&config_data).encode(&mut config_packet);
@@ -147,8 +148,10 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                 let udp_listener_clone = udp_listener.clone();
                 let encoder_handle = thread::spawn(move || {
                     let mut pending = Vec::<f32>::with_capacity(frame_len * 2);
-                    let mut output = vec![0; 2048];
-                    let mut packet = Vec::with_capacity(output.len() + 5);
+                    let mut output = vec![0; MAX_AUDIO_FRAME_PAYLOAD];
+                    let mut packet = Vec::with_capacity(MAX_DATAGRAM_SIZE);
+                    let mut sequence = 0_u32;
+                    let mut timestamp_us = 0_u64;
                     for data in rx {
                         pending.extend(data);
                         while pending.len() >= frame_len {
@@ -157,15 +160,22 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                                 match encoder.encode_float(&pending[..frame_len], &mut output) {
                                     Ok(len) => {
                                         output.truncate(len);
-                                        Packet::Audio(&output).encode(&mut packet);
+                                        Packet::Audio(AudioFrame {
+                                            sequence,
+                                            timestamp_us,
+                                            payload: &output,
+                                        })
+                                        .encode(&mut packet);
                                         let _ = udp_listener_clone.send_to(&packet, client_addr);
-                                        output.resize(2048, 0);
+                                        output.resize(MAX_AUDIO_FRAME_PAYLOAD, 0);
                                         break;
                                     }
                                     Err(e) => {
                                         if e.code() == opus::ErrorCode::BufferTooSmall {
-                                            output.resize(output.len() * 2, 0);
-                                            continue;
+                                            warn!(
+                                                "Encoded Opus frame exceeds the datagram limit; dropping frame"
+                                            );
+                                            break;
                                         }
                                         retries += 1;
                                         if retries >= MAX_RETRIES {
@@ -175,6 +185,8 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
                                     }
                                 }
                             }
+                            sequence = sequence.wrapping_add(1);
+                            timestamp_us = timestamp_us.wrapping_add((OPUS_FRAME_MS * 1000) as u64);
                             if pending.len() == frame_len {
                                 pending.clear();
                             } else {
@@ -220,7 +232,7 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
 }
 
 fn wait_for_client(socket: &UdpSocket, config_packet: &[u8]) -> Result<SocketAddr> {
-    let mut pkt = [0u8; 1500];
+    let mut pkt = [0u8; MAX_DATAGRAM_SIZE];
     loop {
         let (sz, addr) = match socket.recv_from(&mut pkt) {
             Ok(packet) => packet,
@@ -254,7 +266,7 @@ fn monitor_client(
     config_packet: &[u8],
     clipboard: Option<SystemClipboard>,
 ) {
-    let mut pkt = [0u8; 1500];
+    let mut pkt = [0u8; MAX_DATAGRAM_SIZE];
     let mut response = Vec::new();
     let mut last_seen = Instant::now();
 

@@ -2,12 +2,11 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use error::Result;
 
-pub mod cli;
-pub mod clipboard;
-pub mod commands;
-pub mod config;
-pub mod error;
-pub mod protocol;
+mod cli;
+mod clipboard;
+mod commands;
+mod config;
+mod error;
 
 const DEFAULT_UDP_PORT: u16 = 3013;
 

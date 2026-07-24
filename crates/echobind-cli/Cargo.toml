@@ -1,0 +1,24 @@
+[package]
+name = "echobind-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "echobind"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.3", features = ["derive"] }
+cpal = "0.15.3"
+echobind-core = { path = "../echobind-core" }
+opus = "0.3.0"
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = "0.3.19"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win = { version = "5.4.1", features = ["std"] }

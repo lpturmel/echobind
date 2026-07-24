@@ -1,7 +1,5 @@
-use crate::{
-    error::{Error, Result},
-    protocol::{ClipboardChunk, Packet, MAX_CLIPBOARD_CHUNK_PAYLOAD},
-};
+use crate::error::{Error, Result};
+use echobind_core::protocol::{ClipboardChunk, Packet, MAX_CLIPBOARD_CHUNK_PAYLOAD};
 use std::{
     collections::HashMap,
     net::{SocketAddr, UdpSocket},

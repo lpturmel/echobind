@@ -4,12 +4,12 @@ use crate::{
     commands::record::DISCONNECT_TIMEOUT,
     config::{count_to_channels, Config},
     error::{Error, Result},
-    protocol::Packet,
 };
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize, SampleRate, Stream, StreamConfig,
 };
+use echobind_core::protocol::{Packet, MAX_DATAGRAM_SIZE};
 use std::{
     collections::VecDeque,
     net::{SocketAddr, UdpSocket},
@@ -126,17 +126,17 @@ fn run_once(
         let last_response = last_server_response.clone();
         let clipboard = clipboard.clone();
         thread::spawn(move || {
-            let mut pkt = [0u8; 1500];
+            let mut pkt = [0u8; MAX_DATAGRAM_SIZE];
             let mut tmp = vec![0.0f32; 4096];
             while run.load(Ordering::Relaxed) {
                 match sock.recv(&mut pkt) {
                     Ok(sz) => match Packet::try_from(&pkt[..sz]) {
-                        Ok(Packet::Audio(payload)) => {
+                        Ok(Packet::Audio(frame)) => {
                             *last_response.lock().unwrap() = Instant::now();
                             if !play.load(Ordering::Relaxed) {
                                 continue;
                             }
-                            match opus_decoder.decode_float(payload, &mut tmp, false) {
+                            match opus_decoder.decode_float(frame.payload, &mut tmp, false) {
                                 Ok(fr) => {
                                     let mut g = buf.lock().unwrap();
                                     let samples = &tmp[..fr * opus_ch as usize];
@@ -165,7 +165,12 @@ fn run_once(
                                 }
                             }
                         }
-                        Ok(Packet::Hello) | Ok(Packet::Ping(_)) => {}
+                        Ok(Packet::Video(_)) => {
+                            *last_response.lock().unwrap() = Instant::now();
+                        }
+                        Ok(Packet::Hello)
+                        | Ok(Packet::Ping(_))
+                        | Ok(Packet::VideoKeyframeRequest) => {}
                         Err(_) => warn!("Ignoring invalid UDP packet from server"),
                     },
                     Err(ref e)
@@ -272,7 +277,7 @@ fn run_once(
 
 fn request_config(socket: &UdpSocket) -> Result<Config> {
     let mut hello = Vec::new();
-    let mut pkt = [0u8; 1500];
+    let mut pkt = [0u8; MAX_DATAGRAM_SIZE];
     let mut last_hello = None::<Instant>;
     let started = Instant::now();
 
@@ -291,8 +296,11 @@ fn request_config(socket: &UdpSocket) -> Result<Config> {
         match socket.recv(&mut pkt) {
             Ok(sz) => match Packet::try_from(&pkt[..sz]) {
                 Ok(Packet::Config(json)) => return Ok(serde_json::from_slice(json)?),
-                Ok(Packet::Pong(_)) | Ok(Packet::Audio(_)) | Ok(Packet::Clipboard(_)) => {}
-                Ok(Packet::Hello) | Ok(Packet::Ping(_)) => {}
+                Ok(Packet::Pong(_))
+                | Ok(Packet::Audio(_))
+                | Ok(Packet::Clipboard(_))
+                | Ok(Packet::Video(_)) => {}
+                Ok(Packet::Hello) | Ok(Packet::Ping(_)) | Ok(Packet::VideoKeyframeRequest) => {}
                 Err(_) => warn!("Ignoring invalid UDP packet while waiting for config"),
             },
             Err(ref err)

@@ -332,19 +332,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "echobind"
-version = "0.2.0"
+name = "echobind-cli"
+version = "0.3.0"
 dependencies = [
  "clap",
  "clipboard-win",
  "cpal",
+ "echobind-core",
  "objc2-app-kit",
  "objc2-foundation",
  "opus",
- "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "echobind-core"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
