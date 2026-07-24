@@ -22,6 +22,6 @@ screencapturekit = "8.0.1"
 videotoolbox = "0.18.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# scap 0.0.8 uses the pre-1.5 Settings API. Keep Cargo from selecting the
-# semver-incompatible windows-capture 1.5 release.
-windows-capture = "=1.3.6"
+# scap 0.0.8 uses the windows-capture 1.4 API. Both 1.3 and 1.5 have
+# incompatible capture/frame/settings APIs despite satisfying its requirement.
+windows-capture = "=1.4.0"
