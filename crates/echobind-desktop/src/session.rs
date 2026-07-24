@@ -15,7 +15,7 @@ use openh264::{
 };
 use scap::{
     capturer::{Capturer, Options, Resolution},
-    frame::{Frame, FrameType, YUVFrame},
+    frame::{BGRAFrame, Frame, FrameType, YUVFrame},
 };
 use std::{
     net::{SocketAddr, UdpSocket},
@@ -40,7 +40,21 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 
-type CaptureSlot = Arc<(Mutex<Option<YUVFrame>>, Condvar)>;
+enum CapturedFrame {
+    Nv12(YUVFrame),
+    Bgra(BGRAFrame),
+}
+
+impl CapturedFrame {
+    fn update_i420(&self, destination: &mut I420Frame) -> Result<(), String> {
+        match self {
+            Self::Nv12(frame) => destination.update_from_nv12(frame),
+            Self::Bgra(frame) => destination.update_from_bgra(frame),
+        }
+    }
+}
+
+type CaptureSlot = Arc<(Mutex<Option<CapturedFrame>>, Condvar)>;
 type LatestFrame = Arc<Mutex<Option<DisplayFrame>>>;
 
 #[derive(Clone, Debug)]
@@ -393,7 +407,11 @@ fn spawn_capture(
             fps: frames_per_second,
             show_cursor: true,
             show_highlight: false,
-            output_type: FrameType::YUVFrame,
+            output_type: if cfg!(target_os = "windows") {
+                FrameType::BGRAFrame
+            } else {
+                FrameType::YUVFrame
+            },
             output_resolution: Resolution::_720p,
             ..Default::default()
         };
@@ -414,7 +432,12 @@ fn spawn_capture(
             match capturer.get_next_frame() {
                 Ok(Frame::YUVFrame(frame)) => {
                     let (slot, available) = &*capture_slot;
-                    *slot.lock().unwrap() = Some(frame);
+                    *slot.lock().unwrap() = Some(CapturedFrame::Nv12(frame));
+                    available.notify_one();
+                }
+                Ok(Frame::BGRA(frame)) => {
+                    let (slot, available) = &*capture_slot;
+                    *slot.lock().unwrap() = Some(CapturedFrame::Bgra(frame));
                     available.notify_one();
                 }
                 Ok(
@@ -422,8 +445,7 @@ fn spawn_capture(
                     | Frame::RGBx(_)
                     | Frame::XBGR(_)
                     | Frame::BGRx(_)
-                    | Frame::BGR0(_)
-                    | Frame::BGRA(_),
+                    | Frame::BGR0(_),
                 ) => {}
                 Err(error) => {
                     let _ = events.send(SessionEvent::Error(format!(
@@ -502,7 +524,7 @@ fn spawn_encoder(
                 continue;
             };
 
-            if let Err(error) = frame.update_from_nv12(&capture) {
+            if let Err(error) = capture.update_i420(&mut frame) {
                 let _ = events.send(SessionEvent::Error(format!(
                     "Unable to convert captured frame: {error}"
                 )));

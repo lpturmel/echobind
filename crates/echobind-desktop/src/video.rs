@@ -1,5 +1,5 @@
 use openh264::formats::YUVSource;
-use scap::frame::YUVFrame;
+use scap::frame::{BGRAFrame, YUVFrame};
 
 #[derive(Default)]
 pub struct I420Frame {
@@ -58,6 +58,84 @@ impl I420Frame {
 
         Ok(())
     }
+
+    pub fn update_from_bgra(&mut self, frame: &BGRAFrame) -> Result<(), String> {
+        let width = usize::try_from(frame.width).map_err(|_| "negative capture width")?;
+        let height = usize::try_from(frame.height).map_err(|_| "negative capture height")?;
+
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            return Err(format!(
+                "capture dimensions must be positive and even, got {width}x{height}"
+            ));
+        }
+        let required_bytes = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "capture dimensions overflow the address space".to_owned())?;
+        if frame.data.len() < required_bytes {
+            return Err("BGRA capture buffer is smaller than its declared dimensions".to_owned());
+        }
+
+        self.width = width;
+        self.height = height;
+        self.y.resize(width * height, 0);
+        self.u.resize(width * height / 4, 0);
+        self.v.resize(width * height / 4, 0);
+
+        let chroma_width = width / 2;
+        for row in (0..height).step_by(2) {
+            let top_source = &frame.data[row * width * 4..(row + 1) * width * 4];
+            let bottom_source = &frame.data[(row + 1) * width * 4..(row + 2) * width * 4];
+            let (top_y, remaining_y) = self.y.split_at_mut((row + 1) * width);
+            let top_y = &mut top_y[row * width..];
+            let bottom_y = &mut remaining_y[..width];
+            let chroma_row = row / 2;
+            let u_row = &mut self.u[chroma_row * chroma_width..(chroma_row + 1) * chroma_width];
+            let v_row = &mut self.v[chroma_row * chroma_width..(chroma_row + 1) * chroma_width];
+
+            for column in (0..width).step_by(2) {
+                let top_left = bgra_components(top_source, column);
+                let top_right = bgra_components(top_source, column + 1);
+                let bottom_left = bgra_components(bottom_source, column);
+                let bottom_right = bgra_components(bottom_source, column + 1);
+
+                top_y[column] = rgb_to_y(top_left);
+                top_y[column + 1] = rgb_to_y(top_right);
+                bottom_y[column] = rgb_to_y(bottom_left);
+                bottom_y[column + 1] = rgb_to_y(bottom_right);
+
+                let red = top_left.0 + top_right.0 + bottom_left.0 + bottom_right.0;
+                let green = top_left.1 + top_right.1 + bottom_left.1 + bottom_right.1;
+                let blue = top_left.2 + top_right.2 + bottom_left.2 + bottom_right.2;
+                u_row[column / 2] =
+                    clamp_u8(((-38 * red - 74 * green + 112 * blue + 512) >> 10) + 128);
+                v_row[column / 2] =
+                    clamp_u8(((112 * red - 94 * green - 18 * blue + 512) >> 10) + 128);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[inline]
+fn bgra_components(source: &[u8], column: usize) -> (i32, i32, i32) {
+    let offset = column * 4;
+    (
+        i32::from(source[offset + 2]),
+        i32::from(source[offset + 1]),
+        i32::from(source[offset]),
+    )
+}
+
+#[inline]
+fn rgb_to_y((red, green, blue): (i32, i32, i32)) -> u8 {
+    clamp_u8(((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16)
+}
+
+#[inline]
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
 }
 
 impl YUVSource for I420Frame {
@@ -108,6 +186,38 @@ mod tests {
         assert_eq!(converted.y(), &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(converted.u(), &[10, 11]);
         assert_eq!(converted.v(), &[20, 21]);
+    }
+
+    #[test]
+    fn converts_bgra_to_i420() {
+        let frame = BGRAFrame {
+            display_time: 0,
+            width: 2,
+            height: 2,
+            data: vec![
+                0, 0, 255, 255, 0, 0, 255, 255, //
+                0, 0, 255, 255, 0, 0, 255, 255,
+            ],
+        };
+
+        let mut converted = I420Frame::default();
+        converted.update_from_bgra(&frame).unwrap();
+        assert_eq!(converted.y(), &[82, 82, 82, 82]);
+        assert_eq!(converted.u(), &[90]);
+        assert_eq!(converted.v(), &[240]);
+    }
+
+    #[test]
+    fn rejects_truncated_bgra_frames() {
+        let frame = BGRAFrame {
+            display_time: 0,
+            width: 2,
+            height: 2,
+            data: vec![0; 15],
+        };
+
+        let error = I420Frame::default().update_from_bgra(&frame).unwrap_err();
+        assert!(error.contains("smaller"));
     }
 
     #[test]
