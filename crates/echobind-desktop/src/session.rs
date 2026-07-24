@@ -37,8 +37,35 @@ const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
 const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(120);
 const HELLO_INTERVAL: Duration = Duration::from_millis(400);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_WIDTH: u32 = 1280;
-const DEFAULT_HEIGHT: u32 = 720;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoResolution {
+    P720,
+    P1080,
+}
+
+impl VideoResolution {
+    pub const fn dimensions(self) -> (u32, u32) {
+        match self {
+            Self::P720 => (1280, 720),
+            Self::P1080 => (1920, 1080),
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::P720 => "720p",
+            Self::P1080 => "1080p",
+        }
+    }
+
+    fn capture_resolution(self) -> Resolution {
+        match self {
+            Self::P720 => Resolution::_720p,
+            Self::P1080 => Resolution::_1080p,
+        }
+    }
+}
 
 enum CapturedFrame {
     Nv12(YUVFrame),
@@ -46,10 +73,17 @@ enum CapturedFrame {
 }
 
 impl CapturedFrame {
-    fn update_i420(&self, destination: &mut I420Frame) -> Result<(), String> {
+    fn update_i420(
+        &self,
+        destination: &mut I420Frame,
+        resolution: VideoResolution,
+    ) -> Result<(), String> {
         match self {
             Self::Nv12(frame) => destination.update_from_nv12(frame),
-            Self::Bgra(frame) => destination.update_from_bgra(frame),
+            Self::Bgra(frame) => {
+                let (width, height) = resolution.dimensions();
+                destination.update_from_bgra_scaled(frame, width, height)
+            }
         }
     }
 }
@@ -73,6 +107,7 @@ pub enum SessionEvent {
     ConnectionRejected(String),
     Disconnected(String),
     CaptureReady,
+    VideoConfigured { width: u32, height: u32 },
     VideoBackend(String),
     Stats { fps: f32, megabits_per_second: f32 },
     Error(String),
@@ -98,6 +133,7 @@ impl DesktopSession {
         bind_addr: SocketAddr,
         frames_per_second: u32,
         bitrate_bps: u32,
+        resolution: VideoResolution,
     ) -> Result<Self, String> {
         #[cfg(not(target_os = "macos"))]
         {
@@ -122,12 +158,13 @@ impl DesktopSession {
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
 
+        let (width, height) = resolution.dimensions();
         let session_config = SessionConfig {
             audio: None,
             video: Some(VideoConfig {
                 codec: VideoCodec::H264,
-                width: DEFAULT_WIDTH,
-                height: DEFAULT_HEIGHT,
+                width,
+                height,
                 frame_rate: SessionFrameRate {
                     numerator: frames_per_second,
                     denominator: 1,
@@ -158,6 +195,7 @@ impl DesktopSession {
                 event_tx.clone(),
                 frames_per_second,
                 bitrate_bps,
+                resolution,
             );
             (None, vec![hardware_handle])
         };
@@ -170,6 +208,7 @@ impl DesktopSession {
                 capture_slot.clone(),
                 event_tx.clone(),
                 frames_per_second,
+                resolution,
             );
             let encoder_handle = spawn_encoder(
                 socket,
@@ -180,11 +219,13 @@ impl DesktopSession {
                 event_tx.clone(),
                 frames_per_second,
                 bitrate_bps,
+                resolution,
             );
             (Some(capture_slot), vec![capture_handle, encoder_handle])
         };
 
         let _ = event_tx.send(SessionEvent::Listening(local_addr));
+        let _ = event_tx.send(SessionEvent::VideoConfigured { width, height });
         let mut handles = vec![network_handle];
         handles.append(&mut media_handles);
         Ok(Self {
@@ -401,6 +442,7 @@ fn spawn_capture(
     capture_slot: CaptureSlot,
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
+    resolution: VideoResolution,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let options = Options {
@@ -412,7 +454,7 @@ fn spawn_capture(
             } else {
                 FrameType::YUVFrame
             },
-            output_resolution: Resolution::_720p,
+            output_resolution: resolution.capture_resolution(),
             ..Default::default()
         };
 
@@ -470,6 +512,7 @@ fn spawn_encoder(
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
     bitrate_bps: u32,
+    resolution: VideoResolution,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let encoder_config = EncoderConfig::new()
@@ -478,11 +521,8 @@ fn spawn_encoder(
             .rate_control_mode(RateControlMode::Bitrate)
             .usage_type(UsageType::ScreenContentRealTime)
             .complexity(Complexity::Low)
-            .skip_frames(true)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(
-                frames_per_second.saturating_mul(2),
-            ))
-            .max_slice_len(1100);
+            .skip_frames(false)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(frames_per_second));
         let mut encoder = match Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
         {
             Ok(encoder) => encoder,
@@ -524,7 +564,7 @@ fn spawn_encoder(
                 continue;
             };
 
-            if let Err(error) = capture.update_i420(&mut frame) {
+            if let Err(error) = capture.update_i420(&mut frame, resolution) {
                 let _ = events.send(SessionEvent::Error(format!(
                     "Unable to convert captured frame: {error}"
                 )));
@@ -632,6 +672,8 @@ fn spawn_client(
         let mut stats_started = Instant::now();
         let mut stats_frames = 0_u64;
         let mut stats_bytes = 0_u64;
+        let mut last_decoded_frame_id = None::<u64>;
+        let mut waiting_for_keyframe = true;
         let _ = events.send(SessionEvent::AwaitingApproval);
 
         while running.load(Ordering::Relaxed) {
@@ -688,6 +730,10 @@ fn spawn_client(
                                 )));
                                 return;
                             }
+                            let _ = events.send(SessionEvent::VideoConfigured {
+                                width: video.width,
+                                height: video.height,
+                            });
                             if !accepted {
                                 accepted = true;
                                 let _ = events.send(SessionEvent::Connected(server_addr));
@@ -705,32 +751,51 @@ fn spawn_client(
                             let _ = socket.send(&outgoing);
                         }
                         Packet::Video(fragment) if accepted => match reassembler.push(fragment) {
-                            Ok(Some(frame)) => match decoder.decode(&frame.payload) {
-                                Ok(Some(decoded)) => {
-                                    let (width, height) = decoded.dimensions();
-                                    let mut rgba = vec![0; width * height * 4];
-                                    decoded.write_rgba8(&mut rgba);
-                                    *latest_frame.lock().unwrap() = Some(DisplayFrame {
-                                        width,
-                                        height,
-                                        rgba,
-                                    });
-                                    stats_frames = stats_frames.saturating_add(1);
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    warn!("H.264 decode failed: {error}");
-                                    if last_keyframe_request.elapsed() >= Duration::from_millis(500)
+                            Ok(Some(frame)) => {
+                                let frame_gap = last_decoded_frame_id
+                                    .is_some_and(|last| frame.frame_id != last.wrapping_add(1));
+                                if (waiting_for_keyframe || frame_gap) && !frame.is_keyframe {
+                                    waiting_for_keyframe = true;
+                                    if last_keyframe_request.elapsed() >= Duration::from_millis(250)
                                     {
                                         request_keyframe(&socket, &mut outgoing);
                                         last_keyframe_request = Instant::now();
                                     }
+                                    continue;
                                 }
-                            },
+
+                                match decoder.decode(&frame.payload) {
+                                    Ok(Some(decoded)) => {
+                                        let (width, height) = decoded.dimensions();
+                                        let mut rgba = vec![0; width * height * 4];
+                                        decoded.write_rgba8(&mut rgba);
+                                        *latest_frame.lock().unwrap() = Some(DisplayFrame {
+                                            width,
+                                            height,
+                                            rgba,
+                                        });
+                                        last_decoded_frame_id = Some(frame.frame_id);
+                                        waiting_for_keyframe = false;
+                                        stats_frames = stats_frames.saturating_add(1);
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        warn!("H.264 decode failed: {error}");
+                                        waiting_for_keyframe = true;
+                                        if last_keyframe_request.elapsed()
+                                            >= Duration::from_millis(250)
+                                        {
+                                            request_keyframe(&socket, &mut outgoing);
+                                            last_keyframe_request = Instant::now();
+                                        }
+                                    }
+                                }
+                            }
                             Ok(None) => {}
                             Err(error) => {
                                 warn!("Video reassembly failed: {error}");
-                                if last_keyframe_request.elapsed() >= Duration::from_millis(500) {
+                                waiting_for_keyframe = true;
+                                if last_keyframe_request.elapsed() >= Duration::from_millis(250) {
                                     request_keyframe(&socket, &mut outgoing);
                                     last_keyframe_request = Instant::now();
                                 }

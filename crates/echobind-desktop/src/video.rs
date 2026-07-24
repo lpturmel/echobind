@@ -8,6 +8,8 @@ pub struct I420Frame {
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
+    source_columns: Vec<usize>,
+    source_rows: Vec<usize>,
 }
 
 impl I420Frame {
@@ -59,33 +61,47 @@ impl I420Frame {
         Ok(())
     }
 
-    pub fn update_from_bgra(&mut self, frame: &BGRAFrame) -> Result<(), String> {
-        let width = usize::try_from(frame.width).map_err(|_| "negative capture width")?;
-        let height = usize::try_from(frame.height).map_err(|_| "negative capture height")?;
+    pub fn update_from_bgra_scaled(
+        &mut self,
+        frame: &BGRAFrame,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<(), String> {
+        let source_width = usize::try_from(frame.width).map_err(|_| "negative capture width")?;
+        let source_height = usize::try_from(frame.height).map_err(|_| "negative capture height")?;
 
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if source_width == 0 || source_height == 0 {
             return Err(format!(
-                "capture dimensions must be positive and even, got {width}x{height}"
+                "capture dimensions must be positive, got {source_width}x{source_height}"
             ));
         }
-        let required_bytes = width
-            .checked_mul(height)
+        let required_bytes = source_width
+            .checked_mul(source_height)
             .and_then(|pixels| pixels.checked_mul(4))
             .ok_or_else(|| "capture dimensions overflow the address space".to_owned())?;
         if frame.data.len() < required_bytes {
             return Err("BGRA capture buffer is smaller than its declared dimensions".to_owned());
         }
 
+        let (width, height) = fit_dimensions(source_width, source_height, max_width, max_height)?;
         self.width = width;
         self.height = height;
         self.y.resize(width * height, 0);
         self.u.resize(width * height / 4, 0);
         self.v.resize(width * height / 4, 0);
+        self.source_columns.resize(width, 0);
+        self.source_rows.resize(height, 0);
+        for (column, source_column) in self.source_columns.iter_mut().enumerate() {
+            *source_column = (column * source_width / width).min(source_width - 1);
+        }
+        for (row, source_row) in self.source_rows.iter_mut().enumerate() {
+            *source_row = (row * source_height / height).min(source_height - 1);
+        }
 
         let chroma_width = width / 2;
         for row in (0..height).step_by(2) {
-            let top_source = &frame.data[row * width * 4..(row + 1) * width * 4];
-            let bottom_source = &frame.data[(row + 1) * width * 4..(row + 2) * width * 4];
+            let source_top_row = self.source_rows[row];
+            let source_bottom_row = self.source_rows[row + 1];
             let (top_y, remaining_y) = self.y.split_at_mut((row + 1) * width);
             let top_y = &mut top_y[row * width..];
             let bottom_y = &mut remaining_y[..width];
@@ -94,10 +110,16 @@ impl I420Frame {
             let v_row = &mut self.v[chroma_row * chroma_width..(chroma_row + 1) * chroma_width];
 
             for column in (0..width).step_by(2) {
-                let top_left = bgra_components(top_source, column);
-                let top_right = bgra_components(top_source, column + 1);
-                let bottom_left = bgra_components(bottom_source, column);
-                let bottom_right = bgra_components(bottom_source, column + 1);
+                let source_left = self.source_columns[column];
+                let source_right = self.source_columns[column + 1];
+                let top_left =
+                    bgra_components(&frame.data, source_top_row * source_width + source_left);
+                let top_right =
+                    bgra_components(&frame.data, source_top_row * source_width + source_right);
+                let bottom_left =
+                    bgra_components(&frame.data, source_bottom_row * source_width + source_left);
+                let bottom_right =
+                    bgra_components(&frame.data, source_bottom_row * source_width + source_right);
 
                 top_y[column] = rgb_to_y(top_left);
                 top_y[column + 1] = rgb_to_y(top_right);
@@ -119,13 +141,33 @@ impl I420Frame {
 }
 
 #[inline]
-fn bgra_components(source: &[u8], column: usize) -> (i32, i32, i32) {
-    let offset = column * 4;
+fn bgra_components(source: &[u8], pixel: usize) -> (i32, i32, i32) {
+    let offset = pixel * 4;
     (
         i32::from(source[offset + 2]),
         i32::from(source[offset + 1]),
         i32::from(source[offset]),
     )
+}
+
+fn fit_dimensions(
+    width: usize,
+    height: usize,
+    max_width: u32,
+    max_height: u32,
+) -> Result<(usize, usize), String> {
+    let max_width = usize::try_from(max_width).map_err(|_| "maximum width is too large")?;
+    let max_height = usize::try_from(max_height).map_err(|_| "maximum height is too large")?;
+    if max_width < 2 || max_height < 2 {
+        return Err("maximum video dimensions must be at least 2x2".to_owned());
+    }
+
+    let scale = (max_width as f64 / width as f64)
+        .min(max_height as f64 / height as f64)
+        .min(1.0);
+    let fitted_width = ((width as f64 * scale).floor() as usize).max(2) & !1;
+    let fitted_height = ((height as f64 * scale).floor() as usize).max(2) & !1;
+    Ok((fitted_width, fitted_height))
 }
 
 #[inline]
@@ -201,7 +243,7 @@ mod tests {
         };
 
         let mut converted = I420Frame::default();
-        converted.update_from_bgra(&frame).unwrap();
+        converted.update_from_bgra_scaled(&frame, 2, 2).unwrap();
         assert_eq!(converted.y(), &[82, 82, 82, 82]);
         assert_eq!(converted.u(), &[90]);
         assert_eq!(converted.v(), &[240]);
@@ -216,8 +258,39 @@ mod tests {
             data: vec![0; 15],
         };
 
-        let error = I420Frame::default().update_from_bgra(&frame).unwrap_err();
+        let error = I420Frame::default()
+            .update_from_bgra_scaled(&frame, 2, 2)
+            .unwrap_err();
         assert!(error.contains("smaller"));
+    }
+
+    #[test]
+    fn scales_bgra_while_converting() {
+        let frame = BGRAFrame {
+            display_time: 0,
+            width: 4,
+            height: 4,
+            data: vec![
+                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, //
+                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, //
+                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, //
+                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+            ],
+        };
+
+        let mut converted = I420Frame::default();
+        converted.update_from_bgra_scaled(&frame, 2, 2).unwrap();
+        assert_eq!(converted.dimensions(), (2, 2));
+        assert_eq!(converted.y(), &[82, 82, 82, 82]);
+        assert_eq!(converted.u(), &[90]);
+        assert_eq!(converted.v(), &[240]);
+    }
+
+    #[test]
+    fn fits_dimensions_without_upscaling() {
+        assert_eq!(fit_dimensions(2560, 1440, 1280, 720).unwrap(), (1280, 720));
+        assert_eq!(fit_dimensions(1920, 1200, 1280, 720).unwrap(), (1152, 720));
+        assert_eq!(fit_dimensions(800, 600, 1920, 1080).unwrap(), (800, 600));
     }
 
     #[test]

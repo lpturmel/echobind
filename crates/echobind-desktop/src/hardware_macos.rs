@@ -1,5 +1,6 @@
 use super::{
     ensure_software_capture_available, spawn_capture, spawn_encoder, CaptureSlot, SessionEvent,
+    VideoResolution,
 };
 use echobind_core::{
     protocol::{Packet, MAX_DATAGRAM_SIZE},
@@ -19,8 +20,6 @@ use std::{
 use tracing::warn;
 use videotoolbox::{ffi as vt, session::Codec};
 
-const MAX_CAPTURE_WIDTH: u32 = 1280;
-const MAX_CAPTURE_HEIGHT: u32 = 720;
 const ENCODER_WAIT: Duration = Duration::from_millis(30);
 
 type SampleSlot = Arc<(Mutex<Option<CMSampleBuffer>>, Condvar)>;
@@ -41,6 +40,7 @@ struct HardwareEncoder {
     callback_state: *const EncoderState,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_hardware_pipeline(
     socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
@@ -49,6 +49,7 @@ pub(super) fn spawn_hardware_pipeline(
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
     bitrate_bps: u32,
+    resolution: VideoResolution,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let result = run_hardware_pipeline(
@@ -59,6 +60,7 @@ pub(super) fn spawn_hardware_pipeline(
             events.clone(),
             frames_per_second,
             bitrate_bps,
+            resolution,
         );
         if let Err(error) = result {
             if !running.load(Ordering::Relaxed) {
@@ -76,6 +78,7 @@ pub(super) fn spawn_hardware_pipeline(
                 events.clone(),
                 frames_per_second,
                 bitrate_bps,
+                resolution,
             ) {
                 let _ = events.send(SessionEvent::Error(format!(
                     "Hardware H.264 failed ({error}); software fallback failed: {fallback_error}"
@@ -85,6 +88,7 @@ pub(super) fn spawn_hardware_pipeline(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_hardware_pipeline(
     socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
@@ -93,6 +97,7 @@ fn run_hardware_pipeline(
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
     bitrate_bps: u32,
+    resolution: VideoResolution,
 ) -> Result<(), String> {
     let content = SCShareableContent::get().map_err(|error| {
         format!(
@@ -103,7 +108,9 @@ fn run_hardware_pipeline(
     let display = displays
         .first()
         .ok_or_else(|| "ScreenCaptureKit found no displays".to_owned())?;
-    let (width, height) = fit_capture_dimensions(display.width(), display.height());
+    let (max_width, max_height) = resolution.dimensions();
+    let (width, height) =
+        fit_capture_dimensions(display.width(), display.height(), max_width, max_height);
     let frame_interval = CMTime::new(1, frames_per_second as i32);
     let filter = SCContentFilter::create()
         .with_display(display)
@@ -653,18 +660,19 @@ fn extract_h264_parameter_sets(encoded: &HardwareEncodedFrame) -> Option<(Vec<u8
     }
 }
 
-fn fit_capture_dimensions(width: u32, height: u32) -> (u32, u32) {
+fn fit_capture_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
     if width == 0 || height == 0 {
-        return (MAX_CAPTURE_WIDTH, MAX_CAPTURE_HEIGHT);
+        return (max_width, max_height);
     }
-    let scale = (MAX_CAPTURE_WIDTH as f64 / width as f64)
-        .min(MAX_CAPTURE_HEIGHT as f64 / height as f64)
+    let scale = (max_width as f64 / width as f64)
+        .min(max_height as f64 / height as f64)
         .min(1.0);
     let fitted_width = ((width as f64 * scale).floor() as u32).max(2) & !1;
     let fitted_height = ((height as f64 * scale).floor() as u32).max(2) & !1;
     (fitted_width, fitted_height)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_software_fallback(
     socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
@@ -673,6 +681,7 @@ fn start_software_fallback(
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
     bitrate_bps: u32,
+    resolution: VideoResolution,
 ) -> Result<(), String> {
     ensure_software_capture_available()?;
     let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
@@ -681,6 +690,7 @@ fn start_software_fallback(
         capture_slot.clone(),
         events.clone(),
         frames_per_second,
+        resolution,
     );
     let _encoder_handle = spawn_encoder(
         socket,
@@ -691,6 +701,7 @@ fn start_software_fallback(
         events,
         frames_per_second,
         bitrate_bps,
+        resolution,
     );
     Ok(())
 }
@@ -701,9 +712,9 @@ mod tests {
 
     #[test]
     fn preserves_aspect_ratio_and_even_dimensions() {
-        assert_eq!(fit_capture_dimensions(1920, 1080), (1280, 720));
-        assert_eq!(fit_capture_dimensions(3456, 2234), (1112, 720));
-        assert_eq!(fit_capture_dimensions(800, 600), (800, 600));
+        assert_eq!(fit_capture_dimensions(1920, 1080, 1280, 720), (1280, 720));
+        assert_eq!(fit_capture_dimensions(3456, 2234, 1280, 720), (1112, 720));
+        assert_eq!(fit_capture_dimensions(800, 600, 1920, 1080), (800, 600));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::session::{DesktopSession, SessionEvent};
+use crate::session::{DesktopSession, SessionEvent, VideoResolution};
 use eframe::egui;
 use std::net::{IpAddr, SocketAddr};
 
@@ -15,13 +15,17 @@ pub struct EchobindApp {
     port: u16,
     frames_per_second: u32,
     bitrate_mbps: u32,
+    resolution: VideoResolution,
     status: String,
     pending_peer: Option<SocketAddr>,
     session: Option<DesktopSession>,
     texture: Option<egui::TextureHandle>,
     stream_fps: f32,
     stream_mbps: f32,
+    stream_width: u32,
+    stream_height: u32,
     video_backend: String,
+    fullscreen: bool,
 }
 
 impl EchobindApp {
@@ -35,13 +39,17 @@ impl EchobindApp {
             port: 3013,
             frames_per_second: 60,
             bitrate_mbps: 6,
+            resolution: VideoResolution::P720,
             status: "Ready".to_owned(),
             pending_peer: None,
             session: None,
             texture: None,
             stream_fps: 0.0,
             stream_mbps: 0.0,
+            stream_width: 0,
+            stream_height: 0,
             video_backend: "initializing".to_owned(),
+            fullscreen: false,
         }
     }
 
@@ -81,6 +89,10 @@ impl EchobindApp {
                         self.status = format!("{} · capture ready", self.status);
                     }
                 }
+                SessionEvent::VideoConfigured { width, height } => {
+                    self.stream_width = width;
+                    self.stream_height = height;
+                }
                 SessionEvent::VideoBackend(backend) => {
                     self.video_backend = backend;
                 }
@@ -98,6 +110,8 @@ impl EchobindApp {
         }
 
         if let Some(frame) = newest_frame {
+            self.stream_width = frame.width as u32;
+            self.stream_height = frame.height as u32;
             let image =
                 egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
             if let Some(texture) = &mut self.texture {
@@ -125,6 +139,7 @@ impl EchobindApp {
             address,
             self.frames_per_second,
             self.bitrate_mbps.saturating_mul(1_000_000),
+            self.resolution,
         ) {
             Ok(session) => {
                 self.status = format!("Starting server on {address}…");
@@ -165,6 +180,8 @@ impl EchobindApp {
         self.texture = None;
         self.stream_fps = 0.0;
         self.stream_mbps = 0.0;
+        self.stream_width = 0;
+        self.stream_height = 0;
         self.video_backend = "initializing".to_owned();
         self.status = "Ready".to_owned();
     }
@@ -202,6 +219,13 @@ impl EchobindApp {
             ui.add(egui::DragValue::new(&mut self.port).range(1..=u16::MAX));
 
             if self.mode == Mode::Host {
+                ui.label("Resolution");
+                egui::ComboBox::from_id_salt("stream-resolution")
+                    .selected_text(self.resolution.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.resolution, VideoResolution::P720, "720p");
+                        ui.selectable_value(&mut self.resolution, VideoResolution::P1080, "1080p");
+                    });
                 ui.label("FPS");
                 ui.add(egui::DragValue::new(&mut self.frames_per_second).range(15..=60));
                 ui.label("Mbps");
@@ -223,6 +247,10 @@ impl EchobindApp {
                 }
             } else if ui.button("Stop").clicked() {
                 self.stop();
+            }
+
+            if self.texture.is_some() && ui.button("Fullscreen").clicked() {
+                self.set_fullscreen(ui.ctx(), true);
             }
         });
 
@@ -249,11 +277,21 @@ impl EchobindApp {
 
         if self.stream_fps > 0.0 || self.stream_mbps > 0.0 {
             ui.add_space(6.0);
+            let resolution = if self.stream_width > 0 && self.stream_height > 0 {
+                format!("{}×{}", self.stream_width, self.stream_height)
+            } else {
+                self.resolution.label().to_owned()
+            };
             ui.label(format!(
-                "{:.1} FPS · {:.2} Mbps · 720p H.264 · {}",
-                self.stream_fps, self.stream_mbps, self.video_backend
+                "{:.1} FPS · {:.2} Mbps · {resolution} H.264 · {}",
+                self.stream_fps, self.stream_mbps, self.video_backend,
             ));
         }
+    }
+
+    fn set_fullscreen(&mut self, context: &egui::Context, fullscreen: bool) {
+        self.fullscreen = fullscreen;
+        context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
     }
 
     fn show_video(&self, ui: &mut egui::Ui) {
@@ -283,15 +321,23 @@ impl EchobindApp {
 impl eframe::App for EchobindApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        let toggle_fullscreen = context.input(|input| input.key_pressed(egui::Key::F11));
+        let exit_fullscreen =
+            self.fullscreen && context.input(|input| input.key_pressed(egui::Key::Escape));
+        if toggle_fullscreen || exit_fullscreen {
+            self.set_fullscreen(&context, !self.fullscreen);
+        }
         self.process_session_updates(&context);
 
-        egui::Panel::top("controls")
-            .resizable(false)
-            .show(ui, |ui| {
-                ui.add_space(10.0);
-                self.show_controls(ui);
-                ui.add_space(10.0);
-            });
+        if !self.fullscreen {
+            egui::Panel::top("controls")
+                .resizable(false)
+                .show(ui, |ui| {
+                    ui.add_space(10.0);
+                    self.show_controls(ui);
+                    ui.add_space(10.0);
+                });
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.show_video(ui);
