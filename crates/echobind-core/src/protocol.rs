@@ -24,6 +24,7 @@ pub enum Packet<'a> {
     Clipboard(ClipboardChunk<'a>),
     Video(VideoFragment<'a>),
     VideoKeyframeRequest,
+    ConnectionRejected(&'a [u8]),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +61,7 @@ impl Packet<'_> {
     const CLIPBOARD: u8 = 6;
     const VIDEO: u8 = 7;
     const VIDEO_KEYFRAME_REQUEST: u8 = 8;
+    const CONNECTION_REJECTED: u8 = 9;
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
@@ -91,6 +93,9 @@ impl Packet<'_> {
             }
             Packet::VideoKeyframeRequest => {
                 Self::encode_packet(Self::VIDEO_KEYFRAME_REQUEST, &[], out);
+            }
+            Packet::ConnectionRejected(reason) => {
+                Self::encode_packet(Self::CONNECTION_REJECTED, reason, out);
             }
         }
     }
@@ -149,6 +154,7 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
             Packet::VIDEO_KEYFRAME_REQUEST if payload.is_empty() => {
                 Ok(Packet::VideoKeyframeRequest)
             }
+            Packet::CONNECTION_REJECTED => Ok(Packet::ConnectionRejected(payload)),
             _ => Err(PacketParseError::Invalid),
         }
     }
@@ -360,6 +366,15 @@ mod tests {
         assert_eq!(
             Packet::try_from(encoded.as_slice()),
             Ok(Packet::Clipboard(chunk))
+        );
+    }
+
+    #[test]
+    fn encodes_and_parses_connection_rejection() {
+        let encoded = round_trip(Packet::ConnectionRejected(b"busy"));
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Ok(Packet::ConnectionRejected(b"busy"))
         );
     }
 }

@@ -17,13 +17,15 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --release
+      run: cargo build --workspace --release --locked
     - name: Run tests
-      run: cargo test --release
+      run: cargo test --workspace --release --locked
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: echobind-windows
-        path: target/release/echobind.exe
+        path: |
+          target/release/echobind.exe
+          target/release/echobind-desktop.exe
         if-no-files-found: error

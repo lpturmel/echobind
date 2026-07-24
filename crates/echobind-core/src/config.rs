@@ -1,13 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoConfig>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Config {
+pub struct AudioConfig {
     pub sample_format: String,
     pub sample_rate: u32,
     pub channels: u16,
     pub buffer_size: BufferSize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub video: Option<VideoConfig>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,15 +50,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_audio_config_deserializes_without_video() {
-        let json = r#"{
-            "sample_format":"f32",
-            "sample_rate":48000,
-            "channels":2,
-            "buffer_size":{"min":128,"max":1024}
-        }"#;
+    fn audio_only_session_round_trips() {
+        let config = SessionConfig {
+            audio: Some(AudioConfig {
+                sample_format: "f32".to_owned(),
+                sample_rate: 48_000,
+                channels: 2,
+                buffer_size: BufferSize {
+                    min: 128,
+                    max: 1024,
+                },
+            }),
+            video: None,
+        };
 
-        let config: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(config.video, None);
+        let json = serde_json::to_vec(&config).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<SessionConfig>(&json).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn video_only_session_round_trips() {
+        let config = SessionConfig {
+            audio: None,
+            video: Some(VideoConfig {
+                codec: VideoCodec::H264,
+                width: 1280,
+                height: 720,
+                frame_rate: FrameRate {
+                    numerator: 60,
+                    denominator: 1,
+                },
+                bitrate_bps: 6_000_000,
+            }),
+        };
+
+        let json = serde_json::to_vec(&config).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<SessionConfig>(&json).unwrap(),
+            config
+        );
     }
 }

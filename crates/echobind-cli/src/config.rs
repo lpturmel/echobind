@@ -1,4 +1,4 @@
-pub use echobind_core::config::{BufferSize, Config};
+pub use echobind_core::config::{AudioConfig, BufferSize, SessionConfig};
 
 pub fn count_to_channels(count: u16) -> opus::Channels {
     match count {

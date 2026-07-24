@@ -1,7 +1,7 @@
 use crate::{
     cli::RecordCmd,
     clipboard::{self, ClipboardBehavior, SystemClipboard},
-    config::{count_to_channels, BufferSize, Config},
+    config::{count_to_channels, AudioConfig, BufferSize, SessionConfig},
     error::{Error, Result},
 };
 use cpal::{
@@ -106,11 +106,13 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
         cpal::SupportedBufferSize::Range { min, max } => (*min, *max),
         cpal::SupportedBufferSize::Unknown => (0_u32, 0_u32),
     };
-    let config_data = serde_json::to_vec(&Config {
-        sample_format: format!("{}", sample_format),
-        sample_rate: negotiated_sample_rate,
-        channels: stream_config.channels,
-        buffer_size: BufferSize { min, max },
+    let config_data = serde_json::to_vec(&SessionConfig {
+        audio: Some(AudioConfig {
+            sample_format: format!("{}", sample_format),
+            sample_rate: negotiated_sample_rate,
+            channels: stream_config.channels,
+            buffer_size: BufferSize { min, max },
+        }),
         video: None,
     })?;
     let mut config_packet = Vec::new();

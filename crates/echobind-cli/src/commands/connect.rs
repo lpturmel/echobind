@@ -2,7 +2,7 @@ use crate::{
     cli::ConnectCmd,
     clipboard::{self, ClipboardBehavior},
     commands::record::DISCONNECT_TIMEOUT,
-    config::{count_to_channels, Config},
+    config::{count_to_channels, AudioConfig, SessionConfig},
     error::{Error, Result},
 };
 use cpal::{
@@ -170,7 +170,8 @@ fn run_once(
                         }
                         Ok(Packet::Hello)
                         | Ok(Packet::Ping(_))
-                        | Ok(Packet::VideoKeyframeRequest) => {}
+                        | Ok(Packet::VideoKeyframeRequest)
+                        | Ok(Packet::ConnectionRejected(_)) => {}
                         Err(_) => warn!("Ignoring invalid UDP packet from server"),
                     },
                     Err(ref e)
@@ -275,7 +276,7 @@ fn run_once(
     }
 }
 
-fn request_config(socket: &UdpSocket) -> Result<Config> {
+fn request_config(socket: &UdpSocket) -> Result<AudioConfig> {
     let mut hello = Vec::new();
     let mut pkt = [0u8; MAX_DATAGRAM_SIZE];
     let mut last_hello = None::<Instant>;
@@ -295,11 +296,15 @@ fn request_config(socket: &UdpSocket) -> Result<Config> {
 
         match socket.recv(&mut pkt) {
             Ok(sz) => match Packet::try_from(&pkt[..sz]) {
-                Ok(Packet::Config(json)) => return Ok(serde_json::from_slice(json)?),
+                Ok(Packet::Config(json)) => {
+                    let config: SessionConfig = serde_json::from_slice(json)?;
+                    return config.audio.ok_or(Error::NoAudioConfig);
+                }
                 Ok(Packet::Pong(_))
                 | Ok(Packet::Audio(_))
                 | Ok(Packet::Clipboard(_))
-                | Ok(Packet::Video(_)) => {}
+                | Ok(Packet::Video(_))
+                | Ok(Packet::ConnectionRejected(_)) => {}
                 Ok(Packet::Hello) | Ok(Packet::Ping(_)) | Ok(Packet::VideoKeyframeRequest) => {}
                 Err(_) => warn!("Ignoring invalid UDP packet while waiting for config"),
             },

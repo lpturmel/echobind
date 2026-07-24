@@ -2,6 +2,7 @@
 members = [
     "crates/echobind-cli",
     "crates/echobind-core",
+    "crates/echobind-desktop",
 ]
 resolver = "2"
 

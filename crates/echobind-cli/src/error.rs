@@ -9,6 +9,7 @@ pub enum Error {
     SupportedConfigs(cpal::SupportedStreamConfigsError),
     Json(serde_json::Error),
     NoAudioDevice,
+    NoAudioConfig,
     UnsupportedSampleFormat(cpal::SampleFormat),
     ServerDisconnected,
     Opus(opus::Error),
@@ -25,6 +26,7 @@ impl std::fmt::Display for Error {
             Error::SupportedConfigs(e) => write!(f, "Failed to get supported configs: {}", e),
             Error::Json(e) => write!(f, "Failed to parse JSON: {}", e),
             Error::NoAudioDevice => write!(f, "No audio device found"),
+            Error::NoAudioConfig => write!(f, "Server did not provide an audio configuration"),
             Error::ServerDisconnected => write!(f, "Server disconnected"),
             Error::UnsupportedSampleFormat(e) => {
                 write!(f, "Unsupported sample format: {:?}", e)
