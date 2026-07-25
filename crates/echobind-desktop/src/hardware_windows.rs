@@ -18,8 +18,9 @@ use moq_nvenc::sys::nvEncodeAPI::{
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
     NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER,
     NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE, NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER,
-    NV_ENC_PRESET_P1_GUID, NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER,
-    NV_ENC_TUNING_INFO,
+    NV_ENC_PRESET_P3_GUID, NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER,
+    NV_ENC_TUNING_INFO, NV_ENC_VUI_COLOR_PRIMARIES, NV_ENC_VUI_MATRIX_COEFFS,
+    NV_ENC_VUI_TRANSFER_CHARACTERISTIC, NV_ENC_VUI_VIDEO_FORMAT,
 };
 use std::{
     ffi::c_void,
@@ -37,12 +38,15 @@ use tracing::warn;
 use windows::{
     core::Interface,
     Win32::{
-        Foundation::{CloseHandle, HANDLE, RECT, TRUE, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, HANDLE, HMODULE, RECT, TRUE, WAIT_OBJECT_0},
         Graphics::{
+            Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
             Direct3D11::{
-                ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
-                ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-                ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_TEX2D_VPIV,
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+                ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
+                ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
+                D3D11_BIND_RENDER_TARGET, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
                 D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
                 D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
@@ -50,7 +54,12 @@ use windows::{
                 D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
                 D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
             },
-            Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC},
+            Dxgi::{
+                Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC},
+                CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
+                IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+                DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+            },
         },
         System::Threading::{CreateEventW, WaitForSingleObject},
     },
@@ -168,7 +177,7 @@ pub(super) fn spawn_hardware_pipeline(
     active_datagram_size: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let result = run_hardware_pipeline(
+        let dxgi_result = run_dxgi_pipeline(
             socket.clone(),
             running.clone(),
             active_peer.clone(),
@@ -180,6 +189,28 @@ pub(super) fn spawn_hardware_pipeline(
             height,
             active_datagram_size.clone(),
         );
+        let result = match dxgi_result {
+            Ok(()) => Ok(()),
+            Err(error) if running.load(Ordering::Relaxed) => {
+                warn!("DXGI/NVENC pipeline unavailable: {error}");
+                let _ = events.send(SessionEvent::VideoBackend(format!(
+                    "Windows Graphics Capture fallback (DXGI unavailable: {error})"
+                )));
+                run_wgc_pipeline(
+                    socket.clone(),
+                    running.clone(),
+                    active_peer.clone(),
+                    force_keyframe.clone(),
+                    events.clone(),
+                    frames_per_second,
+                    bitrate_bps,
+                    width,
+                    height,
+                    active_datagram_size.clone(),
+                )
+            }
+            Err(error) => Err(error),
+        };
         if let Err(error) = result {
             if !running.load(Ordering::Relaxed) {
                 return;
@@ -207,8 +238,238 @@ pub(super) fn spawn_hardware_pipeline(
     })
 }
 
+#[derive(Debug)]
+enum DxgiCaptureFailure {
+    AccessLost(String),
+    Fatal(String),
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_hardware_pipeline(
+fn run_dxgi_pipeline(
+    socket: Arc<UdpSocket>,
+    running: Arc<AtomicBool>,
+    active_peer: Arc<Mutex<Option<SocketAddr>>>,
+    force_keyframe: Arc<AtomicBool>,
+    events: mpsc::Sender<SessionEvent>,
+    frames_per_second: u32,
+    bitrate_bps: u32,
+    width: u32,
+    height: u32,
+    active_datagram_size: Arc<AtomicUsize>,
+) -> Result<(), String> {
+    let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
+    let sender_handle = spawn_hardware_sender(
+        socket,
+        running.clone(),
+        active_peer.clone(),
+        force_keyframe.clone(),
+        events.clone(),
+        encoded_rx,
+        active_datagram_size,
+    );
+    let mut initialized_once = false;
+    let result = loop {
+        if !running.load(Ordering::Relaxed) {
+            break Ok(());
+        }
+        let session = run_dxgi_capture_session(
+            running.clone(),
+            active_peer.clone(),
+            force_keyframe.clone(),
+            events.clone(),
+            encoded_tx.clone(),
+            frames_per_second,
+            bitrate_bps,
+            width,
+            height,
+        );
+        match session {
+            Ok(()) => break Ok(()),
+            Err(DxgiCaptureFailure::AccessLost(error)) => {
+                initialized_once = true;
+                force_keyframe.store(true, Ordering::Release);
+                let _ = events.send(SessionEvent::VideoBackend(
+                    "DXGI display mode changed · rebuilding capture and forcing IDR".to_owned(),
+                ));
+                warn!("DXGI capture session was invalidated: {error}");
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(DxgiCaptureFailure::Fatal(error)) if initialized_once => {
+                force_keyframe.store(true, Ordering::Release);
+                warn!("DXGI capture recreation failed: {error}");
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(DxgiCaptureFailure::Fatal(error)) => break Err(error),
+        }
+    };
+    drop(encoded_tx);
+    let _ = sender_handle.join();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_dxgi_capture_session(
+    running: Arc<AtomicBool>,
+    active_peer: Arc<Mutex<Option<SocketAddr>>>,
+    force_keyframe: Arc<AtomicBool>,
+    events: mpsc::Sender<SessionEvent>,
+    encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
+    frames_per_second: u32,
+    bitrate_bps: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), DxgiCaptureFailure> {
+    let (device, device_context, output) =
+        create_dxgi_device_for_primary_display().map_err(DxgiCaptureFailure::Fatal)?;
+    let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|error| {
+        if error.code() == DXGI_ERROR_ACCESS_LOST {
+            DxgiCaptureFailure::AccessLost(format!("Unable to duplicate primary display: {error}"))
+        } else {
+            DxgiCaptureFailure::Fatal(format!("Unable to duplicate primary display: {error}"))
+        }
+    })?;
+    let mut capture = HardwareCapture::new_with_device(
+        &device,
+        device_context,
+        CaptureFlags {
+            active_peer,
+            force_keyframe,
+            encoded_frames,
+            events: events.clone(),
+            frames_per_second,
+            bitrate_bps,
+            width,
+            height,
+        },
+        "NVIDIA NVENC H.264 · DXGI Desktop Duplication · D3D11 zero-copy · 4-buffer async",
+    )
+    .map_err(DxgiCaptureFailure::Fatal)?;
+    let _ = events.send(SessionEvent::CaptureReady);
+
+    while running.load(Ordering::Relaxed) {
+        match acquire_dxgi_frame(&duplication, &mut capture) {
+            Ok(()) => {}
+            Err(DxgiCaptureFailure::AccessLost(error)) => {
+                drop(capture);
+                return Err(DxgiCaptureFailure::AccessLost(error));
+            }
+            Err(error) => {
+                drop(capture);
+                return Err(error);
+            }
+        }
+    }
+    drop(capture);
+    Ok(())
+}
+
+fn create_dxgi_device_for_primary_display(
+) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutput1), String> {
+    let primary =
+        Monitor::primary().map_err(|error| format!("Unable to find primary display: {error}"))?;
+    let primary_handle = primary.as_raw_hmonitor();
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+        .map_err(|error| format!("Unable to create DXGI factory: {error}"))?;
+
+    let mut adapter_index = 0;
+    loop {
+        let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(adapter) => adapter,
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(error) => return Err(format!("Unable to enumerate display adapters: {error}")),
+        };
+        let mut output_index = 0;
+        loop {
+            let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(output) => output,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(error) => return Err(format!("Unable to enumerate display outputs: {error}")),
+            };
+            let description = unsafe { output.GetDesc() }
+                .map_err(|error| format!("Unable to inspect display output: {error}"))?;
+            if description.Monitor.0 == primary_handle {
+                let adapter: IDXGIAdapter = adapter
+                    .cast()
+                    .map_err(|error| format!("Unable to open the primary GPU adapter: {error}"))?;
+                let output: IDXGIOutput1 = output.cast().map_err(|error| {
+                    format!("Desktop Duplication is unavailable on the primary output: {error}")
+                })?;
+                let mut device = None;
+                let mut context = None;
+                unsafe {
+                    D3D11CreateDevice(
+                        &adapter,
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        HMODULE::default(),
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                        None,
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    )
+                }
+                .map_err(|error| format!("Unable to create primary-GPU D3D11 device: {error}"))?;
+                return Ok((
+                    device.ok_or_else(|| "D3D11 returned no device".to_owned())?,
+                    context.ok_or_else(|| "D3D11 returned no immediate context".to_owned())?,
+                    output,
+                ));
+            }
+            output_index += 1;
+        }
+        adapter_index += 1;
+    }
+    Err("The primary monitor was not found among the active DXGI outputs".to_owned())
+}
+
+fn acquire_dxgi_frame(
+    duplication: &IDXGIOutputDuplication,
+    capture: &mut HardwareCapture,
+) -> Result<(), DxgiCaptureFailure> {
+    let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+    let mut resource: Option<IDXGIResource> = None;
+    match unsafe { duplication.AcquireNextFrame(8, &mut info, &mut resource) } {
+        Ok(()) => {}
+        Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
+        Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
+            return Err(DxgiCaptureFailure::AccessLost(format!(
+                "Desktop Duplication access was lost: {error}"
+            )))
+        }
+        Err(error) => {
+            return Err(DxgiCaptureFailure::Fatal(format!(
+                "Unable to acquire DXGI desktop frame: {error}"
+            )))
+        }
+    }
+
+    // A successful acquisition must always be paired with ReleaseFrame, even
+    // when conversion or NVENC submission fails.
+    let processing_result = (|| {
+        let resource =
+            resource.ok_or_else(|| "DXGI returned a frame without a desktop texture".to_owned())?;
+        let texture: ID3D11Texture2D = resource
+            .cast()
+            .map_err(|error| format!("DXGI desktop resource is not a D3D11 texture: {error}"))?;
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut description) };
+        if description.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return Err(format!(
+                "Unexpected DXGI desktop format {:?}",
+                description.Format
+            ));
+        }
+        capture.process_texture(&texture, description.Width, description.Height)
+    })();
+    let release_result = unsafe { duplication.ReleaseFrame() }
+        .map_err(|error| format!("Unable to release DXGI desktop frame: {error}"));
+    processing_result.map_err(DxgiCaptureFailure::Fatal)?;
+    release_result.map_err(DxgiCaptureFailure::Fatal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_wgc_pipeline(
     socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
@@ -280,12 +541,41 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
     type Error = String;
 
     fn new(context: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let encoder = Arc::new(NvencEncoder::new(
+        Self::new_with_device(
             &context.device,
-            context.flags.width,
-            context.flags.height,
-            context.flags.frames_per_second,
-            context.flags.bitrate_bps,
+            context.device_context,
+            context.flags,
+            "NVIDIA NVENC H.264 · Windows Graphics Capture · D3D11 zero-copy · 4-buffer async",
+        )
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        _capture_control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        let source_texture = unsafe { frame.as_raw_texture() };
+        self.process_texture(source_texture, frame.width(), frame.height())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        Err("The captured display was closed".to_owned())
+    }
+}
+
+impl HardwareCapture {
+    fn new_with_device(
+        device: &ID3D11Device,
+        device_context: ID3D11DeviceContext,
+        flags: CaptureFlags,
+        backend: &str,
+    ) -> Result<Self, String> {
+        let encoder = Arc::new(NvencEncoder::new(
+            device,
+            flags.width,
+            flags.height,
+            flags.frames_per_second,
+            flags.bitrate_bps,
         )?);
         let (free_slots_tx, free_slots) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
         for slot in 0..NVENC_BUFFER_COUNT {
@@ -298,17 +588,17 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
             encoder.clone(),
             completion_rx,
             free_slots_tx.clone(),
-            context.flags.encoded_frames.clone(),
-            context.flags.force_keyframe.clone(),
+            flags.encoded_frames.clone(),
+            flags.force_keyframe.clone(),
         );
-        let _ = context.flags.events.send(SessionEvent::VideoBackend(
-            "NVIDIA NVENC H.264 · D3D11 zero-copy · 4-buffer async".to_owned(),
-        ));
+        let _ = flags
+            .events
+            .send(SessionEvent::VideoBackend(backend.to_owned()));
         let frame_interval =
-            Duration::from_secs_f64(1.0 / f64::from(context.flags.frames_per_second.max(1)));
+            Duration::from_secs_f64(1.0 / f64::from(flags.frames_per_second.max(1)));
 
         Ok(Self {
-            device_context: context.device_context,
+            device_context,
             encoder,
             scalers: std::iter::repeat_with(|| None)
                 .take(NVENC_BUFFER_COUNT)
@@ -317,7 +607,7 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
             free_slots,
             completion_tx: Some(completion_tx),
             completion_handle: Some(completion_handle),
-            flags: context.flags,
+            flags,
             started: Instant::now(),
             frame_interval,
             next_frame_at: Instant::now(),
@@ -325,11 +615,12 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
         })
     }
 
-    fn on_frame_arrived(
+    fn process_texture(
         &mut self,
-        frame: &mut Frame,
-        _capture_control: InternalCaptureControl,
-    ) -> Result<(), Self::Error> {
+        source_texture: &ID3D11Texture2D,
+        source_width: u32,
+        source_height: u32,
+    ) -> Result<(), String> {
         if self.flags.active_peer.lock().unwrap().is_none() {
             self.next_frame_at = Instant::now();
             return Ok(());
@@ -352,9 +643,8 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
 
         // The capture texture never leaves GPU memory. CopyResource is used at
         // native size; the D3D11 video processor performs downscaling otherwise.
-        let source_texture = unsafe { frame.as_raw_texture() };
         let prepare_result =
-            if frame.width() == self.flags.width && frame.height() == self.flags.height {
+            if source_width == self.flags.width && source_height == self.flags.height {
                 unsafe {
                     self.device_context
                         .CopyResource(output_texture, source_texture);
@@ -362,14 +652,14 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
                 Ok(())
             } else {
                 let scaler_needs_rebuild = self.scalers[slot].as_ref().is_none_or(|scaler| {
-                    scaler.source_width != frame.width() || scaler.source_height != frame.height()
+                    scaler.source_width != source_width || scaler.source_height != source_height
                 });
                 if scaler_needs_rebuild {
                     match D3dScaler::new(
                         &self.device_context,
                         output_texture,
-                        frame.width(),
-                        frame.height(),
+                        source_width,
+                        source_height,
                         self.flags.width,
                         self.flags.height,
                         self.flags.frames_per_second,
@@ -430,10 +720,6 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
             let _ = self.free_slots_tx.try_send(slot);
         }
         Ok(())
-    }
-
-    fn on_closed(&mut self) -> Result<(), Self::Error> {
-        Err("The captured display was closed".to_owned())
     }
 }
 
@@ -899,7 +1185,7 @@ impl NvencEncoder {
                 get_preset(
                     self.encoder,
                     NV_ENC_CODEC_H264_GUID,
-                    NV_ENC_PRESET_P1_GUID,
+                    NV_ENC_PRESET_P3_GUID,
                     NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                     &mut preset,
                 )
@@ -918,7 +1204,12 @@ impl NvencEncoder {
         let frame_budget = bitrate_bps / frames_per_second.max(1);
         config.rcParams.vbvBufferSize = frame_budget.max(1);
         config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
-        config.rcParams.set_enableAQ(0);
+        // Spatial AQ preserves flat UI regions and fine game detail without
+        // buffering future frames. Temporal AQ and lookahead remain disabled
+        // because either can add latency and bitrate variability.
+        config.rcParams.set_enableAQ(1);
+        config.rcParams.set_aqStrength(8);
+        config.rcParams.set_enableTemporalAQ(0);
         config.rcParams.set_enableLookahead(0);
         config.rcParams.set_zeroReorderDelay(1);
         let mut h264 = unsafe { config.encodeCodecConfig.h264Config };
@@ -929,12 +1220,23 @@ impl NvencEncoder {
         h264.sliceMode = 2;
         h264.sliceModeData = 1;
         h264.set_repeatSPSPPS(1);
+        h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
+        h264.h264VUIParameters.videoFormat =
+            NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+        h264.h264VUIParameters.videoFullRangeFlag = 0;
+        h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
+        h264.h264VUIParameters.colourPrimaries =
+            NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        h264.h264VUIParameters.transferCharacteristics =
+            NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        h264.h264VUIParameters.colourMatrix =
+            NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
         config.encodeCodecConfig.h264Config = h264;
 
         let mut initialize = NV_ENC_INITIALIZE_PARAMS {
             version: NV_ENC_INITIALIZE_PARAMS_VER,
             encodeGUID: NV_ENC_CODEC_H264_GUID,
-            presetGUID: NV_ENC_PRESET_P1_GUID,
+            presetGUID: NV_ENC_PRESET_P3_GUID,
             encodeWidth: self.width,
             encodeHeight: self.height,
             darWidth: self.width,

@@ -1080,6 +1080,18 @@ fn spawn_client_network(
                 metrics.dropped_frames.fetch_add(expired, Ordering::Relaxed);
                 metrics.lost_frames.fetch_add(expired, Ordering::Relaxed);
                 reassembly_started.retain(|_, started| started.elapsed() <= VIDEO_REASSEMBLY_AGE);
+                // A missing H.264 reference frame invalidates every dependent
+                // frame after it. Do not let VideoToolbox conceal that damage
+                // as colored bands or blocky smearing: discard the chain and
+                // immediately resume from a new IDR.
+                decode_queue.require_keyframe();
+                completed_frames.clear();
+                next_frame_id = None;
+                waiting_for_keyframe = true;
+                if accepted && last_keyframe_request.elapsed() >= Duration::from_millis(100) {
+                    request_keyframe(&socket, &mut outgoing);
+                    last_keyframe_request = Instant::now();
+                }
             }
             if decoder_needs_keyframe.swap(false, Ordering::AcqRel) {
                 decode_queue.require_keyframe();

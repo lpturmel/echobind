@@ -98,7 +98,9 @@ impl EchobindApp {
             server_ip: "127.0.0.1".to_owned(),
             port: 3013,
             frames_per_second: 60,
-            bitrate_mbps: 20,
+            // Native high-refresh game streaming needs substantially more than
+            // 20 Mbps to avoid macroblocking during rapid full-screen motion.
+            bitrate_mbps: 100,
             resolution: VideoResolution::Native,
             jumbo_datagrams: false,
             transport: "standard MTU".to_owned(),
@@ -515,7 +517,7 @@ impl EchobindApp {
                 ui.label("FPS");
                 ui.add(egui::DragValue::new(&mut self.frames_per_second).range(15..=120));
                 ui.label("Mbps");
-                ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=100));
+                ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=200));
                 ui.checkbox(&mut self.jumbo_datagrams, "Jumbo MTU 9000")
                     .on_hover_text(
                         "Only enable when every LAN hop supports a 9000-byte MTU; negotiation falls back to standard MTU for older clients.",
