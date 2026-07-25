@@ -34,7 +34,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use tracing::warn;
+use tracing::{debug, warn};
 use windows::{
     core::Interface,
     Win32::{
@@ -45,12 +45,13 @@ use windows::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
                 ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
                 ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
-                D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET,
+                D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_BIND_VIDEO_ENCODER,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
                 D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
                 D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
-                D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+                D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
+                D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
                 D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
                 D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -60,8 +61,8 @@ use windows::{
                 Common::{
                     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
                 },
-                CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1,
-                IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+                CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
+                IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
                 DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
             },
         },
@@ -90,6 +91,8 @@ const ACTIVE_CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
 const CAPTURE_ACTIVITY_THRESHOLD: u64 = 3;
 const MAX_IMMEDIATE_HARDWARE_FAILURES: u32 = 3;
+const HARDWARE_RECOVERY_STREAK_RESET: Duration = Duration::from_secs(30);
+const HARDWARE_RECOVERY_MAX_DELAY_MS: u64 = 5_000;
 
 struct CaptureFlags {
     running: Arc<AtomicBool>,
@@ -195,6 +198,8 @@ pub(super) fn spawn_hardware_pipeline(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let hardware_progress = Arc::new(AtomicU64::new(0));
+        let mut last_full_hardware_failure = None::<Instant>;
+        let mut recovery_streak = 0_u32;
         let result = loop {
             let dxgi_error = match run_dxgi_pipeline(
                 socket.clone(),
@@ -213,7 +218,7 @@ pub(super) fn spawn_hardware_pipeline(
                 Err(error) if running.load(Ordering::Relaxed) => error,
                 Err(_) => break Ok(()),
             };
-            warn!("DXGI/NVENC pipeline unavailable: {dxgi_error}");
+            debug!("DXGI/NVENC pipeline unavailable: {dxgi_error}");
             let _ = events.send(SessionEvent::VideoBackend(format!(
                 "Windows Graphics Capture takeover after DXGI: {dxgi_error}"
             )));
@@ -244,7 +249,7 @@ pub(super) fn spawn_hardware_pipeline(
                         if immediate_failures >= MAX_IMMEDIATE_HARDWARE_FAILURES {
                             break Some(error);
                         }
-                        warn!(
+                        debug!(
                             "Windows Graphics Capture/NVENC stopped; rebuilding hardware pipeline: {error}"
                         );
                         force_keyframe.store(true, Ordering::Release);
@@ -265,14 +270,24 @@ pub(super) fn spawn_hardware_pipeline(
             // encoder. Recreate fresh D3D11 and NVENC sessions and keep the
             // socket/audio session alive.
             if hardware_progress.load(Ordering::Acquire) > 0 {
+                let now = Instant::now();
+                if last_full_hardware_failure
+                    .is_none_or(|last| now.duration_since(last) >= HARDWARE_RECOVERY_STREAK_RESET)
+                {
+                    recovery_streak = 0;
+                }
+                recovery_streak = recovery_streak.saturating_add(1);
+                last_full_hardware_failure = Some(now);
+                let delay_ms = (250_u64 << recovery_streak.saturating_sub(1).min(4))
+                    .min(HARDWARE_RECOVERY_MAX_DELAY_MS);
                 warn!(
-                    "Both Windows hardware capture paths stopped; restarting from DXGI: {wgc_error}"
+                    "Windows hardware video pipeline lost (recovery {recovery_streak}); retrying in {delay_ms} ms: DXGI: {dxgi_error}; WGC: {wgc_error}"
                 );
                 force_keyframe.store(true, Ordering::Release);
                 let _ = events.send(SessionEvent::VideoBackend(format!(
-                    "Rebuilding Windows hardware video pipeline after: {wgc_error}"
+                    "Rebuilding Windows hardware video pipeline in {delay_ms} ms after device failure"
                 )));
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(delay_ms));
                 continue;
             }
             break Err(format!(
@@ -379,7 +394,7 @@ fn run_dxgi_pipeline(
                 if immediate_failures >= MAX_IMMEDIATE_HARDWARE_FAILURES {
                     break Err(error);
                 }
-                warn!("DXGI/NVENC stopped; rebuilding hardware pipeline: {error}");
+                debug!("DXGI/NVENC stopped; rebuilding hardware pipeline: {error}");
                 let _ = events.send(SessionEvent::VideoBackend(format!(
                     "DXGI/NVENC restarting after: {error}"
                 )));
@@ -433,7 +448,6 @@ fn run_dxgi_capture_session(
         "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · D3D11 BGRA→NV12 · 4-buffer async",
     )
     .map_err(DxgiCaptureFailure::Fatal)?;
-    let _ = events.send(SessionEvent::CaptureReady);
     let mut peer_became_active = None::<Instant>;
     let mut captured_for_peer = false;
     let mut activity_window_started = Instant::now();
@@ -674,7 +688,6 @@ fn run_wgc_pipeline(
     );
     let control = HardwareCapture::start_free_threaded(settings)
         .map_err(|error| format!("Unable to start D3D11 screen capture: {error}"))?;
-    let _ = events.send(SessionEvent::CaptureReady);
 
     let mut peer_became_active = None::<Instant>;
     let mut activity_window_started = Instant::now();
@@ -787,16 +800,6 @@ impl HardwareCapture {
         backend: &str,
     ) -> Result<Self, String> {
         raise_current_thread_priority("capture");
-        if let Ok(dxgi_device) = device.cast::<IDXGIDevice>() {
-            // The capture copy is a small, bounded workload but must make
-            // forward progress even while a game saturates the 3D queue.
-            // Relative priority +1 is intentionally modest: it avoids capture
-            // starvation without using the soft/hard realtime priorities that
-            // could materially interfere with the game.
-            if let Err(error) = unsafe { dxgi_device.SetGPUThreadPriority(1) } {
-                warn!("Unable to raise D3D11 capture priority: {error}");
-            }
-        }
         let encoder = Arc::new(NvencEncoder::new(
             device,
             flags.width,
@@ -822,6 +825,7 @@ impl HardwareCapture {
             flags.running.clone(),
             completion_failure.clone(),
             flags.hardware_progress.clone(),
+            flags.events.clone(),
         );
         let _ = flags
             .events
@@ -977,7 +981,12 @@ impl HardwareCapture {
                     D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
                 )
             }
-            .map_err(|error| format!("Unable to query D3D11 copy completion: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "Unable to query D3D11 copy completion: {error}; {}",
+                    d3d11_device_removed_reason(&self.device_context)
+                )
+            })?;
             if complete.as_bool() {
                 return Ok(());
             }
@@ -994,6 +1003,20 @@ impl HardwareCapture {
                 thread::yield_now();
             }
         }
+    }
+}
+
+fn d3d11_device_removed_reason(device_context: &ID3D11DeviceContext) -> String {
+    let device = match unsafe { device_context.GetDevice() } {
+        Ok(device) => device,
+        Err(error) => return format!("unable to retrieve D3D11 device: {error}"),
+    };
+    match unsafe { device.GetDeviceRemovedReason() } {
+        Ok(()) => "GetDeviceRemovedReason returned S_OK".to_owned(),
+        Err(reason) => format!(
+            "GetDeviceRemovedReason: {reason} (HRESULT 0x{:08X})",
+            reason.code().0 as u32
+        ),
     }
 }
 
@@ -1026,6 +1049,7 @@ fn spawn_nvenc_completion(
     running: Arc<AtomicBool>,
     completion_failure: Arc<Mutex<Option<String>>>,
     hardware_progress: Arc<AtomicU64>,
+    events: mpsc::Sender<SessionEvent>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         raise_current_thread_priority("NVENC completion");
@@ -1047,7 +1071,9 @@ fn spawn_nvenc_completion(
                         }
                     };
                     if accepted {
-                        hardware_progress.fetch_add(1, Ordering::Release);
+                        if hardware_progress.fetch_add(1, Ordering::AcqRel) == 0 {
+                            let _ = events.send(SessionEvent::CaptureReady);
+                        }
                     }
                 }
                 Err(error) => {
@@ -1253,10 +1279,10 @@ fn create_output_texture(
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        // The D3D11 video processor writes BGRA capture data into this NV12
-        // render target. NVENC accepts the same texture via resource
-        // registration without the D3D11 video-encoder bind flag.
-        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+        // This is both a D3D11 video-processor output and an NVENC input. The
+        // encoder bind flag is valid for NV12 (unlike the former BGRA path)
+        // and tells the driver about both intended hardware-video uses.
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32,
         CPUAccessFlags: 0,
         MiscFlags: 0,
     };
@@ -1312,6 +1338,26 @@ impl D3dScaler {
                 .CreateVideoProcessorEnumerator(&content)
                 .map_err(|error| format!("Unable to create D3D11 video scaler: {error}"))?
         };
+        let bgra_support = unsafe {
+            enumerator
+                .CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM)
+                .map_err(|error| {
+                    format!("Unable to query D3D11 BGRA video-processor support: {error}")
+                })?
+        };
+        if bgra_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0 {
+            return Err("The D3D11 video processor cannot consume BGRA capture frames".to_owned());
+        }
+        let nv12_support = unsafe {
+            enumerator
+                .CheckVideoProcessorFormat(DXGI_FORMAT_NV12)
+                .map_err(|error| {
+                    format!("Unable to query D3D11 NV12 video-processor support: {error}")
+                })?
+        };
+        if nv12_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0 {
+            return Err("The D3D11 video processor cannot produce NV12 encoder frames".to_owned());
+        }
         let processor = unsafe {
             video_device
                 .CreateVideoProcessor(&enumerator, 0)

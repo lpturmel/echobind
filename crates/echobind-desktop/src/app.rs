@@ -196,7 +196,10 @@ impl EchobindApp {
                     self.pending_peer = None;
                 }
                 SessionEvent::CaptureReady => {
-                    if self.mode == Mode::Host && self.pending_peer.is_none() {
+                    if self.mode == Mode::Host
+                        && self.pending_peer.is_none()
+                        && !self.status.contains("capture ready")
+                    {
                         self.status = format!("{} · capture ready", self.status);
                     }
                 }
