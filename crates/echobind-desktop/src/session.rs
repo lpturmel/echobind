@@ -1,7 +1,7 @@
 use crate::video::I420Frame;
 use echobind_core::{
-    protocol::{Packet, MAX_DATAGRAM_SIZE},
-    video::{fragment_video_frame, VideoFrame, VideoReassembler},
+    protocol::{Packet, JUMBO_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE, STANDARD_DATAGRAM_SIZE},
+    video::{fragment_video_frame_with_datagram_size, VideoFrame, VideoReassembler},
     AudioConfig, FrameRate as SessionFrameRate, SessionConfig, VideoCodec, VideoConfig,
 };
 use openh264::{
@@ -22,7 +22,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     net::{SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
@@ -47,8 +47,10 @@ mod hardware_windows;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
-const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(250);
-const VIDEO_DECODE_QUEUE_CAPACITY: usize = 4;
+const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(50);
+const VIDEO_DECODE_QUEUE_CAPACITY: usize = 2;
+const VIDEO_REORDER_WINDOW: usize = 2;
+pub(super) const VIDEO_STALE_AGE: Duration = Duration::from_millis(25);
 const CLIENT_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const HOST_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const HELLO_INTERVAL: Duration = Duration::from_millis(400);
@@ -114,16 +116,22 @@ impl CapturedFrame {
     }
 }
 
-type CaptureSlot = Arc<(Mutex<Option<CapturedFrame>>, Condvar)>;
+struct CapturedSample {
+    frame: CapturedFrame,
+    captured_at: Instant,
+}
+
+type CaptureSlot = Arc<(Mutex<Option<CapturedSample>>, Condvar)>;
 pub(super) type LatestFrame = Arc<Mutex<Option<DisplayFrame>>>;
+pub(super) type FrameNotifier = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub(super) struct DisplayFrame {
     pub width: usize,
     pub height: usize,
     pub data: DisplayFrameData,
-    #[cfg(target_os = "macos")]
-    pub decoded_at: Instant,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub published_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +151,18 @@ pub(super) struct ClientMetrics {
     reassembly_samples: AtomicU64,
     decode_us: AtomicU64,
     decode_samples: AtomicU64,
+    decode_queue_us: AtomicU64,
+    decode_queue_samples: AtomicU64,
+    jitter_us: AtomicU64,
+    jitter_samples: AtomicU64,
+    rtt_us: AtomicU64,
+    lost_frames: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ReceivedVideoFrame {
+    pub frame: VideoFrame,
+    pub received_at: Instant,
 }
 
 #[derive(Clone)]
@@ -152,14 +172,16 @@ pub(super) struct DecodeQueue {
 
 #[derive(Default)]
 struct DecodeQueueState {
-    frames: VecDeque<VideoFrame>,
+    frames: VecDeque<ReceivedVideoFrame>,
     waiting_for_keyframe: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeQueuePush {
     Queued,
     WaitingForKeyframe,
     Overflowed,
+    Stale,
 }
 
 impl DecodeQueue {
@@ -169,20 +191,23 @@ impl DecodeQueue {
         }
     }
 
-    fn push(&self, frame: VideoFrame) -> DecodeQueuePush {
+    fn push(&self, frame: ReceivedVideoFrame) -> DecodeQueuePush {
+        if frame.received_at.elapsed() > VIDEO_STALE_AGE {
+            return DecodeQueuePush::Stale;
+        }
         let (lock, ready) = &*self.inner;
         let mut state = lock.lock().unwrap();
-        if state.waiting_for_keyframe && !frame.is_keyframe {
+        if state.waiting_for_keyframe && !frame.frame.is_keyframe {
             return DecodeQueuePush::WaitingForKeyframe;
         }
         if state.frames.len() >= VIDEO_DECODE_QUEUE_CAPACITY {
             state.frames.clear();
             state.waiting_for_keyframe = true;
-            if !frame.is_keyframe {
+            if !frame.frame.is_keyframe {
                 return DecodeQueuePush::Overflowed;
             }
         }
-        if frame.is_keyframe {
+        if frame.frame.is_keyframe {
             state.waiting_for_keyframe = false;
         }
         state.frames.push_back(frame);
@@ -190,7 +215,7 @@ impl DecodeQueue {
         DecodeQueuePush::Queued
     }
 
-    pub(super) fn pop_timeout(&self, timeout: Duration) -> Option<VideoFrame> {
+    pub(super) fn pop_timeout(&self, timeout: Duration) -> Option<ReceivedVideoFrame> {
         let (lock, ready) = &*self.inner;
         let mut state = lock.lock().unwrap();
         if state.frames.is_empty() {
@@ -227,6 +252,7 @@ pub enum SessionEvent {
         capture_ms: f32,
         encode_ms: f32,
         send_ms: f32,
+        encode_queue_ms: f32,
     },
     ClientStats {
         received_fps: f32,
@@ -235,6 +261,13 @@ pub enum SessionEvent {
         dropped_frames: u64,
         reassembly_ms: f32,
         decode_ms: f32,
+        decode_queue_ms: f32,
+        jitter_ms: f32,
+        rtt_ms: f32,
+        lost_frames: u64,
+    },
+    TransportConfigured {
+        datagram_size: usize,
     },
     Error(String),
 }
@@ -266,6 +299,7 @@ impl DesktopSession {
         frames_per_second: u32,
         bitrate_bps: u32,
         resolution: VideoResolution,
+        jumbo_datagrams: bool,
     ) -> Result<Self, String> {
         let (audio_capture, audio_probe_error) = match audio::discover_system_audio_capture() {
             Ok(settings) => (Some(settings), None),
@@ -291,6 +325,7 @@ impl DesktopSession {
         let running = Arc::new(AtomicBool::new(true));
         let active_peer = Arc::new(Mutex::new(None::<SocketAddr>));
         let force_keyframe = Arc::new(AtomicBool::new(true));
+        let active_datagram_size = Arc::new(AtomicUsize::new(STANDARD_DATAGRAM_SIZE));
         let latest_frame = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
@@ -309,10 +344,15 @@ impl DesktopSession {
                     denominator: 1,
                 },
                 bitrate_bps,
+                datagram_size: STANDARD_DATAGRAM_SIZE as u16,
             }),
         };
-        let config_json = serde_json::to_vec(&session_config)
+        let standard_config_json = serde_json::to_vec(&session_config)
             .map_err(|error| format!("Unable to serialize session config: {error}"))?;
+        let mut jumbo_config = session_config.clone();
+        jumbo_config.video.as_mut().unwrap().datagram_size = JUMBO_DATAGRAM_SIZE as u16;
+        let jumbo_config_json = serde_json::to_vec(&jumbo_config)
+            .map_err(|error| format!("Unable to serialize jumbo session config: {error}"))?;
 
         let network_handle = spawn_host_network(
             socket.clone(),
@@ -321,7 +361,10 @@ impl DesktopSession {
             force_keyframe.clone(),
             command_rx,
             event_tx.clone(),
-            config_json,
+            standard_config_json,
+            jumbo_config_json,
+            jumbo_datagrams,
+            active_datagram_size.clone(),
         );
         if let Some(error) = audio_probe_error {
             let _ = event_tx.send(SessionEvent::AudioBackend(format!(
@@ -340,6 +383,7 @@ impl DesktopSession {
                 frames_per_second,
                 bitrate_bps,
                 resolution,
+                active_datagram_size.clone(),
             );
             (None, vec![hardware_handle])
         };
@@ -357,6 +401,7 @@ impl DesktopSession {
                 width,
                 height,
                 resolution,
+                active_datagram_size.clone(),
             );
             (None, vec![hardware_handle])
         };
@@ -381,6 +426,7 @@ impl DesktopSession {
                 frames_per_second,
                 bitrate_bps,
                 resolution,
+                active_datagram_size.clone(),
             );
             (Some(capture_slot), vec![capture_handle, encoder_handle])
         };
@@ -413,6 +459,7 @@ impl DesktopSession {
     pub fn start_client(
         server_addr: SocketAddr,
         audio_output_device: Option<String>,
+        frame_notifier: FrameNotifier,
     ) -> Result<Self, String> {
         let bind_addr = if server_addr.is_ipv4() {
             "0.0.0.0:0"
@@ -454,6 +501,7 @@ impl DesktopSession {
             metrics,
             decoder_needs_keyframe,
             event_tx,
+            frame_notifier,
         );
 
         Ok(Self {
@@ -596,23 +644,42 @@ fn spawn_host_network(
     force_keyframe: Arc<AtomicBool>,
     commands: mpsc::Receiver<HostCommand>,
     events: mpsc::Sender<SessionEvent>,
-    config_json: Vec<u8>,
+    standard_config_json: Vec<u8>,
+    jumbo_config_json: Vec<u8>,
+    jumbo_requested: bool,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut packet_buffer = [0_u8; MAX_DATAGRAM_SIZE];
         let mut response = Vec::with_capacity(MAX_DATAGRAM_SIZE);
-        let mut pending_peer = None;
+        let mut pending_peer = None::<(SocketAddr, usize)>;
         let mut last_seen = None::<Instant>;
 
         while running.load(Ordering::Relaxed) {
             while let Ok(command) = commands.try_recv() {
                 match command {
-                    HostCommand::Accept(peer) if pending_peer == Some(peer) => {
+                    HostCommand::Accept(peer)
+                        if pending_peer.is_some_and(|(pending, _)| pending == peer) =>
+                    {
+                        let client_max =
+                            pending_peer.map_or(STANDARD_DATAGRAM_SIZE, |(_, max)| max);
+                        let datagram_size = if jumbo_requested && client_max >= JUMBO_DATAGRAM_SIZE
+                        {
+                            JUMBO_DATAGRAM_SIZE
+                        } else {
+                            STANDARD_DATAGRAM_SIZE
+                        };
+                        active_datagram_size.store(datagram_size, Ordering::Release);
                         *active_peer.lock().unwrap() = Some(peer);
                         pending_peer = None;
                         last_seen = Some(Instant::now());
                         force_keyframe.store(true, Ordering::Relaxed);
-                        Packet::Config(&config_json).encode(&mut response);
+                        let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
+                            &jumbo_config_json
+                        } else {
+                            &standard_config_json
+                        };
+                        Packet::Config(config_json).encode(&mut response);
                         if let Err(error) = socket.send_to(&response, peer) {
                             let _ = events.send(SessionEvent::Error(format!(
                                 "Unable to accept {peer}: {error}"
@@ -620,9 +687,13 @@ fn spawn_host_network(
                             *active_peer.lock().unwrap() = None;
                         } else {
                             let _ = events.send(SessionEvent::Connected(peer));
+                            let _ =
+                                events.send(SessionEvent::TransportConfigured { datagram_size });
                         }
                     }
-                    HostCommand::Reject(peer) if pending_peer == Some(peer) => {
+                    HostCommand::Reject(peer)
+                        if pending_peer.is_some_and(|(pending, _)| pending == peer) =>
+                    {
                         Packet::ConnectionRejected(b"Connection rejected by host")
                             .encode(&mut response);
                         let _ = socket.send_to(&response, peer);
@@ -644,18 +715,27 @@ fn spawn_host_network(
                     let current_peer = *active_peer.lock().unwrap();
 
                     match packet {
-                        Packet::Hello if current_peer == Some(peer) => {
+                        Packet::Hello { .. } if current_peer == Some(peer) => {
                             last_seen = Some(Instant::now());
-                            Packet::Config(&config_json).encode(&mut response);
+                            let datagram_size = active_datagram_size.load(Ordering::Acquire);
+                            let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
+                                &jumbo_config_json
+                            } else {
+                                &standard_config_json
+                            };
+                            Packet::Config(config_json).encode(&mut response);
                             let _ = socket.send_to(&response, peer);
                         }
-                        Packet::Hello if current_peer.is_none() => {
-                            if pending_peer != Some(peer) {
-                                pending_peer = Some(peer);
+                        Packet::Hello { max_datagram_size } if current_peer.is_none() => {
+                            let advertised = usize::from(max_datagram_size)
+                                .clamp(STANDARD_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
+                            let is_new = pending_peer.map(|(pending, _)| pending) != Some(peer);
+                            pending_peer = Some((peer, advertised));
+                            if is_new {
                                 let _ = events.send(SessionEvent::PendingConnection(peer));
                             }
                         }
-                        Packet::Hello => {
+                        Packet::Hello { .. } => {
                             Packet::ConnectionRejected(b"Host is already connected")
                                 .encode(&mut response);
                             let _ = socket.send_to(&response, peer);
@@ -696,6 +776,7 @@ fn spawn_host_network(
                         "{peer} stopped responding"
                     )));
                 }
+                active_datagram_size.store(STANDARD_DATAGRAM_SIZE, Ordering::Release);
                 last_seen = None;
             }
         }
@@ -739,12 +820,18 @@ fn spawn_capture(
             match capturer.get_next_frame() {
                 Ok(Frame::YUVFrame(frame)) => {
                     let (slot, available) = &*capture_slot;
-                    *slot.lock().unwrap() = Some(CapturedFrame::Nv12(frame));
+                    *slot.lock().unwrap() = Some(CapturedSample {
+                        frame: CapturedFrame::Nv12(frame),
+                        captured_at: Instant::now(),
+                    });
                     available.notify_one();
                 }
                 Ok(Frame::BGRA(frame)) => {
                     let (slot, available) = &*capture_slot;
-                    *slot.lock().unwrap() = Some(CapturedFrame::Bgra(frame));
+                    *slot.lock().unwrap() = Some(CapturedSample {
+                        frame: CapturedFrame::Bgra(frame),
+                        captured_at: Instant::now(),
+                    });
                     available.notify_one();
                 }
                 Ok(
@@ -778,6 +865,7 @@ fn spawn_encoder(
     frames_per_second: u32,
     bitrate_bps: u32,
     resolution: VideoResolution,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let encoder_config = EncoderConfig::new()
@@ -789,7 +877,7 @@ fn spawn_encoder(
             .adaptive_quantization(false)
             .background_detection(false)
             .skip_frames(true)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(frames_per_second));
+            .intra_frame_period(IntraFramePeriod::from_num_frames(u32::MAX));
         let mut encoder = match Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
         {
             Ok(encoder) => encoder,
@@ -814,6 +902,7 @@ fn spawn_encoder(
         let mut stats_capture_us = 0_u64;
         let mut stats_encode_us = 0_u64;
         let mut stats_send_us = 0_u64;
+        let mut stats_encode_queue_us = 0_u64;
         let mut frame = I420Frame::default();
 
         while running.load(Ordering::Relaxed) {
@@ -830,12 +919,16 @@ fn spawn_encoder(
             let Some(capture) = capture else {
                 continue;
             };
+            if capture.captured_at.elapsed() > VIDEO_STALE_AGE {
+                force_keyframe.store(true, Ordering::Release);
+                continue;
+            }
             let Some(peer) = *active_peer.lock().unwrap() else {
                 continue;
             };
 
             let capture_started = Instant::now();
-            if let Err(error) = capture.update_i420(&mut frame, resolution) {
+            if let Err(error) = capture.frame.update_i420(&mut frame, resolution) {
                 let _ = events.send(SessionEvent::Error(format!(
                     "Unable to convert captured frame: {error}"
                 )));
@@ -864,6 +957,10 @@ fn spawn_encoder(
                 .elapsed()
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
+            if capture.captured_at.elapsed() > VIDEO_STALE_AGE {
+                force_keyframe.store(true, Ordering::Release);
+                continue;
+            }
             let frame_type = encoded.frame_type();
             if frame_type == EncodedFrameType::Skip {
                 continue;
@@ -879,16 +976,23 @@ fn spawn_encoder(
 
             let is_keyframe = matches!(frame_type, EncodedFrameType::IDR | EncodedFrameType::I);
             let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            let fragments =
-                match fragment_video_frame(frame_id, timestamp_us, is_keyframe, &encoded) {
-                    Ok(fragments) => fragments,
-                    Err(error) => {
-                        let _ = events.send(SessionEvent::Error(format!(
-                            "Encoded frame cannot be packetized: {error}"
-                        )));
-                        continue;
-                    }
-                };
+            let encoded_at = Instant::now();
+            let fragments = match fragment_video_frame_with_datagram_size(
+                frame_id,
+                timestamp_us,
+                is_keyframe,
+                &encoded,
+                active_datagram_size.load(Ordering::Acquire),
+            ) {
+                Ok(fragments) => fragments,
+                Err(error) => {
+                    let _ = events.send(SessionEvent::Error(format!(
+                        "Encoded frame cannot be packetized: {error}"
+                    )));
+                    continue;
+                }
+            };
+            let encode_queue_us = encoded_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
             let send_started = Instant::now();
             let mut frame_sent = true;
@@ -909,6 +1013,7 @@ fn spawn_encoder(
                 stats_send_us = stats_send_us.saturating_add(
                     send_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                 );
+                stats_encode_queue_us = stats_encode_queue_us.saturating_add(encode_queue_us);
             }
 
             let elapsed = stats_started.elapsed();
@@ -920,6 +1025,7 @@ fn spawn_encoder(
                     capture_ms: average_milliseconds(stats_capture_us, stats_frames),
                     encode_ms: average_milliseconds(stats_encode_us, stats_frames),
                     send_ms: average_milliseconds(stats_send_us, stats_frames),
+                    encode_queue_ms: average_milliseconds(stats_encode_queue_us, stats_frames),
                 });
                 stats_started = Instant::now();
                 stats_frames = 0;
@@ -927,6 +1033,7 @@ fn spawn_encoder(
                 stats_capture_us = 0;
                 stats_encode_us = 0;
                 stats_send_us = 0;
+                stats_encode_queue_us = 0;
             }
         }
     })
@@ -956,8 +1063,11 @@ fn spawn_client_network(
         let mut last_keyframe_request = Instant::now() - Duration::from_secs(1);
         let mut stats_started = Instant::now();
         let mut next_frame_id = None::<u64>;
-        let mut completed_frames = BTreeMap::<u64, VideoFrame>::new();
+        let mut completed_frames = BTreeMap::<u64, ReceivedVideoFrame>::new();
         let mut reassembly_started = BTreeMap::<u64, Instant>::new();
+        let mut ping_sent = BTreeMap::<u64, Instant>::new();
+        let mut last_frame_arrival = None::<(Instant, u64)>;
+        let mut negotiated_datagram_size = STANDARD_DATAGRAM_SIZE;
         let mut waiting_for_keyframe = true;
         let mut audio_config = None::<AudioConfig>;
         let mut audio_configured = false;
@@ -965,6 +1075,12 @@ fn spawn_client_network(
         let _ = events.send(SessionEvent::AwaitingApproval);
 
         while running.load(Ordering::Relaxed) {
+            let expired = reassembler.expire_stale() as u64;
+            if expired > 0 {
+                metrics.dropped_frames.fetch_add(expired, Ordering::Relaxed);
+                metrics.lost_frames.fetch_add(expired, Ordering::Relaxed);
+                reassembly_started.retain(|_, started| started.elapsed() <= VIDEO_REASSEMBLY_AGE);
+            }
             if decoder_needs_keyframe.swap(false, Ordering::AcqRel) {
                 decode_queue.require_keyframe();
                 completed_frames.clear();
@@ -987,7 +1103,18 @@ fn spawn_client_network(
                 }
             }
             if !accepted && last_hello.elapsed() >= HELLO_INTERVAL {
-                Packet::Hello.encode(&mut outgoing);
+                // Send the legacy empty hello first so standard-MTU ECB2 hosts
+                // still see the request, then advertise jumbo capability to
+                // upgraded hosts.
+                Packet::Hello {
+                    max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+                }
+                .encode(&mut outgoing);
+                let _ = socket.send(&outgoing);
+                Packet::Hello {
+                    max_datagram_size: MAX_DATAGRAM_SIZE as u16,
+                }
+                .encode(&mut outgoing);
                 if let Err(error) = socket.send(&outgoing) {
                     let _ = events.send(SessionEvent::Error(format!(
                         "Connection request failed: {error}"
@@ -999,6 +1126,10 @@ fn spawn_client_network(
             if accepted && last_ping.elapsed() >= HEARTBEAT_INTERVAL {
                 Packet::Ping(ping_id).encode(&mut outgoing);
                 let _ = socket.send(&outgoing);
+                ping_sent.insert(ping_id, Instant::now());
+                while ping_sent.len() > 4 {
+                    ping_sent.pop_first();
+                }
                 ping_id = ping_id.wrapping_add(1);
                 last_ping = Instant::now();
             }
@@ -1056,6 +1187,19 @@ fn spawn_client_network(
                                 )));
                                 return;
                             }
+                            let offered_datagram_size = usize::from(video.datagram_size);
+                            if offered_datagram_size != STANDARD_DATAGRAM_SIZE
+                                && offered_datagram_size != JUMBO_DATAGRAM_SIZE
+                            {
+                                let _ = events.send(SessionEvent::Error(format!(
+                                    "Host selected unsupported datagram size {offered_datagram_size}"
+                                )));
+                                return;
+                            }
+                            negotiated_datagram_size = offered_datagram_size;
+                            let _ = events.send(SessionEvent::TransportConfigured {
+                                datagram_size: negotiated_datagram_size,
+                            });
                             let _ = events.send(SessionEvent::VideoConfigured {
                                 width: video.width,
                                 height: video.height,
@@ -1071,7 +1215,14 @@ fn spawn_client_network(
                             let _ = events.send(SessionEvent::ConnectionRejected(reason));
                             return;
                         }
-                        Packet::Pong(_) => {}
+                        Packet::Pong(id) => {
+                            if let Some(sent) = ping_sent.remove(&id) {
+                                metrics.rtt_us.store(
+                                    sent.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        }
                         Packet::Ping(id) => {
                             Packet::Pong(id).encode(&mut outgoing);
                             let _ = socket.send(&outgoing);
@@ -1082,6 +1233,11 @@ fn spawn_client_network(
                             }
                         }
                         Packet::Video(fragment) if accepted => {
+                            if size > negotiated_datagram_size {
+                                metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                metrics.lost_frames.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             let fragmented_frame_id = fragment.frame_id;
                             reassembly_started
                                 .entry(fragmented_frame_id)
@@ -1091,6 +1247,7 @@ fn spawn_client_network(
                             }
                             match reassembler.push(fragment) {
                                 Ok(Some(frame)) => {
+                                    let completed_at = Instant::now();
                                     if let Some(started) =
                                         reassembly_started.remove(&frame.frame_id)
                                     {
@@ -1102,6 +1259,29 @@ fn spawn_client_network(
                                         metrics.reassembly_samples.fetch_add(1, Ordering::Relaxed);
                                     }
                                     metrics.reassembled_frames.fetch_add(1, Ordering::Relaxed);
+                                    if let Some((previous_arrival, previous_timestamp)) =
+                                        last_frame_arrival.filter(|(_, timestamp)| {
+                                            frame.timestamp_us > *timestamp
+                                        })
+                                    {
+                                        let arrival_delta = completed_at
+                                            .saturating_duration_since(previous_arrival)
+                                            .as_micros()
+                                            .min(u128::from(u64::MAX))
+                                            as u64;
+                                        let source_delta =
+                                            frame.timestamp_us.saturating_sub(previous_timestamp);
+                                        metrics.jitter_us.fetch_add(
+                                            arrival_delta.abs_diff(source_delta),
+                                            Ordering::Relaxed,
+                                        );
+                                        metrics.jitter_samples.fetch_add(1, Ordering::Relaxed);
+                                        last_frame_arrival =
+                                            Some((completed_at, frame.timestamp_us));
+                                    } else if last_frame_arrival.is_none() {
+                                        last_frame_arrival =
+                                            Some((completed_at, frame.timestamp_us));
+                                    }
                                     if waiting_for_keyframe && !frame.is_keyframe {
                                         metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                                         if last_keyframe_request.elapsed()
@@ -1129,14 +1309,32 @@ fn spawn_client_network(
                                         metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                                         continue;
                                     }
-                                    completed_frames.entry(frame_id).or_insert(frame);
+                                    completed_frames.entry(frame_id).or_insert(
+                                        ReceivedVideoFrame {
+                                            frame,
+                                            received_at: completed_at,
+                                        },
+                                    );
 
                                     let expected =
                                         next_frame_id.expect("a completed frame sets order");
                                     if !completed_frames.contains_key(&expected)
-                                        && completed_frames.len() >= 3
+                                        && completed_frames.len() >= VIDEO_REORDER_WINDOW
                                     {
-                                        metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                        let newest = completed_frames
+                                            .last_key_value()
+                                            .map_or(expected, |(id, _)| *id);
+                                        let span =
+                                            newest.saturating_sub(expected).saturating_add(1);
+                                        let lost = span
+                                            .saturating_sub(completed_frames.len() as u64)
+                                            .max(1);
+                                        let unusable =
+                                            lost.saturating_add(completed_frames.len() as u64);
+                                        metrics
+                                            .dropped_frames
+                                            .fetch_add(unusable, Ordering::Relaxed);
+                                        metrics.lost_frames.fetch_add(lost, Ordering::Relaxed);
                                         completed_frames.clear();
                                         decode_queue.require_keyframe();
                                         next_frame_id = None;
@@ -1154,7 +1352,8 @@ fn spawn_client_network(
                                                 next_frame_id = Some(expected.wrapping_add(1));
                                             }
                                             DecodeQueuePush::WaitingForKeyframe
-                                            | DecodeQueuePush::Overflowed => {
+                                            | DecodeQueuePush::Overflowed
+                                            | DecodeQueuePush::Stale => {
                                                 metrics
                                                     .dropped_frames
                                                     .fetch_add(1, Ordering::Relaxed);
@@ -1178,6 +1377,7 @@ fn spawn_client_network(
                                     reassembly_started.remove(&fragmented_frame_id);
                                     warn!("Video reassembly failed: {error}");
                                     metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                    metrics.lost_frames.fetch_add(1, Ordering::Relaxed);
                                     decode_queue.require_keyframe();
                                     completed_frames.clear();
                                     next_frame_id = None;
@@ -1190,7 +1390,7 @@ fn spawn_client_network(
                                 }
                             }
                         }
-                        Packet::Hello
+                        Packet::Hello { .. }
                         | Packet::Clipboard(_)
                         | Packet::Audio(_)
                         | Packet::Video(_)
@@ -1226,6 +1426,11 @@ fn spawn_client_network(
                 let reassembly_samples = metrics.reassembly_samples.swap(0, Ordering::Relaxed);
                 let decode_us = metrics.decode_us.swap(0, Ordering::Relaxed);
                 let decode_samples = metrics.decode_samples.swap(0, Ordering::Relaxed);
+                let decode_queue_us = metrics.decode_queue_us.swap(0, Ordering::Relaxed);
+                let decode_queue_samples = metrics.decode_queue_samples.swap(0, Ordering::Relaxed);
+                let jitter_us = metrics.jitter_us.swap(0, Ordering::Relaxed);
+                let jitter_samples = metrics.jitter_samples.swap(0, Ordering::Relaxed);
+                let lost_frames = metrics.lost_frames.swap(0, Ordering::Relaxed);
                 let _ = events.send(SessionEvent::ClientStats {
                     received_fps: received_frames as f32 / seconds,
                     decoded_fps: decoded_frames as f32 / seconds,
@@ -1233,6 +1438,10 @@ fn spawn_client_network(
                     dropped_frames,
                     reassembly_ms: average_milliseconds(reassembly_us, reassembly_samples),
                     decode_ms: average_milliseconds(decode_us, decode_samples),
+                    decode_queue_ms: average_milliseconds(decode_queue_us, decode_queue_samples),
+                    jitter_ms: average_milliseconds(jitter_us, jitter_samples),
+                    rtt_ms: metrics.rtt_us.load(Ordering::Relaxed) as f32 / 1_000.0,
+                    lost_frames,
                 });
                 stats_started = Instant::now();
             }
@@ -1247,6 +1456,7 @@ fn spawn_video_decoder(
     metrics: Arc<ClientMetrics>,
     needs_keyframe: Arc<AtomicBool>,
     events: mpsc::Sender<SessionEvent>,
+    frame_notifier: FrameNotifier,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         #[cfg(target_os = "macos")]
@@ -1258,6 +1468,7 @@ fn spawn_video_decoder(
                 metrics.clone(),
                 needs_keyframe.clone(),
                 events.clone(),
+                frame_notifier.clone(),
             ) {
                 Ok(()) => return,
                 Err(error) => {
@@ -1277,6 +1488,7 @@ fn spawn_video_decoder(
             metrics,
             needs_keyframe,
             events.clone(),
+            frame_notifier,
         ) {
             let _ = events.send(SessionEvent::Error(error));
         }
@@ -1290,6 +1502,7 @@ fn run_software_video_decoder(
     metrics: Arc<ClientMetrics>,
     needs_keyframe: Arc<AtomicBool>,
     events: mpsc::Sender<SessionEvent>,
+    frame_notifier: FrameNotifier,
 ) -> Result<(), String> {
     let mut decoder =
         Decoder::new().map_err(|error| format!("Unable to initialize H.264 decoder: {error}"))?;
@@ -1298,9 +1511,21 @@ fn run_software_video_decoder(
     ));
 
     while running.load(Ordering::Relaxed) {
-        let Some(frame) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
+        let Some(received) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
             continue;
         };
+        let queue_elapsed = received.received_at.elapsed();
+        if queue_elapsed > VIDEO_STALE_AGE {
+            metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            needs_keyframe.store(true, Ordering::Release);
+            continue;
+        }
+        metrics.decode_queue_us.fetch_add(
+            queue_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        metrics.decode_queue_samples.fetch_add(1, Ordering::Relaxed);
+        let frame = received.frame;
         let decode_started = Instant::now();
         match decoder.decode(&frame.payload) {
             Ok(Some(decoded)) => {
@@ -1311,9 +1536,9 @@ fn run_software_video_decoder(
                     width,
                     height,
                     data: DisplayFrameData::Rgba(rgba),
-                    #[cfg(target_os = "macos")]
-                    decoded_at: Instant::now(),
+                    published_at: Instant::now(),
                 });
+                frame_notifier();
                 metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
                 metrics.decode_us.fetch_add(
                     decode_started
@@ -1345,5 +1570,60 @@ fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
         0.0
     } else {
         total_us as f32 / samples as f32 / 1_000.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn received(frame_id: u64, is_keyframe: bool, age: Duration) -> ReceivedVideoFrame {
+        ReceivedVideoFrame {
+            frame: VideoFrame {
+                frame_id,
+                timestamp_us: frame_id,
+                is_keyframe,
+                payload: vec![1],
+            },
+            received_at: Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn decode_queue_discards_backlog_until_a_fresh_keyframe() {
+        let queue = DecodeQueue::new();
+        assert_eq!(
+            queue.push(received(0, true, Duration::ZERO)),
+            DecodeQueuePush::Queued
+        );
+        assert_eq!(
+            queue.push(received(1, false, Duration::ZERO)),
+            DecodeQueuePush::Queued
+        );
+        assert_eq!(
+            queue.push(received(2, false, Duration::ZERO)),
+            DecodeQueuePush::Overflowed
+        );
+        assert_eq!(
+            queue.push(received(3, false, Duration::ZERO)),
+            DecodeQueuePush::WaitingForKeyframe
+        );
+        assert_eq!(
+            queue.push(received(4, true, Duration::ZERO)),
+            DecodeQueuePush::Queued
+        );
+    }
+
+    #[test]
+    fn decode_queue_rejects_stale_frames() {
+        let queue = DecodeQueue::new();
+        assert_eq!(
+            queue.push(received(
+                0,
+                true,
+                VIDEO_STALE_AGE + Duration::from_millis(1)
+            )),
+            DecodeQueuePush::Stale
+        );
     }
 }

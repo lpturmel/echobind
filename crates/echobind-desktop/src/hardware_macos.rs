@@ -1,17 +1,17 @@
 use super::{
     ensure_software_capture_available, spawn_capture, spawn_encoder, CaptureSlot, SessionEvent,
-    VideoResolution,
+    VideoResolution, VIDEO_STALE_AGE,
 };
 use echobind_core::{
     protocol::{Packet, MAX_DATAGRAM_SIZE},
-    video::fragment_video_frame,
+    video::fragment_video_frame_with_datagram_size,
 };
 use screencapturekit::prelude::*;
 use std::{
     ffi::c_void,
     net::{SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
@@ -22,7 +22,7 @@ use videotoolbox::{ffi as vt, session::Codec};
 
 const ENCODER_WAIT: Duration = Duration::from_millis(30);
 
-type SampleSlot = Arc<(Mutex<Option<CMSampleBuffer>>, Condvar)>;
+type SampleSlot = Arc<(Mutex<Option<(CMSampleBuffer, Instant)>>, Condvar)>;
 
 struct HardwareEncodedFrame {
     data: Vec<u8>,
@@ -50,6 +50,7 @@ pub(super) fn spawn_hardware_pipeline(
     frames_per_second: u32,
     bitrate_bps: u32,
     resolution: VideoResolution,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let result = run_hardware_pipeline(
@@ -61,6 +62,7 @@ pub(super) fn spawn_hardware_pipeline(
             frames_per_second,
             bitrate_bps,
             resolution,
+            active_datagram_size.clone(),
         );
         if let Err(error) = result {
             if !running.load(Ordering::Relaxed) {
@@ -79,6 +81,7 @@ pub(super) fn spawn_hardware_pipeline(
                 frames_per_second,
                 bitrate_bps,
                 resolution,
+                active_datagram_size,
             ) {
                 let _ = events.send(SessionEvent::Error(format!(
                     "Hardware H.264 failed ({error}); software fallback failed: {fallback_error}"
@@ -98,6 +101,7 @@ fn run_hardware_pipeline(
     frames_per_second: u32,
     bitrate_bps: u32,
     resolution: VideoResolution,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> Result<(), String> {
     let content = SCShareableContent::get().map_err(|error| {
         format!(
@@ -133,7 +137,7 @@ fn run_hardware_pipeline(
     stream.add_output_handler(
         move |sample: CMSampleBuffer, _| {
             let (slot, available) = &*callback_slot;
-            *slot.lock().unwrap() = Some(sample);
+            *slot.lock().unwrap() = Some((sample, Instant::now()));
             available.notify_one();
         },
         SCStreamOutputType::Screen,
@@ -156,6 +160,10 @@ fn run_hardware_pipeline(
     let mut stats_started = Instant::now();
     let mut stats_frames = 0_u64;
     let mut stats_bytes = 0_u64;
+    let mut stats_capture_us = 0_u64;
+    let mut stats_encode_us = 0_u64;
+    let mut stats_encode_queue_us = 0_u64;
+    let mut stats_send_us = 0_u64;
 
     while running.load(Ordering::Relaxed) {
         let sample = {
@@ -168,9 +176,14 @@ fn run_hardware_pipeline(
                 .unwrap();
             guard.take()
         };
-        let Some(sample) = sample else {
+        let Some((sample, captured_at)) = sample else {
             continue;
         };
+        let capture_elapsed = captured_at.elapsed();
+        if capture_elapsed > VIDEO_STALE_AGE {
+            force_keyframe.store(true, Ordering::Release);
+            continue;
+        }
         let Some(peer) = *active_peer.lock().unwrap() else {
             continue;
         };
@@ -183,6 +196,7 @@ fn run_hardware_pipeline(
         let Some(surface) = pixel_buffer.io_surface() else {
             continue;
         };
+        let encode_started = Instant::now();
         let encoded = encoder
             .encode(
                 &surface,
@@ -190,6 +204,7 @@ fn run_hardware_pipeline(
                 request_keyframe,
             )
             .map_err(|error| format!("VideoToolbox H.264 encoding failed: {error}"))?;
+        let encode_elapsed = encode_started.elapsed();
         sequence = sequence.wrapping_add(1);
         if encoded.data.is_empty() {
             continue;
@@ -203,11 +218,24 @@ fn run_hardware_pipeline(
             force_keyframe.store(false, Ordering::Relaxed);
         }
         encoded_any = true;
+        if captured_at.elapsed() > VIDEO_STALE_AGE {
+            force_keyframe.store(true, Ordering::Release);
+            continue;
+        }
 
         let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        let fragments = fragment_video_frame(frame_id, timestamp_us, is_keyframe, &annex_b)
-            .map_err(|error| format!("Hardware frame cannot be packetized: {error}"))?;
+        let encoded_at = Instant::now();
+        let fragments = fragment_video_frame_with_datagram_size(
+            frame_id,
+            timestamp_us,
+            is_keyframe,
+            &annex_b,
+            active_datagram_size.load(Ordering::Acquire),
+        )
+        .map_err(|error| format!("Hardware frame cannot be packetized: {error}"))?;
+        let encode_queue_us = encoded_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
+        let send_started = Instant::now();
         let mut frame_sent = true;
         for fragment in fragments {
             Packet::Video(fragment).encode(&mut packet);
@@ -221,6 +249,15 @@ fn run_hardware_pipeline(
         frame_id = frame_id.wrapping_add(1);
         if frame_sent {
             stats_frames = stats_frames.saturating_add(1);
+            stats_capture_us = stats_capture_us
+                .saturating_add(capture_elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
+            stats_encode_us = stats_encode_us
+                .saturating_add(encode_elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
+            stats_encode_queue_us = stats_encode_queue_us.saturating_add(encode_queue_us);
+            stats_send_us =
+                stats_send_us.saturating_add(
+                    send_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                );
         }
 
         let elapsed = stats_started.elapsed();
@@ -229,13 +266,18 @@ fn run_hardware_pipeline(
             let _ = events.send(SessionEvent::Stats {
                 fps: stats_frames as f32 / seconds,
                 megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
-                capture_ms: 0.0,
-                encode_ms: 0.0,
-                send_ms: 0.0,
+                capture_ms: super::average_milliseconds(stats_capture_us, stats_frames),
+                encode_ms: super::average_milliseconds(stats_encode_us, stats_frames),
+                send_ms: super::average_milliseconds(stats_send_us, stats_frames),
+                encode_queue_ms: super::average_milliseconds(stats_encode_queue_us, stats_frames),
             });
             stats_started = Instant::now();
             stats_frames = 0;
             stats_bytes = 0;
+            stats_capture_us = 0;
+            stats_encode_us = 0;
+            stats_encode_queue_us = 0;
+            stats_send_us = 0;
         }
     }
 
@@ -345,10 +387,7 @@ impl HardwareEncoder {
                 )
                 .map_err(|error| format!("ExpectedFrameRate: {error}"))?;
             encoder
-                .set_i32(
-                    vt::kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                    frames_per_second.saturating_mul(2) as i32,
-                )
+                .set_i32(vt::kVTCompressionPropertyKey_MaxKeyFrameInterval, i32::MAX)
                 .map_err(|error| format!("MaxKeyFrameInterval: {error}"))?;
             encoder
                 .set_cf_value(
@@ -687,6 +726,7 @@ fn start_software_fallback(
     frames_per_second: u32,
     bitrate_bps: u32,
     resolution: VideoResolution,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> Result<(), String> {
     ensure_software_capture_available()?;
     let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
@@ -707,6 +747,7 @@ fn start_software_fallback(
         frames_per_second,
         bitrate_bps,
         resolution,
+        active_datagram_size,
     );
     Ok(())
 }
@@ -759,6 +800,7 @@ mod tests {
     fn hardware_frame_decodes_to_nv12_iosurface() {
         use super::super::{
             decoder_macos, ClientMetrics, DecodeQueue, DisplayFrameData, LatestFrame,
+            ReceivedVideoFrame,
         };
         use echobind_core::video::VideoFrame;
         use std::sync::atomic::AtomicU64;
@@ -790,13 +832,17 @@ mod tests {
                 decoder_metrics,
                 decoder_needs_keyframe,
                 events,
+                Arc::new(|| {}),
             )
         });
-        let _ = queue.push(VideoFrame {
-            frame_id: 0,
-            timestamp_us: 0,
-            is_keyframe: true,
-            payload: annex_b,
+        let _ = queue.push(ReceivedVideoFrame {
+            frame: VideoFrame {
+                frame_id: 0,
+                timestamp_us: 0,
+                is_keyframe: true,
+                payload: annex_b,
+            },
+            received_at: Instant::now(),
         });
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -840,7 +886,7 @@ mod tests {
                 )
                 .expect("Metal renderer should initialize");
                 renderer
-                    .set_frame(&device, pixel_buffer.clone(), decoded.decoded_at)
+                    .set_frame(&device, pixel_buffer.clone(), decoded.published_at)
                     .expect("NV12 IOSurface should import into Metal without copying");
             }
             DisplayFrameData::Rgba(_) => panic!("expected zero-copy NV12 output"),

@@ -11,9 +11,7 @@ The repository is a Cargo workspace:
 - `echobind-desktop` is the native `wgpu` desktop application for manually
   approved H.264 screen sharing.
 
-Video capture, encoding, decoding, and presentation are not wired into the CLI
-yet. Protocol version 2 reserves packet types for fragmented video frames and
-keyframe requests.
+Video remains desktop-only; the CLI continues to provide its audio workflow.
 
 ## Desktop video MVP
 
@@ -35,16 +33,26 @@ On the viewing machine:
 2. Enter the server's IP address and UDP port.
 3. Wait for the server to accept the connection.
 
-The MVP streams the primary display at up to 720p using H.264. On macOS it uses
-ScreenCaptureKit `IOSurface` frames directly with a required VideoToolbox
-hardware encoder, avoiding CPU pixel readback and color conversion. The
-encoder enables real-time, no-frame-reordering, low-latency rate control. If
-that path is unavailable, the UI reports the OpenH264 software fallback.
+The desktop app streams the primary display at native, 720p, or 1080p
+resolution and up to 120 FPS. Windows uses Windows Graphics Capture, a
+four-buffer asynchronous D3D11/NVENC pipeline, and GPU scaling. macOS uses
+ScreenCaptureKit and VideoToolbox for hardware encode, then VideoToolbox NV12
+decode and IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264
+is retained as a reported fallback.
 
-Capture and display queues retain only the newest frame, and incomplete video
-frames expire after 120 ms rather than accumulating latency. Windows currently
-uses the OpenH264 software path. Desktop audio playback is not wired into this
-MVP yet; the existing CLI continues to provide audio streaming.
+The low-latency path has no B-frame reordering, uses a one-frame NVENC VBV,
+generates IDRs only for startup or recovery, requests UI repaints directly from
+the decoder callback, and discards video that spends more than 25 ms in a host
+or decode queue. The UI reports capture, encode, send, reassembly, decode,
+presentation, RTT, jitter, drop, and loss measurements. Opus system audio is
+streamed independently and the viewer can select the default or a named output
+device.
+
+Standard mode uses 1400-byte UDP datagrams to avoid IP fragmentation. The host
+can explicitly enable **Jumbo MTU 9000**; it uses 8192-byte UDP datagrams only
+when the desktop client advertises support. Enable it only when every LAN hop,
+including both network adapters and switches, is configured for a 9000-byte
+MTU.
 
 # Build
 
@@ -76,6 +84,7 @@ Echobind uses UDP for setup, heartbeat, media, and clipboard synchronization.
 The client sends a UDP hello to receive the session config, then sends periodic
 UDP pings; either side treats 3 seconds without a UDP response as a disconnect.
 
-Protocol v2 uses 1200-byte media datagrams. Audio frames carry sequence numbers
-and presentation timestamps. Encoded video frames are split into independently
-identified fragments and reassembled with bounded memory.
+Protocol v2 uses 1400-byte media datagrams by default and negotiates optional
+8192-byte video datagrams. Audio frames carry sequence numbers and presentation
+timestamps. Encoded video frames are split into independently identified
+fragments and reassembled with bounded memory and expiration deadlines.

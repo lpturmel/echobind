@@ -1,5 +1,6 @@
 use crate::protocol::{
-    VideoFragment, MAX_VIDEO_FRAGMENTS, MAX_VIDEO_FRAGMENT_PAYLOAD, MAX_VIDEO_FRAME_SIZE,
+    VideoFragment, MAX_DATAGRAM_SIZE, MAX_VIDEO_FRAGMENTS, MAX_VIDEO_FRAGMENT_PAYLOAD,
+    MAX_VIDEO_FRAME_SIZE, STANDARD_DATAGRAM_SIZE,
 };
 use std::{
     collections::HashMap,
@@ -19,6 +20,7 @@ pub struct VideoFrame {
 pub enum VideoFragmentationError {
     EmptyFrame,
     FrameTooLarge,
+    InvalidDatagramSize,
 }
 
 impl fmt::Display for VideoFragmentationError {
@@ -27,6 +29,9 @@ impl fmt::Display for VideoFragmentationError {
             VideoFragmentationError::EmptyFrame => write!(f, "video frame is empty"),
             VideoFragmentationError::FrameTooLarge => {
                 write!(f, "video frame exceeds the protocol limit")
+            }
+            VideoFragmentationError::InvalidDatagramSize => {
+                write!(f, "invalid negotiated video datagram size")
             }
         }
     }
@@ -40,6 +45,22 @@ pub fn fragment_video_frame(
     is_keyframe: bool,
     payload: &[u8],
 ) -> Result<Vec<VideoFragment<'_>>, VideoFragmentationError> {
+    fragment_video_frame_with_datagram_size(
+        frame_id,
+        timestamp_us,
+        is_keyframe,
+        payload,
+        STANDARD_DATAGRAM_SIZE,
+    )
+}
+
+pub fn fragment_video_frame_with_datagram_size(
+    frame_id: u64,
+    timestamp_us: u64,
+    is_keyframe: bool,
+    payload: &[u8],
+    datagram_size: usize,
+) -> Result<Vec<VideoFragment<'_>>, VideoFragmentationError> {
     if payload.is_empty() {
         return Err(VideoFragmentationError::EmptyFrame);
     }
@@ -47,13 +68,17 @@ pub fn fragment_video_frame(
         return Err(VideoFragmentationError::FrameTooLarge);
     }
 
-    let total = payload.len().div_ceil(MAX_VIDEO_FRAGMENT_PAYLOAD);
+    if !(STANDARD_DATAGRAM_SIZE..=MAX_DATAGRAM_SIZE).contains(&datagram_size) {
+        return Err(VideoFragmentationError::InvalidDatagramSize);
+    }
+    let fragment_payload = datagram_size - (MAX_DATAGRAM_SIZE - MAX_VIDEO_FRAGMENT_PAYLOAD);
+    let total = payload.len().div_ceil(fragment_payload);
     if total > MAX_VIDEO_FRAGMENTS || total > u16::MAX as usize {
         return Err(VideoFragmentationError::FrameTooLarge);
     }
 
     Ok(payload
-        .chunks(MAX_VIDEO_FRAGMENT_PAYLOAD)
+        .chunks(fragment_payload)
         .enumerate()
         .map(|(index, chunk)| VideoFragment {
             frame_id,
@@ -112,7 +137,7 @@ impl VideoReassembler {
         &mut self,
         fragment: VideoFragment<'_>,
     ) -> Result<Option<VideoFrame>, VideoReassemblyError> {
-        self.drop_expired();
+        self.expire_stale();
         self.validate_fragment(fragment)?;
 
         if !self.frames.contains_key(&fragment.frame_id)
@@ -144,6 +169,14 @@ impl VideoReassembler {
         self.frames.len()
     }
 
+    pub fn expire_stale(&mut self) -> usize {
+        let before = self.frames.len();
+        let max_age = self.max_age;
+        self.frames
+            .retain(|_, frame| frame.last_updated.elapsed() <= max_age);
+        before - self.frames.len()
+    }
+
     fn validate_fragment(&self, fragment: VideoFragment<'_>) -> Result<(), VideoReassemblyError> {
         if fragment.total == 0
             || fragment.index >= fragment.total
@@ -154,12 +187,6 @@ impl VideoReassembler {
             return Err(VideoReassemblyError::InvalidFragment);
         }
         Ok(())
-    }
-
-    fn drop_expired(&mut self) {
-        let max_age = self.max_age;
-        self.frames
-            .retain(|_, frame| frame.last_updated.elapsed() <= max_age);
     }
 
     fn drop_oldest(&mut self) {
@@ -241,10 +268,11 @@ impl PendingVideoFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{JUMBO_DATAGRAM_SIZE, STANDARD_VIDEO_FRAGMENT_PAYLOAD};
 
     #[test]
     fn fragments_and_reassembles_out_of_order() {
-        let payload = vec![7; MAX_VIDEO_FRAGMENT_PAYLOAD * 2 + 17];
+        let payload = vec![7; STANDARD_VIDEO_FRAGMENT_PAYLOAD * 2 + 17];
         let fragments = fragment_video_frame(42, 123_456, true, &payload).unwrap();
         assert_eq!(fragments.len(), 3);
 
@@ -261,7 +289,7 @@ mod tests {
 
     #[test]
     fn duplicate_fragment_is_ignored() {
-        let payload = vec![1; MAX_VIDEO_FRAGMENT_PAYLOAD + 1];
+        let payload = vec![1; STANDARD_VIDEO_FRAGMENT_PAYLOAD + 1];
         let fragments = fragment_video_frame(8, 99, false, &payload).unwrap();
         let mut reassembler = VideoReassembler::new(2, Duration::from_secs(1));
 
@@ -275,7 +303,7 @@ mod tests {
 
     #[test]
     fn pending_frames_are_bounded() {
-        let payload = vec![0; MAX_VIDEO_FRAGMENT_PAYLOAD + 1];
+        let payload = vec![0; STANDARD_VIDEO_FRAGMENT_PAYLOAD + 1];
         let first = fragment_video_frame(1, 0, false, &payload).unwrap();
         let second = fragment_video_frame(2, 1, false, &payload).unwrap();
         let mut reassembler = VideoReassembler::new(1, Duration::from_secs(1));
@@ -283,5 +311,34 @@ mod tests {
         reassembler.push(first[0]).unwrap();
         reassembler.push(second[0]).unwrap();
         assert_eq!(reassembler.pending_frames(), 1);
+    }
+
+    #[test]
+    fn jumbo_mode_reduces_fragment_count_and_round_trips() {
+        let payload = vec![3; 32_000];
+        let standard = fragment_video_frame(7, 10, true, &payload).unwrap();
+        let jumbo =
+            fragment_video_frame_with_datagram_size(7, 10, true, &payload, JUMBO_DATAGRAM_SIZE)
+                .unwrap();
+        assert!(jumbo.len() < standard.len());
+
+        let mut reassembler = VideoReassembler::new(2, Duration::from_secs(1));
+        let mut completed = None;
+        for fragment in jumbo {
+            completed = reassembler.push(fragment).unwrap().or(completed);
+        }
+        assert_eq!(completed.unwrap().payload, payload);
+    }
+
+    #[test]
+    fn rejects_unnegotiated_datagram_sizes() {
+        assert_eq!(
+            fragment_video_frame_with_datagram_size(1, 0, false, &[1], 1399),
+            Err(VideoFragmentationError::InvalidDatagramSize)
+        );
+        assert_eq!(
+            fragment_video_frame_with_datagram_size(1, 0, false, &[1], MAX_DATAGRAM_SIZE + 1,),
+            Err(VideoFragmentationError::InvalidDatagramSize)
+        );
     }
 }

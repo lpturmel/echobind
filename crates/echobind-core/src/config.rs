@@ -29,6 +29,12 @@ pub struct VideoConfig {
     pub height: u32,
     pub frame_rate: FrameRate,
     pub bitrate_bps: u32,
+    #[serde(default = "default_video_datagram_size")]
+    pub datagram_size: u16,
+}
+
+fn default_video_datagram_size() -> u16 {
+    crate::protocol::STANDARD_DATAGRAM_SIZE as u16
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +90,7 @@ mod tests {
                     denominator: 1,
                 },
                 bitrate_bps: 6_000_000,
+                datagram_size: default_video_datagram_size(),
             }),
         };
 
@@ -91,6 +98,24 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<SessionConfig>(&json).unwrap(),
             config
+        );
+    }
+
+    #[test]
+    fn legacy_video_config_defaults_to_standard_mtu() {
+        let json = br#"{
+            "video": {
+                "codec": "h264",
+                "width": 1280,
+                "height": 720,
+                "frame_rate": {"numerator": 60, "denominator": 1},
+                "bitrate_bps": 6000000
+            }
+        }"#;
+        let config: SessionConfig = serde_json::from_slice(json).unwrap();
+        assert_eq!(
+            config.video.unwrap().datagram_size,
+            crate::protocol::STANDARD_DATAGRAM_SIZE as u16
         );
     }
 }

@@ -93,7 +93,7 @@ struct ImportedNv12Frame {
     _y_texture: wgpu::Texture,
     _uv_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
-    decoded_at: Instant,
+    published_at: Instant,
     presented: AtomicBool,
 }
 
@@ -229,7 +229,7 @@ impl MacVideoRenderer {
         &mut self,
         device: &wgpu::Device,
         pixel_buffer: CVPixelBuffer,
-        decoded_at: Instant,
+        published_at: Instant,
     ) -> Result<(), String> {
         if pixel_buffer.plane_count() != 2 {
             return Err(format!(
@@ -300,7 +300,7 @@ impl MacVideoRenderer {
             _y_texture: y_texture,
             _uv_texture: uv_texture,
             bind_group,
-            decoded_at,
+            published_at,
             presented: AtomicBool::new(false),
         });
         Ok(())
@@ -420,7 +420,7 @@ impl CallbackTrait for MacVideoPaintCallback {
             renderer.presented_frames.fetch_add(1, Ordering::Relaxed);
             renderer.present_latency_us.fetch_add(
                 frame
-                    .decoded_at
+                    .published_at
                     .elapsed()
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64,

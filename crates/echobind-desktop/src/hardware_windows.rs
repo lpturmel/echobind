@@ -1,10 +1,10 @@
 use super::{
     ensure_software_capture_available, spawn_capture, spawn_encoder, CaptureSlot, SessionEvent,
-    VideoResolution,
+    VideoResolution, VIDEO_STALE_AGE,
 };
 use echobind_core::{
     protocol::{Packet, MAX_DATAGRAM_SIZE},
-    video::fragment_video_frame,
+    video::fragment_video_frame_with_datagram_size,
 };
 use libloading::Library;
 use moq_nvenc::sys::nvEncodeAPI::{
@@ -27,7 +27,7 @@ use std::{
     net::{SocketAddr, UdpSocket},
     ptr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
@@ -102,6 +102,8 @@ struct EncodedHardwareFrame {
     data: Vec<u8>,
     capture_us: u64,
     encode_us: u64,
+    encoded_at: Instant,
+    captured_at: Instant,
 }
 
 struct PendingNvencFrame {
@@ -111,6 +113,7 @@ struct PendingNvencFrame {
     timestamp_us: u64,
     capture_us: u64,
     encode_started: Instant,
+    captured_at: Instant,
 }
 
 unsafe impl Send for PendingNvencFrame {}
@@ -162,6 +165,7 @@ pub(super) fn spawn_hardware_pipeline(
     width: u32,
     height: u32,
     resolution: VideoResolution,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let result = run_hardware_pipeline(
@@ -174,6 +178,7 @@ pub(super) fn spawn_hardware_pipeline(
             bitrate_bps,
             width,
             height,
+            active_datagram_size.clone(),
         );
         if let Err(error) = result {
             if !running.load(Ordering::Relaxed) {
@@ -192,6 +197,7 @@ pub(super) fn spawn_hardware_pipeline(
                 frames_per_second,
                 bitrate_bps,
                 resolution,
+                active_datagram_size,
             ) {
                 let _ = events.send(SessionEvent::Error(format!(
                     "NVENC/D3D11 failed ({error}); software fallback failed: {fallback_error}"
@@ -212,6 +218,7 @@ fn run_hardware_pipeline(
     bitrate_bps: u32,
     width: u32,
     height: u32,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> Result<(), String> {
     // Keep the capture callback bounded. UDP packetization and the many send
     // syscalls needed for a large H.264 frame must never hold the Windows
@@ -227,6 +234,7 @@ fn run_hardware_pipeline(
         force_keyframe.clone(),
         events.clone(),
         encoded_rx,
+        active_datagram_size,
     );
     let monitor =
         Monitor::primary().map_err(|error| format!("Unable to find primary display: {error}"))?;
@@ -409,6 +417,7 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
             timestamp_us,
             capture_us,
             encode_started,
+            captured_at: capture_started,
         };
         self.frame_id = self.frame_id.wrapping_add(1);
         if self
@@ -471,6 +480,7 @@ fn spawn_hardware_sender(
     force_keyframe: Arc<AtomicBool>,
     events: mpsc::Sender<SessionEvent>,
     encoded_frames: mpsc::Receiver<EncodedHardwareFrame>,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut packet = Vec::with_capacity(MAX_DATAGRAM_SIZE);
@@ -480,6 +490,7 @@ fn spawn_hardware_sender(
         let mut stats_capture_us = 0_u64;
         let mut stats_encode_us = 0_u64;
         let mut stats_send_us = 0_u64;
+        let mut stats_encode_queue_us = 0_u64;
 
         while running.load(Ordering::Relaxed) {
             let frame = match encoded_frames.recv_timeout(Duration::from_millis(20)) {
@@ -493,19 +504,26 @@ fn spawn_hardware_sender(
                         &mut stats_capture_us,
                         &mut stats_encode_us,
                         &mut stats_send_us,
+                        &mut stats_encode_queue_us,
                     );
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            let encode_queue_elapsed = frame.encoded_at.elapsed();
+            if frame.captured_at.elapsed() > VIDEO_STALE_AGE {
+                force_keyframe.store(true, Ordering::Release);
+                continue;
+            }
             let Some(peer) = *active_peer.lock().unwrap() else {
                 continue;
             };
-            let fragments = match fragment_video_frame(
+            let fragments = match fragment_video_frame_with_datagram_size(
                 frame.frame_id,
                 frame.timestamp_us,
                 frame.is_keyframe,
                 &frame.data,
+                active_datagram_size.load(Ordering::Acquire),
             ) {
                 Ok(fragments) => fragments,
                 Err(error) => {
@@ -536,6 +554,9 @@ fn spawn_hardware_sender(
                 stats_send_us = stats_send_us.saturating_add(
                     send_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                 );
+                stats_encode_queue_us = stats_encode_queue_us.saturating_add(
+                    encode_queue_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+                );
             }
             report_sender_stats(
                 &events,
@@ -545,6 +566,7 @@ fn spawn_hardware_sender(
                 &mut stats_capture_us,
                 &mut stats_encode_us,
                 &mut stats_send_us,
+                &mut stats_encode_queue_us,
             );
         }
     })
@@ -558,6 +580,7 @@ fn report_sender_stats(
     stats_capture_us: &mut u64,
     stats_encode_us: &mut u64,
     stats_send_us: &mut u64,
+    stats_encode_queue_us: &mut u64,
 ) {
     let elapsed = stats_started.elapsed();
     if elapsed < Duration::from_secs(1) {
@@ -570,6 +593,7 @@ fn report_sender_stats(
         capture_ms: average_milliseconds(*stats_capture_us, *stats_frames),
         encode_ms: average_milliseconds(*stats_encode_us, *stats_frames),
         send_ms: average_milliseconds(*stats_send_us, *stats_frames),
+        encode_queue_ms: average_milliseconds(*stats_encode_queue_us, *stats_frames),
     });
     *stats_started = Instant::now();
     *stats_frames = 0;
@@ -577,6 +601,7 @@ fn report_sender_stats(
     *stats_capture_us = 0;
     *stats_encode_us = 0;
     *stats_send_us = 0;
+    *stats_encode_queue_us = 0;
 }
 
 fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
@@ -885,19 +910,19 @@ impl NvencEncoder {
         let mut config = preset.presetCfg;
         config.version = NV_ENC_CONFIG_VER;
         config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-        config.gopLength = frames_per_second.max(1);
+        config.gopLength = u32::MAX;
         config.frameIntervalP = 1;
         config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
         config.rcParams.averageBitRate = bitrate_bps;
         config.rcParams.maxBitRate = bitrate_bps;
         let frame_budget = bitrate_bps / frames_per_second.max(1);
-        config.rcParams.vbvBufferSize = frame_budget.saturating_mul(2).max(64_000);
+        config.rcParams.vbvBufferSize = frame_budget.max(1);
         config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
         config.rcParams.set_enableAQ(0);
         config.rcParams.set_enableLookahead(0);
         config.rcParams.set_zeroReorderDelay(1);
         let mut h264 = unsafe { config.encodeCodecConfig.h264Config };
-        h264.idrPeriod = frames_per_second.max(1);
+        h264.idrPeriod = u32::MAX;
         // One slice per picture. Row-per-slice mode creates hundreds of NAL
         // units at native ultrawide resolutions without reducing latency
         // unless sub-frame bitstream output is also enabled.
@@ -1137,6 +1162,8 @@ impl NvencEncoder {
                 .elapsed()
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64,
+            encoded_at: Instant::now(),
+            captured_at: pending.captured_at,
         })
     }
 
@@ -1209,6 +1236,7 @@ fn start_software_fallback(
     frames_per_second: u32,
     bitrate_bps: u32,
     resolution: VideoResolution,
+    active_datagram_size: Arc<AtomicUsize>,
 ) -> Result<(), String> {
     ensure_software_capture_available()?;
     let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
@@ -1229,6 +1257,7 @@ fn start_software_fallback(
         frames_per_second,
         bitrate_bps,
         resolution,
+        active_datagram_size,
     );
     Ok(())
 }

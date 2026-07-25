@@ -168,7 +168,7 @@ fn run_once(
                         Ok(Packet::Video(_)) => {
                             *last_response.lock().unwrap() = Instant::now();
                         }
-                        Ok(Packet::Hello)
+                        Ok(Packet::Hello { .. })
                         | Ok(Packet::Ping(_))
                         | Ok(Packet::VideoKeyframeRequest)
                         | Ok(Packet::ConnectionRejected(_)) => {}
@@ -282,7 +282,10 @@ fn request_config(socket: &UdpSocket) -> Result<AudioConfig> {
     let mut last_hello = None::<Instant>;
     let started = Instant::now();
 
-    Packet::Hello.encode(&mut hello);
+    Packet::Hello {
+        max_datagram_size: echobind_core::protocol::STANDARD_DATAGRAM_SIZE as u16,
+    }
+    .encode(&mut hello);
     info!("[UDP] Sending hello and waiting for audio config");
 
     loop {
@@ -305,7 +308,9 @@ fn request_config(socket: &UdpSocket) -> Result<AudioConfig> {
                 | Ok(Packet::Clipboard(_))
                 | Ok(Packet::Video(_))
                 | Ok(Packet::ConnectionRejected(_)) => {}
-                Ok(Packet::Hello) | Ok(Packet::Ping(_)) | Ok(Packet::VideoKeyframeRequest) => {}
+                Ok(Packet::Hello { .. })
+                | Ok(Packet::Ping(_))
+                | Ok(Packet::VideoKeyframeRequest) => {}
                 Err(_) => warn!("Ignoring invalid UDP packet while waiting for config"),
             },
             Err(ref err)

@@ -30,6 +30,8 @@ pub struct EchobindApp {
     frames_per_second: u32,
     bitrate_mbps: u32,
     resolution: VideoResolution,
+    jumbo_datagrams: bool,
+    transport: String,
     status: String,
     pending_peer: Option<SocketAddr>,
     session: Option<DesktopSession>,
@@ -55,8 +57,13 @@ pub struct EchobindApp {
     capture_ms: f32,
     encode_ms: f32,
     send_ms: f32,
+    encode_queue_ms: f32,
     reassembly_ms: f32,
     decode_ms: f32,
+    decode_queue_ms: f32,
+    jitter_ms: f32,
+    rtt_ms: f32,
+    lost_frames: u64,
 }
 
 impl EchobindApp {
@@ -93,6 +100,8 @@ impl EchobindApp {
             frames_per_second: 60,
             bitrate_mbps: 20,
             resolution: VideoResolution::Native,
+            jumbo_datagrams: false,
+            transport: "standard MTU".to_owned(),
             status: "Ready".to_owned(),
             pending_peer: None,
             session: None,
@@ -118,8 +127,13 @@ impl EchobindApp {
             capture_ms: 0.0,
             encode_ms: 0.0,
             send_ms: 0.0,
+            encode_queue_ms: 0.0,
             reassembly_ms: 0.0,
             decode_ms: 0.0,
+            decode_queue_ms: 0.0,
+            jitter_ms: 0.0,
+            rtt_ms: 0.0,
+            lost_frames: 0,
         }
     }
 
@@ -175,6 +189,7 @@ impl EchobindApp {
                     capture_ms,
                     encode_ms,
                     send_ms,
+                    encode_queue_ms,
                 } => {
                     self.stream_fps = fps;
                     self.received_fps = fps;
@@ -182,6 +197,7 @@ impl EchobindApp {
                     self.capture_ms = capture_ms;
                     self.encode_ms = encode_ms;
                     self.send_ms = send_ms;
+                    self.encode_queue_ms = encode_queue_ms;
                 }
                 SessionEvent::ClientStats {
                     received_fps,
@@ -190,6 +206,10 @@ impl EchobindApp {
                     dropped_frames,
                     reassembly_ms,
                     decode_ms,
+                    decode_queue_ms,
+                    jitter_ms,
+                    rtt_ms,
+                    lost_frames,
                 } => {
                     self.received_fps = received_fps;
                     self.stream_fps = decoded_fps;
@@ -197,6 +217,17 @@ impl EchobindApp {
                     self.dropped_frames = dropped_frames;
                     self.reassembly_ms = reassembly_ms;
                     self.decode_ms = decode_ms;
+                    self.decode_queue_ms = decode_queue_ms;
+                    self.jitter_ms = jitter_ms;
+                    self.rtt_ms = rtt_ms;
+                    self.lost_frames = lost_frames;
+                }
+                SessionEvent::TransportConfigured { datagram_size } => {
+                    self.transport = if datagram_size > 1400 {
+                        format!("jumbo {datagram_size}-byte UDP")
+                    } else {
+                        "standard MTU".to_owned()
+                    };
                 }
                 SessionEvent::Error(error) => {
                     self.status = format!("Error: {error}");
@@ -222,7 +253,7 @@ impl EchobindApp {
             self.present_stats_at = Instant::now();
         }
 
-        context.request_repaint_after(std::time::Duration::from_millis(8));
+        context.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     fn start_host(&mut self) {
@@ -240,6 +271,7 @@ impl EchobindApp {
             self.frames_per_second,
             self.bitrate_mbps.saturating_mul(1_000_000),
             self.resolution,
+            self.jumbo_datagrams,
         ) {
             Ok(session) => {
                 self.status = format!("Starting server on {address}…");
@@ -251,7 +283,7 @@ impl EchobindApp {
         }
     }
 
-    fn connect(&mut self) {
+    fn connect(&mut self, context: &egui::Context) {
         let address = match parse_address(&self.server_ip, self.port) {
             Ok(address) => address,
             Err(error) => {
@@ -261,7 +293,13 @@ impl EchobindApp {
         };
         self.stop();
 
-        match DesktopSession::start_client(address, self.audio_output_device.clone()) {
+        let repaint_context = context.clone();
+        let frame_notifier = Arc::new(move || repaint_context.request_repaint());
+        match DesktopSession::start_client(
+            address,
+            self.audio_output_device.clone(),
+            frame_notifier,
+        ) {
             Ok(session) => {
                 self.status = format!("Requesting connection to {address}…");
                 self.session = Some(session);
@@ -293,6 +331,12 @@ impl EchobindApp {
         self.send_ms = 0.0;
         self.reassembly_ms = 0.0;
         self.decode_ms = 0.0;
+        self.encode_queue_ms = 0.0;
+        self.decode_queue_ms = 0.0;
+        self.jitter_ms = 0.0;
+        self.rtt_ms = 0.0;
+        self.lost_frames = 0;
+        self.transport = "standard MTU".to_owned();
         self.status = "Ready".to_owned();
     }
 
@@ -314,7 +358,7 @@ impl EchobindApp {
                             video.set_frame(
                                 &self.render_state.device,
                                 pixel_buffer,
-                                frame.decoded_at,
+                                frame.published_at,
                             )
                         })
                 };
@@ -472,6 +516,10 @@ impl EchobindApp {
                 ui.add(egui::DragValue::new(&mut self.frames_per_second).range(15..=120));
                 ui.label("Mbps");
                 ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=100));
+                ui.checkbox(&mut self.jumbo_datagrams, "Jumbo MTU 9000")
+                    .on_hover_text(
+                        "Only enable when every LAN hop supports a 9000-byte MTU; negotiation falls back to standard MTU for older clients.",
+                    );
             }
 
             let active = self.session.is_some();
@@ -484,7 +532,7 @@ impl EchobindApp {
                 if ui.button(label).clicked() {
                     match self.mode {
                         Mode::Host => self.start_host(),
-                        Mode::Connect => self.connect(),
+                        Mode::Connect => self.connect(ui.ctx()),
                     }
                 }
             } else if ui.button("Stop").clicked() {
@@ -567,27 +615,33 @@ impl EchobindApp {
             };
             if self.mode == Mode::Host {
                 ui.label(format!(
-                    "{:.1} FPS sent · {:.2} Mbps · {resolution} H.264 · {} · {}",
-                    self.stream_fps, self.stream_mbps, self.video_backend, self.audio_backend,
+                    "{:.1} FPS sent · {:.2} Mbps · {resolution} H.264 · {} · {} · {}",
+                    self.stream_fps,
+                    self.stream_mbps,
+                    self.video_backend,
+                    self.audio_backend,
+                    self.transport,
                 ));
                 ui.label(format!(
-                    "pipeline avg: capture {:.2} ms · encode {:.2} ms · send {:.2} ms",
-                    self.capture_ms, self.encode_ms, self.send_ms,
+                    "pipeline avg: capture {:.2} ms · encode {:.2} ms · encode→send {:.2} ms · send {:.2} ms",
+                    self.capture_ms, self.encode_ms, self.encode_queue_ms, self.send_ms,
                 ));
             } else {
                 ui.label(format!(
-                    "{:.1} decoded · {:.1} received · {:.1} presented · {} dropped · {:.2} Mbps · {resolution} H.264 · {} · {}",
+                    "{:.1} decoded · {:.1} received · {:.1} presented · {} dropped / {} lost · {:.2} Mbps · {resolution} H.264 · {} · {} · {}",
                     self.stream_fps,
                     self.received_fps,
                     self.present_fps,
                     self.dropped_frames,
+                    self.lost_frames,
                     self.stream_mbps,
                     self.video_backend,
                     self.audio_backend,
+                    self.transport,
                 ));
                 ui.label(format!(
-                    "pipeline avg: reassemble {:.2} ms · decode {:.2} ms · decode→present {:.2} ms",
-                    self.reassembly_ms, self.decode_ms, self.present_latency_ms,
+                    "pipeline avg: reassemble {:.2} ms · decode queue {:.2} ms · decode {:.2} ms · repaint→present {:.2} ms · jitter {:.2} ms · RTT {:.2} ms",
+                    self.reassembly_ms, self.decode_queue_ms, self.decode_ms, self.present_latency_ms, self.jitter_ms, self.rtt_ms,
                 ));
             }
         }

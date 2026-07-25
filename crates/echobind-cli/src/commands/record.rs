@@ -247,7 +247,7 @@ fn wait_for_client(socket: &UdpSocket, config_packet: &[u8]) -> Result<SocketAdd
             Err(err) => return Err(err.into()),
         };
         match Packet::try_from(&pkt[..sz]) {
-            Ok(Packet::Hello) => {
+            Ok(Packet::Hello { .. }) => {
                 socket.send_to(config_packet, addr)?;
                 return Ok(addr);
             }
@@ -284,7 +284,7 @@ fn monitor_client(
 
         match socket.recv_from(&mut pkt) {
             Ok((sz, addr)) if addr == client_addr => match Packet::try_from(&pkt[..sz]) {
-                Ok(Packet::Hello) => {
+                Ok(Packet::Hello { .. }) => {
                     last_seen = Instant::now();
                     if let Err(err) = socket.send_to(config_packet, client_addr) {
                         warn!("Failed to resend config to {client_addr}: {err}");

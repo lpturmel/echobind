@@ -1,5 +1,6 @@
 use super::{
-    ClientMetrics, DecodeQueue, DisplayFrame, DisplayFrameData, LatestFrame, SessionEvent,
+    ClientMetrics, DecodeQueue, DisplayFrame, DisplayFrameData, FrameNotifier, LatestFrame,
+    SessionEvent, VIDEO_STALE_AGE,
 };
 use apple_cf::{
     cf::{CFDictionary, CFNumber, CFType},
@@ -30,6 +31,7 @@ pub(super) fn run_decoder(
     metrics: Arc<ClientMetrics>,
     needs_keyframe: Arc<AtomicBool>,
     events: mpsc::Sender<SessionEvent>,
+    frame_notifier: FrameNotifier,
 ) -> Result<(), String> {
     if !DecompressionSession::is_hardware_decode_supported(Codec::H264) {
         return Err("Apple hardware H.264 decoding is not supported".to_owned());
@@ -44,9 +46,21 @@ pub(super) fn run_decoder(
     let decode_started = Arc::new(Mutex::new(BTreeMap::<i64, Instant>::new()));
 
     while running.load(Ordering::Relaxed) {
-        let Some(frame) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
+        let Some(received) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
             continue;
         };
+        let queue_elapsed = received.received_at.elapsed();
+        if queue_elapsed > VIDEO_STALE_AGE {
+            metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            needs_keyframe.store(true, Ordering::Release);
+            continue;
+        }
+        metrics.decode_queue_us.fetch_add(
+            queue_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        metrics.decode_queue_samples.fetch_add(1, Ordering::Relaxed);
+        let frame = received.frame;
         let nals = match annex_b_nals(&frame.payload) {
             Ok(nals) => nals,
             Err(error) => {
@@ -76,6 +90,7 @@ pub(super) fn run_decoder(
                     metrics.clone(),
                     needs_keyframe.clone(),
                     decode_started.clone(),
+                    frame_notifier.clone(),
                 ) {
                     Ok(session) => session,
                     Err(error) => {
@@ -149,6 +164,7 @@ fn create_decoder(
     metrics: Arc<ClientMetrics>,
     needs_keyframe: Arc<AtomicBool>,
     decode_started: Arc<Mutex<BTreeMap<i64, Instant>>>,
+    frame_notifier: FrameNotifier,
 ) -> Result<DecompressionSession, String> {
     let pixel_format_key = unsafe {
         CFType::from_raw_retained(raw::kCVPixelBufferPixelFormatTypeKey.cast_mut().cast())
@@ -222,8 +238,9 @@ fn create_decoder(
                 width,
                 height,
                 data: DisplayFrameData::Nv12(pixel_buffer),
-                decoded_at: std::time::Instant::now(),
+                published_at: std::time::Instant::now(),
             });
+            frame_notifier();
             metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
             if let Some(elapsed) = decode_elapsed {
                 metrics.decode_us.fetch_add(

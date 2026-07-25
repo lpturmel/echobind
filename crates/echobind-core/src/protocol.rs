@@ -7,19 +7,24 @@ const VIDEO_HEADER_LEN: usize = 21;
 const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 
-// Keep the complete IPv6 packet below the Ethernet 1500-byte MTU while using
-// most of each LAN datagram (40-byte IPv6 + 8-byte UDP + 1400-byte payload).
-// Avoiding IP fragmentation is essential for stable high-frame-rate video.
-pub const MAX_DATAGRAM_SIZE: usize = 1400;
+// The standard mode keeps the complete IPv6 packet below an Ethernet 1500-byte
+// MTU. Jumbo mode is only used after the client advertises support and the host
+// explicitly enables it; 8 KiB leaves headroom inside a 9000-byte jumbo frame.
+pub const STANDARD_DATAGRAM_SIZE: usize = 1400;
+pub const JUMBO_DATAGRAM_SIZE: usize = 8192;
+pub const MAX_DATAGRAM_SIZE: usize = JUMBO_DATAGRAM_SIZE;
 pub const MAX_CLIPBOARD_CHUNK_PAYLOAD: usize = 1024;
-pub const MAX_AUDIO_FRAME_PAYLOAD: usize = MAX_DATAGRAM_SIZE - HEADER_LEN - AUDIO_HEADER_LEN;
+pub const MAX_AUDIO_FRAME_PAYLOAD: usize = STANDARD_DATAGRAM_SIZE - HEADER_LEN - AUDIO_HEADER_LEN;
+pub const STANDARD_VIDEO_FRAGMENT_PAYLOAD: usize =
+    STANDARD_DATAGRAM_SIZE - HEADER_LEN - VIDEO_HEADER_LEN;
 pub const MAX_VIDEO_FRAGMENT_PAYLOAD: usize = MAX_DATAGRAM_SIZE - HEADER_LEN - VIDEO_HEADER_LEN;
 pub const MAX_VIDEO_FRAME_SIZE: usize = 8 * 1024 * 1024;
-pub const MAX_VIDEO_FRAGMENTS: usize = MAX_VIDEO_FRAME_SIZE.div_ceil(MAX_VIDEO_FRAGMENT_PAYLOAD);
+pub const MAX_VIDEO_FRAGMENTS: usize =
+    MAX_VIDEO_FRAME_SIZE.div_ceil(STANDARD_VIDEO_FRAGMENT_PAYLOAD);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Packet<'a> {
-    Hello,
+    Hello { max_datagram_size: u16 },
     Config(&'a [u8]),
     Ping(u64),
     Pong(u64),
@@ -68,7 +73,13 @@ impl Packet<'_> {
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Packet::Hello => Self::encode_packet(Self::HELLO, &[], out),
+            Packet::Hello { max_datagram_size } => {
+                if usize::from(*max_datagram_size) <= STANDARD_DATAGRAM_SIZE {
+                    Self::encode_packet(Self::HELLO, &[], out);
+                } else {
+                    Self::encode_packet(Self::HELLO, &max_datagram_size.to_be_bytes(), out);
+                }
+            }
             Packet::Config(payload) => Self::encode_packet(Self::CONFIG, payload, out),
             Packet::Ping(id) => Self::encode_packet(Self::PING, &id.to_be_bytes(), out),
             Packet::Pong(id) => Self::encode_packet(Self::PONG, &id.to_be_bytes(), out),
@@ -147,7 +158,15 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
 
         let payload = &data[HEADER_LEN..];
         match data[MAGIC.len()] {
-            Packet::HELLO if payload.is_empty() => Ok(Packet::Hello),
+            Packet::HELLO if payload.is_empty() => Ok(Packet::Hello {
+                // Legacy peers did not advertise transport capabilities.
+                max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+            }),
+            Packet::HELLO if payload.len() == 2 => Ok(Packet::Hello {
+                max_datagram_size: u16::from_be_bytes(
+                    payload.try_into().map_err(|_| PacketParseError::Invalid)?,
+                ),
+            }),
             Packet::CONFIG => Ok(Packet::Config(payload)),
             Packet::PING => parse_u64(payload).map(Packet::Ping),
             Packet::PONG => parse_u64(payload).map(Packet::Pong),
@@ -282,6 +301,29 @@ mod tests {
     fn encodes_and_parses_ping() {
         let encoded = round_trip(Packet::Ping(42));
         assert_eq!(Packet::try_from(encoded.as_slice()), Ok(Packet::Ping(42)));
+    }
+
+    #[test]
+    fn hello_advertises_datagram_capability_and_accepts_legacy() {
+        let hello = Packet::Hello {
+            max_datagram_size: JUMBO_DATAGRAM_SIZE as u16,
+        };
+        let encoded = round_trip(hello);
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Ok(Packet::Hello {
+                max_datagram_size: JUMBO_DATAGRAM_SIZE as u16
+            })
+        );
+
+        let mut legacy = MAGIC.to_vec();
+        legacy.push(Packet::HELLO);
+        assert_eq!(
+            Packet::try_from(legacy.as_slice()),
+            Ok(Packet::Hello {
+                max_datagram_size: STANDARD_DATAGRAM_SIZE as u16
+            })
+        );
     }
 
     #[test]
