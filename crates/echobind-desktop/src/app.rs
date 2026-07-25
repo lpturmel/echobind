@@ -4,8 +4,9 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        mpsc, Arc,
     },
+    thread,
     time::Instant,
 };
 
@@ -22,6 +23,11 @@ struct GpuVideoTexture {
     height: usize,
 }
 
+struct SessionShutdown {
+    complete: mpsc::Receiver<()>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
 pub struct EchobindApp {
     mode: Mode,
     host_ip: String,
@@ -35,6 +41,7 @@ pub struct EchobindApp {
     status: String,
     pending_peer: Option<SocketAddr>,
     session: Option<DesktopSession>,
+    shutdown: Option<SessionShutdown>,
     texture: Option<GpuVideoTexture>,
     nv12_ready: bool,
     render_state: eframe::egui_wgpu::RenderState,
@@ -107,6 +114,7 @@ impl EchobindApp {
             status: "Ready".to_owned(),
             pending_peer: None,
             session: None,
+            shutdown: None,
             texture: None,
             nv12_ready: false,
             render_state,
@@ -140,7 +148,24 @@ impl EchobindApp {
     }
 
     fn process_session_updates(&mut self, context: &egui::Context) {
+        let stopped = self.shutdown.as_ref().is_some_and(|shutdown| {
+            matches!(
+                shutdown.complete.try_recv(),
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+            )
+        });
+        if stopped {
+            if let Some(mut shutdown) = self.shutdown.take() {
+                if let Some(handle) = shutdown.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+            self.status = "Ready".to_owned();
+        }
         let Some(session) = &self.session else {
+            if self.shutdown.is_some() {
+                context.request_repaint_after(std::time::Duration::from_millis(20));
+            }
             return;
         };
 
@@ -259,6 +284,10 @@ impl EchobindApp {
     }
 
     fn start_host(&mut self) {
+        if self.shutdown.is_some() {
+            self.status = "Waiting for the previous session to finish stopping…".to_owned();
+            return;
+        }
         let address = match parse_address(&self.host_ip, self.port) {
             Ok(address) => address,
             Err(error) => {
@@ -286,6 +315,10 @@ impl EchobindApp {
     }
 
     fn connect(&mut self, context: &egui::Context) {
+        if self.shutdown.is_some() {
+            self.status = "Waiting for the previous session to finish stopping…".to_owned();
+            return;
+        }
         let address = match parse_address(&self.server_ip, self.port) {
             Ok(address) => address,
             Err(error) => {
@@ -314,7 +347,18 @@ impl EchobindApp {
 
     fn stop(&mut self) {
         if let Some(mut session) = self.session.take() {
-            session.stop();
+            let (complete_tx, complete_rx) = mpsc::channel();
+            let handle = thread::Builder::new()
+                .name("echobind-session-shutdown".to_owned())
+                .spawn(move || {
+                    session.stop();
+                    let _ = complete_tx.send(());
+                })
+                .expect("unable to start the session shutdown worker");
+            self.shutdown = Some(SessionShutdown {
+                complete: complete_rx,
+                handle: Some(handle),
+            });
         }
         self.pending_peer = None;
         self.clear_texture();
@@ -339,7 +383,11 @@ impl EchobindApp {
         self.rtt_ms = 0.0;
         self.lost_frames = 0;
         self.transport = "standard MTU".to_owned();
-        self.status = "Ready".to_owned();
+        self.status = if self.shutdown.is_some() {
+            "Stopping session and releasing media devices and socket…".to_owned()
+        } else {
+            "Ready".to_owned()
+        };
     }
 
     fn upload_frame(&mut self, frame: crate::session::DisplayFrame) {
@@ -525,13 +573,14 @@ impl EchobindApp {
             }
 
             let active = self.session.is_some();
+            let stopping = self.shutdown.is_some();
             if !active {
                 let label = if self.mode == Mode::Host {
                     "Start server"
                 } else {
                     "Connect"
                 };
-                if ui.button(label).clicked() {
+                if ui.add_enabled(!stopping, egui::Button::new(label)).clicked() {
                     match self.mode {
                         Mode::Host => self.start_host(),
                         Mode::Connect => self.connect(ui.ctx()),
@@ -712,6 +761,19 @@ impl eframe::App for EchobindApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.show_video(ui);
         });
+    }
+}
+
+impl Drop for EchobindApp {
+    fn drop(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            session.stop();
+        }
+        if let Some(mut shutdown) = self.shutdown.take() {
+            if let Some(handle) = shutdown.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 

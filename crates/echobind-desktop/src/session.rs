@@ -562,25 +562,11 @@ impl DesktopSession {
         }
         self.host_commands.take();
         self.audio_commands.take();
-        let mut handles = self.handles.drain(..);
-        // The network worker owns the UDP socket and has a 20 ms read timeout.
-        // Join it first so an immediate restart can safely bind the same port.
-        if let Some(network_handle) = handles.next() {
-            let _ = network_handle.join();
-        }
-        let handles: Vec<_> = handles.collect();
-        if !handles.is_empty() {
-            // GPU encoders and platform audio APIs can take several seconds to
-            // retire outstanding buffers. Reap them away from egui's render
-            // thread so Stop remains responsive and platform teardown cannot
-            // block inside a UI callback.
-            let _ = thread::Builder::new()
-                .name("echobind-session-shutdown".to_owned())
-                .spawn(move || {
-                    for handle in handles {
-                        let _ = handle.join();
-                    }
-                });
+        // Stop is complete only after every worker has dropped its socket and
+        // platform media resources. The app invokes this method from a
+        // dedicated shutdown thread so these joins never block egui.
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
         }
     }
 }
@@ -755,6 +741,38 @@ fn spawn_host_network(
                             };
                             Packet::Config(config_json).encode(&mut response);
                             let _ = socket.send_to(&response, peer);
+                        }
+                        Packet::Hello { max_datagram_size }
+                            if current_peer.is_some_and(|current| {
+                                current != peer && current.ip() == peer.ip()
+                            }) =>
+                        {
+                            // A manually restarted client keeps the same host
+                            // address but receives a new ephemeral UDP port.
+                            // Treat that Hello as an endpoint migration instead
+                            // of rejecting the user's own Mac as a second peer.
+                            let client_max = usize::from(max_datagram_size)
+                                .clamp(STANDARD_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
+                            let datagram_size =
+                                if jumbo_requested && client_max >= JUMBO_DATAGRAM_SIZE {
+                                    JUMBO_DATAGRAM_SIZE
+                                } else {
+                                    STANDARD_DATAGRAM_SIZE
+                                };
+                            active_datagram_size.store(datagram_size, Ordering::Release);
+                            *active_peer.lock().unwrap() = Some(peer);
+                            last_seen = Some(Instant::now());
+                            reconnect_peer = None;
+                            force_keyframe.store(true, Ordering::Release);
+                            let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
+                                &jumbo_config_json
+                            } else {
+                                &standard_config_json
+                            };
+                            Packet::Config(config_json).encode(&mut response);
+                            if socket.send_to(&response, peer).is_ok() {
+                                let _ = events.send(SessionEvent::Connected(peer));
+                            }
                         }
                         Packet::Hello { .. }
                             if current_peer.is_none()

@@ -79,6 +79,7 @@ const NVENC_BUFFER_COUNT: usize = 4;
 const ENCODE_COMPLETION_TIMEOUT_MS: u32 = 1_000;
 
 struct CaptureFlags {
+    running: Arc<AtomicBool>,
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     force_keyframe: Arc<AtomicBool>,
     encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
@@ -332,6 +333,7 @@ fn run_dxgi_capture_session(
         &device,
         device_context,
         CaptureFlags {
+            running: running.clone(),
             active_peer,
             force_keyframe,
             encoded_frames,
@@ -505,6 +507,7 @@ fn run_wgc_pipeline(
         DrawBorderSettings::WithoutBorder,
         ColorFormat::Bgra8,
         CaptureFlags {
+            running: running.clone(),
             active_peer,
             force_keyframe,
             encoded_frames: encoded_tx,
@@ -590,6 +593,7 @@ impl HardwareCapture {
             free_slots_tx.clone(),
             flags.encoded_frames.clone(),
             flags.force_keyframe.clone(),
+            flags.running.clone(),
         );
         let _ = flags
             .events
@@ -738,22 +742,34 @@ fn spawn_nvenc_completion(
     free_slots: mpsc::SyncSender<usize>,
     encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
     force_keyframe: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(pending) = pending_frames.recv() {
             let result = encoder.complete(&pending);
-            let _ = free_slots.try_send(pending.slot);
             match result {
-                Ok(frame) => {
-                    if encoded_frames.try_send(frame).is_err() {
-                        force_keyframe.store(true, Ordering::Release);
+                Ok(mut frame) => loop {
+                    match encoded_frames.try_send(frame) {
+                        Ok(()) => break,
+                        Err(mpsc::TrySendError::Full(returned)) => {
+                            if !running.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            frame = returned;
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
                     }
-                }
+                },
                 Err(error) => {
                     warn!("Asynchronous NVENC completion failed: {error}");
                     force_keyframe.store(true, Ordering::Release);
                 }
             }
+            // Return the texture only after its encoded output is accepted by
+            // the sender. This propagates short socket bursts back to capture
+            // instead of dropping a reference frame and starting an IDR storm.
+            let _ = free_slots.try_send(pending.slot);
         }
     })
 }
@@ -1564,14 +1580,14 @@ fn start_software_fallback(
 ) -> Result<(), String> {
     ensure_software_capture_available()?;
     let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
-    let _capture_handle = spawn_capture(
+    let capture_handle = spawn_capture(
         running.clone(),
         capture_slot.clone(),
         events.clone(),
         frames_per_second,
         resolution,
     );
-    let _encoder_handle = spawn_encoder(
+    let encoder_handle = spawn_encoder(
         socket,
         running,
         active_peer,
@@ -1583,5 +1599,7 @@ fn start_software_fallback(
         resolution,
         active_datagram_size,
     );
+    let _ = capture_handle.join();
+    let _ = encoder_handle.join();
     Ok(())
 }

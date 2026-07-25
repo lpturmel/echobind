@@ -730,14 +730,14 @@ fn start_software_fallback(
 ) -> Result<(), String> {
     ensure_software_capture_available()?;
     let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
-    let _capture_handle = spawn_capture(
+    let capture_handle = spawn_capture(
         running.clone(),
         capture_slot.clone(),
         events.clone(),
         frames_per_second,
         resolution,
     );
-    let _encoder_handle = spawn_encoder(
+    let encoder_handle = spawn_encoder(
         socket,
         running,
         active_peer,
@@ -749,6 +749,8 @@ fn start_software_fallback(
         resolution,
         active_datagram_size,
     );
+    let _ = capture_handle.join();
+    let _ = encoder_handle.join();
     Ok(())
 }
 

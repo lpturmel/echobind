@@ -50,7 +50,7 @@ struct PlaybackBuffer {
 pub(super) struct AudioPlayback {
     sender: SyncSender<EncodedAudioFrame>,
     running: Arc<AtomicBool>,
-    _handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl AudioCaptureSettings {
@@ -369,7 +369,7 @@ pub(super) fn spawn_audio_playback(
     AudioPlayback {
         sender,
         running,
-        _handle: handle,
+        handle: Some(handle),
     }
 }
 
@@ -388,6 +388,9 @@ impl AudioPlayback {
 impl Drop for AudioPlayback {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
