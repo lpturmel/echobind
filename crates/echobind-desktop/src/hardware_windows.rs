@@ -38,15 +38,16 @@ use tracing::warn;
 use windows::{
     core::Interface,
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HMODULE, RECT, TRUE, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, RECT, TRUE, WAIT_OBJECT_0},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
             Direct3D11::{
-                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
                 ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
                 ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
-                D3D11_BIND_RENDER_TARGET, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
+                D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
                 D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
                 D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
@@ -77,6 +78,9 @@ type NvencGetMaxVersion = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 
 const NVENC_BUFFER_COUNT: usize = 4;
 const ENCODE_COMPLETION_TIMEOUT_MS: u32 = 1_000;
+const GPU_COPY_COMPLETION_TIMEOUT: Duration = Duration::from_millis(50);
+const DXGI_CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+const DXGI_ACCESS_LOST_RETRIES: u32 = 2;
 
 struct CaptureFlags {
     running: Arc<AtomicBool>,
@@ -92,12 +96,14 @@ struct CaptureFlags {
 
 struct HardwareCapture {
     device_context: ID3D11DeviceContext,
+    copy_completion_query: ID3D11Query,
     encoder: Arc<NvencEncoder>,
     scalers: Vec<Option<D3dScaler>>,
     free_slots_tx: mpsc::SyncSender<usize>,
     free_slots: mpsc::Receiver<usize>,
     completion_tx: Option<mpsc::SyncSender<PendingNvencFrame>>,
     completion_handle: Option<JoinHandle<()>>,
+    completion_failure: Arc<Mutex<Option<String>>>,
     flags: CaptureFlags,
     started: Instant,
     frame_interval: Duration,
@@ -268,7 +274,7 @@ fn run_dxgi_pipeline(
         encoded_rx,
         active_datagram_size,
     );
-    let mut initialized_once = false;
+    let mut access_lost_retries = 0_u32;
     let result = loop {
         if !running.load(Ordering::Relaxed) {
             break Ok(());
@@ -287,18 +293,18 @@ fn run_dxgi_pipeline(
         match session {
             Ok(()) => break Ok(()),
             Err(DxgiCaptureFailure::AccessLost(error)) => {
-                initialized_once = true;
+                access_lost_retries = access_lost_retries.saturating_add(1);
                 force_keyframe.store(true, Ordering::Release);
                 let _ = events.send(SessionEvent::VideoBackend(
                     "DXGI display mode changed · rebuilding capture and forcing IDR".to_owned(),
                 ));
                 warn!("DXGI capture session was invalidated: {error}");
+                if access_lost_retries >= DXGI_ACCESS_LOST_RETRIES {
+                    break Err(format!(
+                        "DXGI repeatedly lost the display while changing modes: {error}"
+                    ));
+                }
                 thread::sleep(Duration::from_millis(25));
-            }
-            Err(DxgiCaptureFailure::Fatal(error)) if initialized_once => {
-                force_keyframe.store(true, Ordering::Release);
-                warn!("DXGI capture recreation failed: {error}");
-                thread::sleep(Duration::from_millis(100));
             }
             Err(DxgiCaptureFailure::Fatal(error)) => break Err(error),
         }
@@ -329,6 +335,7 @@ fn run_dxgi_capture_session(
             DxgiCaptureFailure::Fatal(format!("Unable to duplicate primary display: {error}"))
         }
     })?;
+    let peer_state = active_peer.clone();
     let mut capture = HardwareCapture::new_with_device(
         &device,
         device_context,
@@ -347,10 +354,34 @@ fn run_dxgi_capture_session(
     )
     .map_err(DxgiCaptureFailure::Fatal)?;
     let _ = events.send(SessionEvent::CaptureReady);
+    let mut peer_became_active = None::<Instant>;
+    let mut captured_for_peer = false;
 
     while running.load(Ordering::Relaxed) {
         match acquire_dxgi_frame(&duplication, &mut capture) {
-            Ok(()) => {}
+            Ok(acquired) => {
+                let peer_is_active = peer_state.lock().unwrap().is_some();
+                if !peer_is_active {
+                    peer_became_active = None;
+                    captured_for_peer = false;
+                    continue;
+                }
+                let active_since = *peer_became_active.get_or_insert_with(Instant::now);
+                if acquired {
+                    captured_for_peer = true;
+                }
+                // A static desktop legitimately produces no new duplication
+                // frames after its initial image. Only fail over if a newly
+                // connected or newly rebuilt session cannot produce even that
+                // first frame.
+                if !captured_for_peer && active_since.elapsed() >= DXGI_CAPTURE_STALL_TIMEOUT {
+                    drop(capture);
+                    return Err(DxgiCaptureFailure::Fatal(format!(
+                        "DXGI produced no desktop frames for {} ms while a viewer was connected",
+                        DXGI_CAPTURE_STALL_TIMEOUT.as_millis()
+                    )));
+                }
+            }
             Err(DxgiCaptureFailure::AccessLost(error)) => {
                 drop(capture);
                 return Err(DxgiCaptureFailure::AccessLost(error));
@@ -428,12 +459,17 @@ fn create_dxgi_device_for_primary_display(
 fn acquire_dxgi_frame(
     duplication: &IDXGIOutputDuplication,
     capture: &mut HardwareCapture,
-) -> Result<(), DxgiCaptureFailure> {
+) -> Result<bool, DxgiCaptureFailure> {
+    if let Some(error) = capture.take_completion_failure() {
+        return Err(DxgiCaptureFailure::Fatal(format!(
+            "NVENC completion pipeline stopped: {error}"
+        )));
+    }
     let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
     let mut resource: Option<IDXGIResource> = None;
     match unsafe { duplication.AcquireNextFrame(8, &mut info, &mut resource) } {
         Ok(()) => {}
-        Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
+        Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
         Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
             return Err(DxgiCaptureFailure::AccessLost(format!(
                 "Desktop Duplication access was lost: {error}"
@@ -467,7 +503,8 @@ fn acquire_dxgi_frame(
     let release_result = unsafe { duplication.ReleaseFrame() }
         .map_err(|error| format!("Unable to release DXGI desktop frame: {error}"));
     processing_result.map_err(DxgiCaptureFailure::Fatal)?;
-    release_result.map_err(DxgiCaptureFailure::Fatal)
+    release_result.map_err(DxgiCaptureFailure::Fatal)?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -580,6 +617,7 @@ impl HardwareCapture {
             flags.frames_per_second,
             flags.bitrate_bps,
         )?);
+        let copy_completion_query = create_gpu_completion_query(device)?;
         let (free_slots_tx, free_slots) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
         for slot in 0..NVENC_BUFFER_COUNT {
             free_slots_tx
@@ -587,6 +625,7 @@ impl HardwareCapture {
                 .map_err(|_| "Unable to initialize the NVENC buffer ring".to_owned())?;
         }
         let (completion_tx, completion_rx) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
+        let completion_failure = Arc::new(Mutex::new(None));
         let completion_handle = spawn_nvenc_completion(
             encoder.clone(),
             completion_rx,
@@ -594,6 +633,7 @@ impl HardwareCapture {
             flags.encoded_frames.clone(),
             flags.force_keyframe.clone(),
             flags.running.clone(),
+            completion_failure.clone(),
         );
         let _ = flags
             .events
@@ -603,6 +643,7 @@ impl HardwareCapture {
 
         Ok(Self {
             device_context,
+            copy_completion_query,
             encoder,
             scalers: std::iter::repeat_with(|| None)
                 .take(NVENC_BUFFER_COUNT)
@@ -611,6 +652,7 @@ impl HardwareCapture {
             free_slots,
             completion_tx: Some(completion_tx),
             completion_handle: Some(completion_handle),
+            completion_failure,
             flags,
             started: Instant::now(),
             frame_interval,
@@ -625,6 +667,9 @@ impl HardwareCapture {
         source_width: u32,
         source_height: u32,
     ) -> Result<(), String> {
+        if let Some(error) = self.take_completion_failure() {
+            return Err(format!("NVENC completion pipeline stopped: {error}"));
+        }
         if self.flags.active_peer.lock().unwrap().is_none() {
             self.next_frame_at = Instant::now();
             return Ok(());
@@ -684,11 +729,12 @@ impl HardwareCapture {
             let _ = self.free_slots_tx.try_send(slot);
             return Err(error);
         }
-        // Submit the copy/scale before NVENC maps the DirectX resource. This is
-        // asynchronous; NVENC performs the required GPU-side synchronization.
-        unsafe {
-            self.device_context.Flush();
-        }
+        // DXGI invalidates its desktop surface as soon as ReleaseFrame is
+        // called. CopyResource and VideoProcessorBlt are asynchronous, so a
+        // Flush alone does not make it legal for the caller to release that
+        // source texture. Wait only for this short GPU copy/scale operation;
+        // NVENC itself remains four-buffer asynchronous.
+        self.wait_for_gpu_copy()?;
 
         let force_idr = self.flags.force_keyframe.swap(false, Ordering::Relaxed);
         let timestamp_us = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -722,9 +768,61 @@ impl HardwareCapture {
             self.flags.force_keyframe.store(true, Ordering::Release);
             let _ = self.encoder.unmap(mapped_resource);
             let _ = self.free_slots_tx.try_send(slot);
+            return Err("NVENC completion worker disconnected".to_owned());
         }
         Ok(())
     }
+
+    fn take_completion_failure(&self) -> Option<String> {
+        self.completion_failure.lock().unwrap().take()
+    }
+
+    fn wait_for_gpu_copy(&self) -> Result<(), String> {
+        unsafe {
+            self.device_context.End(&self.copy_completion_query);
+            self.device_context.Flush();
+        }
+        let started = Instant::now();
+        let mut spins = 0_u32;
+        loop {
+            let mut complete = BOOL::default();
+            unsafe {
+                self.device_context.GetData(
+                    &self.copy_completion_query,
+                    Some((&mut complete as *mut BOOL).cast()),
+                    std::mem::size_of::<BOOL>() as u32,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                )
+            }
+            .map_err(|error| format!("Unable to query D3D11 copy completion: {error}"))?;
+            if complete.as_bool() {
+                return Ok(());
+            }
+            if started.elapsed() >= GPU_COPY_COMPLETION_TIMEOUT {
+                return Err(format!(
+                    "D3D11 desktop copy did not finish within {} ms",
+                    GPU_COPY_COMPLETION_TIMEOUT.as_millis()
+                ));
+            }
+            if spins < 128 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+}
+
+fn create_gpu_completion_query(device: &ID3D11Device) -> Result<ID3D11Query, String> {
+    let description = D3D11_QUERY_DESC {
+        Query: D3D11_QUERY_EVENT,
+        MiscFlags: 0,
+    };
+    let mut query = None;
+    unsafe { device.CreateQuery(&description, Some(&mut query)) }
+        .map_err(|error| format!("Unable to create D3D11 copy-completion query: {error}"))?;
+    query.ok_or_else(|| "D3D11 returned no copy-completion query".to_owned())
 }
 
 impl Drop for HardwareCapture {
@@ -743,6 +841,7 @@ fn spawn_nvenc_completion(
     encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
     force_keyframe: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    completion_failure: Arc<Mutex<Option<String>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(pending) = pending_frames.recv() {
@@ -764,6 +863,9 @@ fn spawn_nvenc_completion(
                 Err(error) => {
                     warn!("Asynchronous NVENC completion failed: {error}");
                     force_keyframe.store(true, Ordering::Release);
+                    *completion_failure.lock().unwrap() = Some(error);
+                    let _ = free_slots.try_send(pending.slot);
+                    break;
                 }
             }
             // Return the texture only after its encoded output is accepted by
