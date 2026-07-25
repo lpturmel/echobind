@@ -18,7 +18,7 @@ use moq_nvenc::sys::nvEncodeAPI::{
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
     NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER,
     NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE, NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER,
-    NV_ENC_PRESET_P3_GUID, NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER,
+    NV_ENC_PRESET_P1_GUID, NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER,
     NV_ENC_TUNING_INFO, NV_ENC_VUI_COLOR_PRIMARIES, NV_ENC_VUI_MATRIX_COEFFS,
     NV_ENC_VUI_TRANSFER_CHARACTERISTIC, NV_ENC_VUI_VIDEO_FORMAT,
 };
@@ -28,7 +28,7 @@ use std::{
     net::{SocketAddr, UdpSocket},
     ptr,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
@@ -49,20 +49,26 @@ use windows::{
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
                 D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-                D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-                D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-                D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-                D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
+                D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+                D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+                D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+                D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+                D3D11_VPOV_DIMENSION_TEXTURE2D,
             },
             Dxgi::{
-                Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC},
-                CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
-                IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+                Common::{
+                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+                },
+                CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1,
+                IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
                 DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
             },
         },
-        System::Threading::{CreateEventW, WaitForSingleObject},
+        System::Threading::{
+            CreateEventW, GetCurrentThread, SetThreadPriority, WaitForSingleObject,
+            THREAD_PRIORITY_ABOVE_NORMAL,
+        },
     },
 };
 use windows_capture::{
@@ -78,15 +84,19 @@ type NvencGetMaxVersion = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 
 const NVENC_BUFFER_COUNT: usize = 4;
 const ENCODE_COMPLETION_TIMEOUT_MS: u32 = 1_000;
-const GPU_COPY_COMPLETION_TIMEOUT: Duration = Duration::from_millis(50);
+const GPU_COPY_COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 const DXGI_CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
-const DXGI_ACCESS_LOST_RETRIES: u32 = 2;
+const ACTIVE_CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+const CAPTURE_ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
+const CAPTURE_ACTIVITY_THRESHOLD: u64 = 3;
+const MAX_IMMEDIATE_HARDWARE_FAILURES: u32 = 3;
 
 struct CaptureFlags {
     running: Arc<AtomicBool>,
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     force_keyframe: Arc<AtomicBool>,
     encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
+    hardware_progress: Arc<AtomicU64>,
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
     bitrate_bps: u32,
@@ -184,26 +194,34 @@ pub(super) fn spawn_hardware_pipeline(
     active_datagram_size: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let dxgi_result = run_dxgi_pipeline(
-            socket.clone(),
-            running.clone(),
-            active_peer.clone(),
-            force_keyframe.clone(),
-            events.clone(),
-            frames_per_second,
-            bitrate_bps,
-            width,
-            height,
-            active_datagram_size.clone(),
-        );
-        let result = match dxgi_result {
-            Ok(()) => Ok(()),
-            Err(error) if running.load(Ordering::Relaxed) => {
-                warn!("DXGI/NVENC pipeline unavailable: {error}");
-                let _ = events.send(SessionEvent::VideoBackend(format!(
-                    "Windows Graphics Capture fallback (DXGI unavailable: {error})"
-                )));
-                run_wgc_pipeline(
+        let hardware_progress = Arc::new(AtomicU64::new(0));
+        let result = loop {
+            let dxgi_error = match run_dxgi_pipeline(
+                socket.clone(),
+                running.clone(),
+                active_peer.clone(),
+                force_keyframe.clone(),
+                events.clone(),
+                frames_per_second,
+                bitrate_bps,
+                width,
+                height,
+                active_datagram_size.clone(),
+                hardware_progress.clone(),
+            ) {
+                Ok(()) => break Ok(()),
+                Err(error) if running.load(Ordering::Relaxed) => error,
+                Err(_) => break Ok(()),
+            };
+            warn!("DXGI/NVENC pipeline unavailable: {dxgi_error}");
+            let _ = events.send(SessionEvent::VideoBackend(format!(
+                "Windows Graphics Capture takeover after DXGI: {dxgi_error}"
+            )));
+
+            let mut immediate_failures = 0_u32;
+            let wgc_error = loop {
+                let progress_before = hardware_progress.load(Ordering::Acquire);
+                match run_wgc_pipeline(
                     socket.clone(),
                     running.clone(),
                     active_peer.clone(),
@@ -214,9 +232,52 @@ pub(super) fn spawn_hardware_pipeline(
                     width,
                     height,
                     active_datagram_size.clone(),
-                )
+                    hardware_progress.clone(),
+                ) {
+                    Ok(()) => break None,
+                    Err(error) if running.load(Ordering::Relaxed) => {
+                        if hardware_progress.load(Ordering::Acquire) > progress_before {
+                            immediate_failures = 0;
+                        } else {
+                            immediate_failures = immediate_failures.saturating_add(1);
+                        }
+                        if immediate_failures >= MAX_IMMEDIATE_HARDWARE_FAILURES {
+                            break Some(error);
+                        }
+                        warn!(
+                            "Windows Graphics Capture/NVENC stopped; rebuilding hardware pipeline: {error}"
+                        );
+                        force_keyframe.store(true, Ordering::Release);
+                        let _ = events.send(SessionEvent::VideoBackend(format!(
+                            "Windows Graphics Capture/NVENC restarting after: {error}"
+                        )));
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(wgc_error) = wgc_error else {
+                break Ok(());
+            };
+
+            // Once either hardware path has delivered a frame, never demote a
+            // transient game/display/driver event to the unusable 4K software
+            // encoder. Recreate fresh D3D11 and NVENC sessions and keep the
+            // socket/audio session alive.
+            if hardware_progress.load(Ordering::Acquire) > 0 {
+                warn!(
+                    "Both Windows hardware capture paths stopped; restarting from DXGI: {wgc_error}"
+                );
+                force_keyframe.store(true, Ordering::Release);
+                let _ = events.send(SessionEvent::VideoBackend(format!(
+                    "Rebuilding Windows hardware video pipeline after: {wgc_error}"
+                )));
+                thread::sleep(Duration::from_millis(100));
+                continue;
             }
-            Err(error) => Err(error),
+            break Err(format!(
+                "DXGI/NVENC failed ({dxgi_error}); Windows Graphics Capture/NVENC failed ({wgc_error})"
+            ));
         };
         if let Err(error) = result {
             if !running.load(Ordering::Relaxed) {
@@ -263,6 +324,7 @@ fn run_dxgi_pipeline(
     width: u32,
     height: u32,
     active_datagram_size: Arc<AtomicUsize>,
+    hardware_progress: Arc<AtomicU64>,
 ) -> Result<(), String> {
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
     let sender_handle = spawn_hardware_sender(
@@ -274,11 +336,12 @@ fn run_dxgi_pipeline(
         encoded_rx,
         active_datagram_size,
     );
-    let mut access_lost_retries = 0_u32;
+    let mut immediate_failures = 0_u32;
     let result = loop {
         if !running.load(Ordering::Relaxed) {
             break Ok(());
         }
+        let progress_before = hardware_progress.load(Ordering::Acquire);
         let session = run_dxgi_capture_session(
             running.clone(),
             active_peer.clone(),
@@ -289,24 +352,39 @@ fn run_dxgi_pipeline(
             bitrate_bps,
             width,
             height,
+            hardware_progress.clone(),
         );
+        if hardware_progress.load(Ordering::Acquire) > progress_before {
+            immediate_failures = 0;
+        } else {
+            immediate_failures = immediate_failures.saturating_add(1);
+        }
         match session {
             Ok(()) => break Ok(()),
             Err(DxgiCaptureFailure::AccessLost(error)) => {
-                access_lost_retries = access_lost_retries.saturating_add(1);
                 force_keyframe.store(true, Ordering::Release);
                 let _ = events.send(SessionEvent::VideoBackend(
                     "DXGI display mode changed · rebuilding capture and forcing IDR".to_owned(),
                 ));
                 warn!("DXGI capture session was invalidated: {error}");
-                if access_lost_retries >= DXGI_ACCESS_LOST_RETRIES {
+                if immediate_failures >= MAX_IMMEDIATE_HARDWARE_FAILURES {
                     break Err(format!(
-                        "DXGI repeatedly lost the display while changing modes: {error}"
+                        "DXGI repeatedly failed before producing a frame: {error}"
                     ));
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(DxgiCaptureFailure::Fatal(error)) => break Err(error),
+            Err(DxgiCaptureFailure::Fatal(error)) => {
+                force_keyframe.store(true, Ordering::Release);
+                if immediate_failures >= MAX_IMMEDIATE_HARDWARE_FAILURES {
+                    break Err(error);
+                }
+                warn!("DXGI/NVENC stopped; rebuilding hardware pipeline: {error}");
+                let _ = events.send(SessionEvent::VideoBackend(format!(
+                    "DXGI/NVENC restarting after: {error}"
+                )));
+                thread::sleep(Duration::from_millis(50));
+            }
         }
     };
     drop(encoded_tx);
@@ -325,6 +403,7 @@ fn run_dxgi_capture_session(
     bitrate_bps: u32,
     width: u32,
     height: u32,
+    hardware_progress: Arc<AtomicU64>,
 ) -> Result<(), DxgiCaptureFailure> {
     let (device, device_context, output) =
         create_dxgi_device_for_primary_display().map_err(DxgiCaptureFailure::Fatal)?;
@@ -344,18 +423,23 @@ fn run_dxgi_capture_session(
             active_peer,
             force_keyframe,
             encoded_frames,
+            hardware_progress: hardware_progress.clone(),
             events: events.clone(),
             frames_per_second,
             bitrate_bps,
             width,
             height,
         },
-        "NVIDIA NVENC H.264 · DXGI Desktop Duplication · D3D11 zero-copy · 4-buffer async",
+        "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · D3D11 BGRA→NV12 · 4-buffer async",
     )
     .map_err(DxgiCaptureFailure::Fatal)?;
     let _ = events.send(SessionEvent::CaptureReady);
     let mut peer_became_active = None::<Instant>;
     let mut captured_for_peer = false;
+    let mut activity_window_started = Instant::now();
+    let mut activity_frames = 0_u64;
+    let mut active_video_seen = false;
+    let mut last_desktop_frame = None::<Instant>;
 
     while running.load(Ordering::Relaxed) {
         match acquire_dxgi_frame(&duplication, &mut capture) {
@@ -364,11 +448,26 @@ fn run_dxgi_capture_session(
                 if !peer_is_active {
                     peer_became_active = None;
                     captured_for_peer = false;
+                    activity_window_started = Instant::now();
+                    activity_frames = 0;
+                    active_video_seen = false;
+                    last_desktop_frame = None;
                     continue;
                 }
-                let active_since = *peer_became_active.get_or_insert_with(Instant::now);
+                let now = Instant::now();
+                let active_since = *peer_became_active.get_or_insert(now);
                 if acquired {
                     captured_for_peer = true;
+                    last_desktop_frame = Some(now);
+                    if now.duration_since(activity_window_started) > CAPTURE_ACTIVITY_WINDOW {
+                        activity_window_started = now;
+                        activity_frames = 1;
+                    } else {
+                        activity_frames = activity_frames.saturating_add(1);
+                    }
+                    if activity_frames >= CAPTURE_ACTIVITY_THRESHOLD {
+                        active_video_seen = true;
+                    }
                 }
                 // A static desktop legitimately produces no new duplication
                 // frames after its initial image. Only fail over if a newly
@@ -379,6 +478,21 @@ fn run_dxgi_capture_session(
                     return Err(DxgiCaptureFailure::Fatal(format!(
                         "DXGI produced no desktop frames for {} ms while a viewer was connected",
                         DXGI_CAPTURE_STALL_TIMEOUT.as_millis()
+                    )));
+                }
+                // DXGI is allowed to stay quiet on a static desktop. Once it
+                // has demonstrated a stream of changing frames, however, a
+                // multi-second silence means the duplication producer has
+                // stalled without reporting DXGI_ERROR_ACCESS_LOST. Rebuild
+                // the D3D/NVENC session instead of leaving the client frozen.
+                if active_video_seen
+                    && last_desktop_frame
+                        .is_some_and(|last| last.elapsed() >= ACTIVE_CAPTURE_STALL_TIMEOUT)
+                {
+                    drop(capture);
+                    return Err(DxgiCaptureFailure::Fatal(format!(
+                        "DXGI stopped producing an active desktop stream for {} ms",
+                        ACTIVE_CAPTURE_STALL_TIMEOUT.as_millis()
                     )));
                 }
             }
@@ -519,6 +633,7 @@ fn run_wgc_pipeline(
     width: u32,
     height: u32,
     active_datagram_size: Arc<AtomicUsize>,
+    hardware_progress: Arc<AtomicU64>,
 ) -> Result<(), String> {
     // Keep the capture callback bounded. UDP packetization and the many send
     // syscalls needed for a large H.264 frame must never hold the Windows
@@ -536,6 +651,7 @@ fn run_wgc_pipeline(
         encoded_rx,
         active_datagram_size,
     );
+    let peer_state = active_peer.clone();
     let monitor =
         Monitor::primary().map_err(|error| format!("Unable to find primary display: {error}"))?;
     let settings = Settings::new(
@@ -548,6 +664,7 @@ fn run_wgc_pipeline(
             active_peer,
             force_keyframe,
             encoded_frames: encoded_tx,
+            hardware_progress: hardware_progress.clone(),
             events: events.clone(),
             frames_per_second,
             bitrate_bps,
@@ -559,11 +676,70 @@ fn run_wgc_pipeline(
         .map_err(|error| format!("Unable to start D3D11 screen capture: {error}"))?;
     let _ = events.send(SessionEvent::CaptureReady);
 
+    let mut peer_became_active = None::<Instant>;
+    let mut activity_window_started = Instant::now();
+    let mut activity_frames = 0_u64;
+    let mut active_video_seen = false;
+    let mut last_progress_at = None::<Instant>;
+    let mut observed_progress = hardware_progress.load(Ordering::Acquire);
+    let mut watchdog_error = None;
+
     while running.load(Ordering::Relaxed) && !control.is_finished() {
+        let peer_is_active = peer_state.lock().unwrap().is_some();
+        if !peer_is_active {
+            peer_became_active = None;
+            activity_window_started = Instant::now();
+            activity_frames = 0;
+            active_video_seen = false;
+            last_progress_at = None;
+            observed_progress = hardware_progress.load(Ordering::Acquire);
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        let now = Instant::now();
+        let active_since = *peer_became_active.get_or_insert(now);
+        let current_progress = hardware_progress.load(Ordering::Acquire);
+        if current_progress > observed_progress {
+            let new_frames = current_progress - observed_progress;
+            observed_progress = current_progress;
+            last_progress_at = Some(now);
+            if now.duration_since(activity_window_started) > CAPTURE_ACTIVITY_WINDOW {
+                activity_window_started = now;
+                activity_frames = new_frames;
+            } else {
+                activity_frames = activity_frames.saturating_add(new_frames);
+            }
+            if activity_frames >= CAPTURE_ACTIVITY_THRESHOLD {
+                active_video_seen = true;
+            }
+        }
+
+        if last_progress_at.is_none() && active_since.elapsed() >= DXGI_CAPTURE_STALL_TIMEOUT {
+            watchdog_error = Some(format!(
+                "Windows Graphics Capture produced no encoded frames for {} ms",
+                DXGI_CAPTURE_STALL_TIMEOUT.as_millis()
+            ));
+            break;
+        }
+        if active_video_seen
+            && last_progress_at.is_some_and(|last| last.elapsed() >= ACTIVE_CAPTURE_STALL_TIMEOUT)
+        {
+            watchdog_error = Some(format!(
+                "Windows Graphics Capture stopped producing an active stream for {} ms",
+                ACTIVE_CAPTURE_STALL_TIMEOUT.as_millis()
+            ));
+            break;
+        }
         thread::sleep(Duration::from_millis(20));
     }
 
-    let capture_result = if running.load(Ordering::Relaxed) {
+    let capture_result = if let Some(error) = watchdog_error {
+        match control.stop() {
+            Ok(()) => Err(error),
+            Err(stop_error) => Err(format!("{error}; capture stop also failed: {stop_error}")),
+        }
+    } else if running.load(Ordering::Relaxed) {
         control
             .wait()
             .map_err(|error| format!("D3D11 screen capture stopped: {error}"))
@@ -585,7 +761,7 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
             &context.device,
             context.device_context,
             context.flags,
-            "NVIDIA NVENC H.264 · Windows Graphics Capture · D3D11 zero-copy · 4-buffer async",
+            "NVIDIA NVENC H.264 P1 · Windows Graphics Capture · D3D11 BGRA→NV12 · 4-buffer async",
         )
     }
 
@@ -610,6 +786,17 @@ impl HardwareCapture {
         flags: CaptureFlags,
         backend: &str,
     ) -> Result<Self, String> {
+        raise_current_thread_priority("capture");
+        if let Ok(dxgi_device) = device.cast::<IDXGIDevice>() {
+            // The capture copy is a small, bounded workload but must make
+            // forward progress even while a game saturates the 3D queue.
+            // Relative priority +1 is intentionally modest: it avoids capture
+            // starvation without using the soft/hard realtime priorities that
+            // could materially interfere with the game.
+            if let Err(error) = unsafe { dxgi_device.SetGPUThreadPriority(1) } {
+                warn!("Unable to raise D3D11 capture priority: {error}");
+            }
+        }
         let encoder = Arc::new(NvencEncoder::new(
             device,
             flags.width,
@@ -634,6 +821,7 @@ impl HardwareCapture {
             flags.force_keyframe.clone(),
             flags.running.clone(),
             completion_failure.clone(),
+            flags.hardware_progress.clone(),
         );
         let _ = flags
             .events
@@ -690,47 +878,39 @@ impl HardwareCapture {
         let capture_started = Instant::now();
         let output_texture = &self.encoder.slots[slot].texture;
 
-        // The capture texture never leaves GPU memory. CopyResource is used at
-        // native size; the D3D11 video processor performs downscaling otherwise.
-        let prepare_result =
-            if source_width == self.flags.width && source_height == self.flags.height {
-                unsafe {
-                    self.device_context
-                        .CopyResource(output_texture, source_texture);
+        // Convert BGRA capture output directly to NV12 in the D3D11 video
+        // processor. NVENC can consume this texture without performing its own
+        // RGB-to-YUV conversion, leaving more encoder throughput for 4K/120.
+        let scaler_needs_rebuild = self.scalers[slot].as_ref().is_none_or(|scaler| {
+            scaler.source_width != source_width || scaler.source_height != source_height
+        });
+        if scaler_needs_rebuild {
+            match D3dScaler::new(
+                &self.device_context,
+                output_texture,
+                source_width,
+                source_height,
+                self.flags.width,
+                self.flags.height,
+                self.flags.frames_per_second,
+            ) {
+                Ok(scaler) => self.scalers[slot] = Some(scaler),
+                Err(error) => {
+                    let _ = self.free_slots_tx.try_send(slot);
+                    return Err(error);
                 }
-                Ok(())
-            } else {
-                let scaler_needs_rebuild = self.scalers[slot].as_ref().is_none_or(|scaler| {
-                    scaler.source_width != source_width || scaler.source_height != source_height
-                });
-                if scaler_needs_rebuild {
-                    match D3dScaler::new(
-                        &self.device_context,
-                        output_texture,
-                        source_width,
-                        source_height,
-                        self.flags.width,
-                        self.flags.height,
-                        self.flags.frames_per_second,
-                    ) {
-                        Ok(scaler) => self.scalers[slot] = Some(scaler),
-                        Err(error) => {
-                            let _ = self.free_slots_tx.try_send(slot);
-                            return Err(error);
-                        }
-                    }
-                }
-                self.scalers[slot]
-                    .as_ref()
-                    .expect("scaler was initialized")
-                    .scale(source_texture)
-            };
+            }
+        }
+        let prepare_result = self.scalers[slot]
+            .as_ref()
+            .expect("scaler was initialized")
+            .scale(source_texture);
         if let Err(error) = prepare_result {
             let _ = self.free_slots_tx.try_send(slot);
             return Err(error);
         }
         // DXGI invalidates its desktop surface as soon as ReleaseFrame is
-        // called. CopyResource and VideoProcessorBlt are asynchronous, so a
+        // called. VideoProcessorBlt is asynchronous, so a
         // Flush alone does not make it legal for the caller to release that
         // source texture. Wait only for this short GPU copy/scale operation;
         // NVENC itself remains four-buffer asynchronous.
@@ -785,6 +965,9 @@ impl HardwareCapture {
         let started = Instant::now();
         let mut spins = 0_u32;
         loop {
+            if !self.flags.running.load(Ordering::Relaxed) {
+                return Err("D3D11 desktop copy cancelled while stopping".to_owned());
+            }
             let mut complete = BOOL::default();
             unsafe {
                 self.device_context.GetData(
@@ -842,24 +1025,31 @@ fn spawn_nvenc_completion(
     force_keyframe: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     completion_failure: Arc<Mutex<Option<String>>>,
+    hardware_progress: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        raise_current_thread_priority("NVENC completion");
         while let Ok(pending) = pending_frames.recv() {
             let result = encoder.complete(&pending);
             match result {
-                Ok(mut frame) => loop {
-                    match encoded_frames.try_send(frame) {
-                        Ok(()) => break,
-                        Err(mpsc::TrySendError::Full(returned)) => {
-                            if !running.load(Ordering::Relaxed) {
-                                break;
+                Ok(mut frame) => {
+                    let accepted = loop {
+                        match encoded_frames.try_send(frame) {
+                            Ok(()) => break true,
+                            Err(mpsc::TrySendError::Full(returned)) => {
+                                if !running.load(Ordering::Relaxed) {
+                                    break false;
+                                }
+                                frame = returned;
+                                thread::sleep(Duration::from_millis(1));
                             }
-                            frame = returned;
-                            thread::sleep(Duration::from_millis(1));
+                            Err(mpsc::TrySendError::Disconnected(_)) => break false,
                         }
-                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    };
+                    if accepted {
+                        hardware_progress.fetch_add(1, Ordering::Release);
                     }
-                },
+                }
                 Err(error) => {
                     warn!("Asynchronous NVENC completion failed: {error}");
                     force_keyframe.store(true, Ordering::Release);
@@ -887,6 +1077,7 @@ fn spawn_hardware_sender(
     active_datagram_size: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        raise_current_thread_priority("video sender");
         let mut packet = Vec::with_capacity(MAX_DATAGRAM_SIZE);
         let mut stats_started = Instant::now();
         let mut stats_frames = 0_u64;
@@ -1038,6 +1229,14 @@ fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
     }
 }
 
+fn raise_current_thread_priority(role: &str) {
+    if let Err(error) =
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) }
+    {
+        warn!("Unable to raise {role} thread priority: {error}");
+    }
+}
+
 fn create_output_texture(
     device: &ID3D11Device,
     width: u32,
@@ -1048,18 +1247,15 @@ fn create_output_texture(
         Height: height,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: DXGI_FORMAT_NV12,
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        // NVENC accepts externally allocated DirectX textures through
-        // nvEncRegisterResource and does not require the Direct3D video-encoder
-        // bind flag. That flag targets the D3D11.1 video-encoder API and some
-        // drivers reject it for BGRA textures with E_INVALIDARG. Render-target
-        // binding is retained because the D3D11 video processor writes here
-        // when downscaling.
+        // The D3D11 video processor writes BGRA capture data into this NV12
+        // render target. NVENC accepts the same texture via resource
+        // registration without the D3D11 video-encoder bind flag.
         BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
         CPUAccessFlags: 0,
         MiscFlags: 0,
@@ -1154,6 +1350,14 @@ impl D3dScaler {
             bottom: output_height as i32,
         };
         unsafe {
+            let rgb_full_range = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0 };
+            // YCbCr_Matrix = BT.709 (bit 2), Nominal_Range = 16-235
+            // (value 1 in bits 4-5). This matches the H.264 VUI emitted below.
+            let nv12_bt709_limited = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+                _bitfield: (1 << 2) | (1 << 4),
+            };
+            video_context.VideoProcessorSetStreamColorSpace(&processor, 0, &rgb_full_range);
+            video_context.VideoProcessorSetOutputColorSpace(&processor, &nv12_bt709_limited);
             video_context.VideoProcessorSetStreamSourceRect(
                 &processor,
                 0,
@@ -1325,7 +1529,7 @@ impl NvencEncoder {
                 get_preset(
                     self.encoder,
                     NV_ENC_CODEC_H264_GUID,
-                    NV_ENC_PRESET_P3_GUID,
+                    NV_ENC_PRESET_P1_GUID,
                     NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                     &mut preset,
                 )
@@ -1344,11 +1548,11 @@ impl NvencEncoder {
         let frame_budget = bitrate_bps / frames_per_second.max(1);
         config.rcParams.vbvBufferSize = frame_budget.max(1);
         config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
-        // Spatial AQ preserves flat UI regions and fine game detail without
-        // buffering future frames. Temporal AQ and lookahead remain disabled
-        // because either can add latency and bitrate variability.
-        config.rcParams.set_enableAQ(1);
-        config.rcParams.set_aqStrength(8);
+        // At native ultrawide 120 FPS, throughput takes precedence over AQ.
+        // The LAN bitrate budget is high enough to preserve detail without
+        // spending extra NVENC cycles on adaptive quantization.
+        config.rcParams.set_enableAQ(0);
+        config.rcParams.set_aqStrength(0);
         config.rcParams.set_enableTemporalAQ(0);
         config.rcParams.set_enableLookahead(0);
         config.rcParams.set_zeroReorderDelay(1);
@@ -1376,7 +1580,7 @@ impl NvencEncoder {
         let mut initialize = NV_ENC_INITIALIZE_PARAMS {
             version: NV_ENC_INITIALIZE_PARAMS_VER,
             encodeGUID: NV_ENC_CODEC_H264_GUID,
-            presetGUID: NV_ENC_PRESET_P3_GUID,
+            presetGUID: NV_ENC_PRESET_P1_GUID,
             encodeWidth: self.width,
             encodeHeight: self.height,
             darWidth: self.width,
@@ -1389,7 +1593,7 @@ impl NvencEncoder {
             maxEncodeWidth: self.width,
             maxEncodeHeight: self.height,
             tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
             ..Default::default()
         };
         let initialize_encoder = required(
@@ -1418,7 +1622,7 @@ impl NvencEncoder {
             width: self.width,
             height: self.height,
             resourceToRegister: texture.as_raw(),
-            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
             bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
             ..Default::default()
         };
