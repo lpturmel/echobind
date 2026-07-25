@@ -8,6 +8,13 @@ enum Mode {
     Connect,
 }
 
+struct GpuVideoTexture {
+    texture: eframe::wgpu::Texture,
+    id: egui::TextureId,
+    width: usize,
+    height: usize,
+}
+
 pub struct EchobindApp {
     mode: Mode,
     host_ip: String,
@@ -19,8 +26,11 @@ pub struct EchobindApp {
     status: String,
     pending_peer: Option<SocketAddr>,
     session: Option<DesktopSession>,
-    texture: Option<egui::TextureHandle>,
+    texture: Option<GpuVideoTexture>,
+    render_state: eframe::egui_wgpu::RenderState,
     stream_fps: f32,
+    received_fps: f32,
+    dropped_frames: u64,
     stream_mbps: f32,
     stream_width: u32,
     stream_height: u32,
@@ -35,6 +45,10 @@ impl EchobindApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         creation_context.egui_ctx.set_theme(egui::Theme::Dark);
         let audio_output_devices = DesktopSession::audio_output_devices().unwrap_or_default();
+        let render_state = creation_context
+            .wgpu_render_state
+            .clone()
+            .expect("Echobind requires the wgpu renderer");
 
         Self {
             mode: Mode::Connect,
@@ -48,7 +62,10 @@ impl EchobindApp {
             pending_peer: None,
             session: None,
             texture: None,
+            render_state,
             stream_fps: 0.0,
+            received_fps: 0.0,
+            dropped_frames: 0,
             stream_mbps: 0.0,
             stream_width: 0,
             stream_height: 0,
@@ -111,7 +128,19 @@ impl EchobindApp {
                     megabits_per_second,
                 } => {
                     self.stream_fps = fps;
+                    self.received_fps = fps;
                     self.stream_mbps = megabits_per_second;
+                }
+                SessionEvent::ClientStats {
+                    received_fps,
+                    decoded_fps,
+                    megabits_per_second,
+                    dropped_frames,
+                } => {
+                    self.received_fps = received_fps;
+                    self.stream_fps = decoded_fps;
+                    self.stream_mbps = megabits_per_second;
+                    self.dropped_frames = dropped_frames;
                 }
                 SessionEvent::Error(error) => {
                     self.status = format!("Error: {error}");
@@ -122,14 +151,7 @@ impl EchobindApp {
         if let Some(frame) = newest_frame {
             self.stream_width = frame.width as u32;
             self.stream_height = frame.height as u32;
-            let image =
-                egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
-            if let Some(texture) = &mut self.texture {
-                texture.set(image, egui::TextureOptions::LINEAR);
-            } else {
-                self.texture =
-                    Some(context.load_texture("remote-video", image, egui::TextureOptions::LINEAR));
-            }
+            self.upload_frame(frame);
         }
 
         context.request_repaint_after(std::time::Duration::from_millis(8));
@@ -187,14 +209,83 @@ impl EchobindApp {
             session.stop();
         }
         self.pending_peer = None;
-        self.texture = None;
+        self.clear_texture();
         self.stream_fps = 0.0;
+        self.received_fps = 0.0;
+        self.dropped_frames = 0;
         self.stream_mbps = 0.0;
         self.stream_width = 0;
         self.stream_height = 0;
         self.video_backend = "initializing".to_owned();
         self.audio_backend = "System default output".to_owned();
         self.status = "Ready".to_owned();
+    }
+
+    fn upload_frame(&mut self, frame: crate::session::DisplayFrame) {
+        let needs_texture = self
+            .texture
+            .as_ref()
+            .is_none_or(|texture| texture.width != frame.width || texture.height != frame.height);
+        if needs_texture {
+            self.clear_texture();
+            let texture =
+                self.render_state
+                    .device
+                    .create_texture(&eframe::wgpu::TextureDescriptor {
+                        label: Some("echobind_remote_video"),
+                        size: eframe::wgpu::Extent3d {
+                            width: frame.width as u32,
+                            height: frame.height as u32,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: eframe::wgpu::TextureDimension::D2,
+                        format: eframe::wgpu::TextureFormat::Rgba8Unorm,
+                        usage: eframe::wgpu::TextureUsages::COPY_DST
+                            | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+            let view = texture.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+            let id = self.render_state.renderer.write().register_native_texture(
+                &self.render_state.device,
+                &view,
+                eframe::wgpu::FilterMode::Linear,
+            );
+            self.texture = Some(GpuVideoTexture {
+                texture,
+                id,
+                width: frame.width,
+                height: frame.height,
+            });
+        }
+
+        let texture = self.texture.as_ref().expect("video texture was created");
+        self.render_state.queue.write_texture(
+            eframe::wgpu::TexelCopyTextureInfo {
+                texture: &texture.texture,
+                mip_level: 0,
+                origin: eframe::wgpu::Origin3d::ZERO,
+                aspect: eframe::wgpu::TextureAspect::All,
+            },
+            &frame.rgba,
+            eframe::wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((frame.width * 4) as u32),
+                rows_per_image: Some(frame.height as u32),
+            },
+            eframe::wgpu::Extent3d {
+                width: frame.width as u32,
+                height: frame.height as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn clear_texture(&mut self) {
+        if let Some(texture) = self.texture.take() {
+            self.render_state.renderer.write().free_texture(&texture.id);
+        }
     }
 
     fn refresh_audio_devices(&mut self) {
@@ -350,10 +441,22 @@ impl EchobindApp {
             } else {
                 self.resolution.label().to_owned()
             };
-            ui.label(format!(
-                "{:.1} FPS · {:.2} Mbps · {resolution} H.264 · {} · {}",
-                self.stream_fps, self.stream_mbps, self.video_backend, self.audio_backend,
-            ));
+            if self.mode == Mode::Host {
+                ui.label(format!(
+                    "{:.1} FPS sent · {:.2} Mbps · {resolution} H.264 · {} · {}",
+                    self.stream_fps, self.stream_mbps, self.video_backend, self.audio_backend,
+                ));
+            } else {
+                ui.label(format!(
+                    "{:.1} FPS decoded · {:.1} received · {} dropped · {:.2} Mbps · {resolution} H.264 · {} · {}",
+                    self.stream_fps,
+                    self.received_fps,
+                    self.dropped_frames,
+                    self.stream_mbps,
+                    self.video_backend,
+                    self.audio_backend,
+                ));
+            }
         }
     }
 
@@ -375,13 +478,13 @@ impl EchobindApp {
         };
 
         let available = ui.available_size();
-        let source = texture.size_vec2();
+        let source = egui::vec2(texture.width as f32, texture.height as f32);
         let scale = (available.x / source.x)
             .min(available.y / source.y)
             .max(0.01);
         let display_size = source * scale;
         ui.centered_and_justified(|ui| {
-            ui.add(egui::Image::from_texture(texture).fit_to_exact_size(display_size));
+            ui.add(egui::Image::from_texture((texture.id, source)).fit_to_exact_size(display_size));
         });
     }
 }

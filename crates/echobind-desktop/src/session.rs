@@ -1,7 +1,7 @@
 use crate::video::I420Frame;
 use echobind_core::{
     protocol::{Packet, MAX_DATAGRAM_SIZE},
-    video::{fragment_video_frame, VideoReassembler},
+    video::{fragment_video_frame, VideoFrame, VideoReassembler},
     AudioConfig, FrameRate as SessionFrameRate, SessionConfig, VideoCodec, VideoConfig,
 };
 use openh264::{
@@ -17,10 +17,12 @@ use scap::{
     capturer::{Capturer, Options, Resolution},
     frame::{BGRAFrame, Frame, FrameType, YUVFrame},
 };
+use socket2::SockRef;
 use std::{
+    collections::{BTreeMap, VecDeque},
     net::{SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
@@ -32,6 +34,10 @@ use tracing::{debug, warn};
 mod audio;
 
 #[cfg(target_os = "macos")]
+#[path = "decoder_macos.rs"]
+mod decoder_macos;
+
+#[cfg(target_os = "macos")]
 #[path = "hardware_macos.rs"]
 mod hardware_macos;
 
@@ -41,7 +47,10 @@ mod hardware_windows;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
-const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(120);
+const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(250);
+const VIDEO_DECODE_QUEUE_CAPACITY: usize = 4;
+const CLIENT_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+const HOST_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const HELLO_INTERVAL: Duration = Duration::from_millis(400);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -106,13 +115,82 @@ impl CapturedFrame {
 }
 
 type CaptureSlot = Arc<(Mutex<Option<CapturedFrame>>, Condvar)>;
-type LatestFrame = Arc<Mutex<Option<DisplayFrame>>>;
+pub(super) type LatestFrame = Arc<Mutex<Option<DisplayFrame>>>;
 
 #[derive(Clone, Debug)]
-pub struct DisplayFrame {
+pub(super) struct DisplayFrame {
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
+}
+
+#[derive(Default)]
+pub(super) struct ClientMetrics {
+    received_bytes: AtomicU64,
+    reassembled_frames: AtomicU64,
+    decoded_frames: AtomicU64,
+    dropped_frames: AtomicU64,
+}
+
+#[derive(Clone)]
+pub(super) struct DecodeQueue {
+    inner: Arc<(Mutex<DecodeQueueState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct DecodeQueueState {
+    frames: VecDeque<VideoFrame>,
+    waiting_for_keyframe: bool,
+}
+
+enum DecodeQueuePush {
+    Queued,
+    WaitingForKeyframe,
+    Overflowed,
+}
+
+impl DecodeQueue {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(DecodeQueueState::default()), Condvar::new())),
+        }
+    }
+
+    fn push(&self, frame: VideoFrame) -> DecodeQueuePush {
+        let (lock, ready) = &*self.inner;
+        let mut state = lock.lock().unwrap();
+        if state.waiting_for_keyframe && !frame.is_keyframe {
+            return DecodeQueuePush::WaitingForKeyframe;
+        }
+        if state.frames.len() >= VIDEO_DECODE_QUEUE_CAPACITY {
+            state.frames.clear();
+            state.waiting_for_keyframe = true;
+            if !frame.is_keyframe {
+                return DecodeQueuePush::Overflowed;
+            }
+        }
+        if frame.is_keyframe {
+            state.waiting_for_keyframe = false;
+        }
+        state.frames.push_back(frame);
+        ready.notify_one();
+        DecodeQueuePush::Queued
+    }
+
+    pub(super) fn pop_timeout(&self, timeout: Duration) -> Option<VideoFrame> {
+        let (lock, ready) = &*self.inner;
+        let mut state = lock.lock().unwrap();
+        if state.frames.is_empty() {
+            state = ready.wait_timeout(state, timeout).unwrap().0;
+        }
+        state.frames.pop_front()
+    }
+
+    fn require_keyframe(&self) {
+        let mut state = self.inner.0.lock().unwrap();
+        state.frames.clear();
+        state.waiting_for_keyframe = true;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -124,10 +202,22 @@ pub enum SessionEvent {
     ConnectionRejected(String),
     Disconnected(String),
     CaptureReady,
-    VideoConfigured { width: u32, height: u32 },
+    VideoConfigured {
+        width: u32,
+        height: u32,
+    },
     VideoBackend(String),
     AudioBackend(String),
-    Stats { fps: f32, megabits_per_second: f32 },
+    Stats {
+        fps: f32,
+        megabits_per_second: f32,
+    },
+    ClientStats {
+        received_fps: f32,
+        decoded_fps: f32,
+        megabits_per_second: f32,
+        dropped_frames: u64,
+    },
     Error(String),
 }
 
@@ -144,6 +234,7 @@ pub struct DesktopSession {
     events: mpsc::Receiver<SessionEvent>,
     latest_frame: LatestFrame,
     capture_slot: Option<CaptureSlot>,
+    decode_queue: Option<DecodeQueue>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -171,6 +262,7 @@ impl DesktopSession {
             UdpSocket::bind(bind_addr)
                 .map_err(|error| format!("Unable to bind {bind_addr}: {error}"))?,
         );
+        configure_socket_buffers(&socket, HOST_SOCKET_BUFFER_SIZE)?;
         socket
             .set_read_timeout(Some(SOCKET_TIMEOUT))
             .map_err(|error| format!("Unable to configure server socket: {error}"))?;
@@ -295,6 +387,7 @@ impl DesktopSession {
             events: event_rx,
             latest_frame,
             capture_slot,
+            decode_queue: None,
             handles,
         })
     }
@@ -310,6 +403,7 @@ impl DesktopSession {
         };
         let socket = UdpSocket::bind(bind_addr)
             .map_err(|error| format!("Unable to create client socket: {error}"))?;
+        configure_socket_buffers(&socket, CLIENT_SOCKET_BUFFER_SIZE)?;
         socket
             .connect(server_addr)
             .map_err(|error| format!("Unable to connect to {server_addr}: {error}"))?;
@@ -319,16 +413,29 @@ impl DesktopSession {
 
         let running = Arc::new(AtomicBool::new(true));
         let latest_frame = Arc::new(Mutex::new(None));
+        let decode_queue = DecodeQueue::new();
+        let metrics = Arc::new(ClientMetrics::default());
+        let decoder_needs_keyframe = Arc::new(AtomicBool::new(true));
         let (event_tx, event_rx) = mpsc::channel();
         let (audio_command_tx, audio_command_rx) = mpsc::channel();
-        let handle = spawn_client(
+        let network_handle = spawn_client_network(
             socket,
             server_addr,
             running.clone(),
-            latest_frame.clone(),
-            event_tx,
+            decode_queue.clone(),
+            metrics.clone(),
+            decoder_needs_keyframe.clone(),
+            event_tx.clone(),
             audio_output_device,
             audio_command_rx,
+        );
+        let decoder_handle = spawn_video_decoder(
+            running.clone(),
+            decode_queue.clone(),
+            latest_frame.clone(),
+            metrics,
+            decoder_needs_keyframe,
+            event_tx,
         );
 
         Ok(Self {
@@ -338,7 +445,8 @@ impl DesktopSession {
             events: event_rx,
             latest_frame,
             capture_slot: None,
-            handles: vec![handle],
+            decode_queue: Some(decode_queue),
+            handles: vec![network_handle, decoder_handle],
         })
     }
 
@@ -373,9 +481,23 @@ impl DesktopSession {
         if let Some(slot) = &self.capture_slot {
             slot.1.notify_all();
         }
+        if let Some(queue) = &self.decode_queue {
+            queue.inner.1.notify_all();
+        }
         self.host_commands.take();
         self.handles.clear();
     }
+}
+
+fn configure_socket_buffers(socket: &UdpSocket, requested_size: usize) -> Result<(), String> {
+    let socket_ref = SockRef::from(socket);
+    socket_ref
+        .set_recv_buffer_size(requested_size)
+        .map_err(|error| format!("Unable to enlarge UDP receive buffer: {error}"))?;
+    socket_ref
+        .set_send_buffer_size(requested_size)
+        .map_err(|error| format!("Unable to enlarge UDP send buffer: {error}"))?;
+    Ok(())
 }
 
 fn ensure_software_capture_available() -> Result<(), String> {
@@ -766,29 +888,20 @@ fn spawn_encoder(
     })
 }
 
-fn spawn_client(
+#[allow(clippy::too_many_arguments)]
+fn spawn_client_network(
     socket: UdpSocket,
     server_addr: SocketAddr,
     running: Arc<AtomicBool>,
-    latest_frame: LatestFrame,
+    decode_queue: DecodeQueue,
+    metrics: Arc<ClientMetrics>,
+    decoder_needs_keyframe: Arc<AtomicBool>,
     events: mpsc::Sender<SessionEvent>,
     mut audio_output_device: Option<String>,
     audio_commands: mpsc::Receiver<Option<String>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut decoder = match Decoder::new() {
-            Ok(decoder) => decoder,
-            Err(error) => {
-                let _ = events.send(SessionEvent::Error(format!(
-                    "Unable to initialize H.264 decoder: {error}"
-                )));
-                return;
-            }
-        };
-        let _ = events.send(SessionEvent::VideoBackend(
-            "OpenH264 software decoder".to_owned(),
-        ));
-        let mut reassembler = VideoReassembler::new(3, VIDEO_REASSEMBLY_AGE);
+        let mut reassembler = VideoReassembler::new(8, VIDEO_REASSEMBLY_AGE);
         let mut packet_buffer = [0_u8; MAX_DATAGRAM_SIZE];
         let mut outgoing = Vec::with_capacity(MAX_DATAGRAM_SIZE);
         let mut accepted = false;
@@ -798,9 +911,8 @@ fn spawn_client(
         let mut ping_id = 0_u64;
         let mut last_keyframe_request = Instant::now() - Duration::from_secs(1);
         let mut stats_started = Instant::now();
-        let mut stats_frames = 0_u64;
-        let mut stats_bytes = 0_u64;
-        let mut last_decoded_frame_id = None::<u64>;
+        let mut next_frame_id = None::<u64>;
+        let mut completed_frames = BTreeMap::<u64, VideoFrame>::new();
         let mut waiting_for_keyframe = true;
         let mut audio_config = None::<AudioConfig>;
         let mut audio_configured = false;
@@ -808,6 +920,16 @@ fn spawn_client(
         let _ = events.send(SessionEvent::AwaitingApproval);
 
         while running.load(Ordering::Relaxed) {
+            if decoder_needs_keyframe.swap(false, Ordering::AcqRel) {
+                decode_queue.require_keyframe();
+                completed_frames.clear();
+                next_frame_id = None;
+                waiting_for_keyframe = true;
+                if accepted && last_keyframe_request.elapsed() >= Duration::from_millis(100) {
+                    request_keyframe(&socket, &mut outgoing);
+                    last_keyframe_request = Instant::now();
+                }
+            }
             while let Ok(device) = audio_commands.try_recv() {
                 audio_output_device = device;
                 audio_playback.take();
@@ -838,7 +960,9 @@ fn spawn_client(
 
             match socket.recv(&mut packet_buffer) {
                 Ok(size) => {
-                    stats_bytes = stats_bytes.saturating_add(size as u64);
+                    metrics
+                        .received_bytes
+                        .fetch_add(size as u64, Ordering::Relaxed);
                     let packet = match Packet::try_from(&packet_buffer[..size]) {
                         Ok(packet) => packet,
                         Err(error) => {
@@ -914,10 +1038,9 @@ fn spawn_client(
                         }
                         Packet::Video(fragment) if accepted => match reassembler.push(fragment) {
                             Ok(Some(frame)) => {
-                                let frame_gap = last_decoded_frame_id
-                                    .is_some_and(|last| frame.frame_id != last.wrapping_add(1));
-                                if (waiting_for_keyframe || frame_gap) && !frame.is_keyframe {
-                                    waiting_for_keyframe = true;
+                                metrics.reassembled_frames.fetch_add(1, Ordering::Relaxed);
+                                if waiting_for_keyframe && !frame.is_keyframe {
+                                    metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                                     if last_keyframe_request.elapsed() >= Duration::from_millis(250)
                                     {
                                         request_keyframe(&socket, &mut outgoing);
@@ -926,36 +1049,68 @@ fn spawn_client(
                                     continue;
                                 }
 
-                                match decoder.decode(&frame.payload) {
-                                    Ok(Some(decoded)) => {
-                                        let (width, height) = decoded.dimensions();
-                                        let mut rgba = vec![0; width * height * 4];
-                                        decoded.write_rgba8(&mut rgba);
-                                        *latest_frame.lock().unwrap() = Some(DisplayFrame {
-                                            width,
-                                            height,
-                                            rgba,
-                                        });
-                                        last_decoded_frame_id = Some(frame.frame_id);
-                                        waiting_for_keyframe = false;
-                                        stats_frames = stats_frames.saturating_add(1);
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => {
-                                        warn!("H.264 decode failed: {error}");
-                                        waiting_for_keyframe = true;
-                                        if last_keyframe_request.elapsed()
-                                            >= Duration::from_millis(250)
-                                        {
-                                            request_keyframe(&socket, &mut outgoing);
-                                            last_keyframe_request = Instant::now();
+                                // A complete later frame can arrive before an earlier frame when
+                                // UDP reorders datagrams. Hold a tiny reorder window instead of
+                                // treating that as packet loss immediately.
+                                if frame.is_keyframe && next_frame_id != Some(frame.frame_id) {
+                                    completed_frames.clear();
+                                    next_frame_id = Some(frame.frame_id);
+                                    waiting_for_keyframe = false;
+                                } else if waiting_for_keyframe {
+                                    next_frame_id = Some(frame.frame_id);
+                                    waiting_for_keyframe = false;
+                                }
+                                let frame_id = frame.frame_id;
+                                if next_frame_id.is_some_and(|next| frame_id < next) {
+                                    metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                completed_frames.entry(frame_id).or_insert(frame);
+
+                                let expected = next_frame_id.expect("a completed frame sets order");
+                                if !completed_frames.contains_key(&expected)
+                                    && completed_frames.len() >= 3
+                                {
+                                    metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                    completed_frames.clear();
+                                    decode_queue.require_keyframe();
+                                    next_frame_id = None;
+                                    waiting_for_keyframe = true;
+                                }
+
+                                while let Some(expected) = next_frame_id {
+                                    let Some(ordered_frame) = completed_frames.remove(&expected)
+                                    else {
+                                        break;
+                                    };
+                                    match decode_queue.push(ordered_frame) {
+                                        DecodeQueuePush::Queued => {
+                                            next_frame_id = Some(expected.wrapping_add(1));
+                                        }
+                                        DecodeQueuePush::WaitingForKeyframe
+                                        | DecodeQueuePush::Overflowed => {
+                                            metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                            completed_frames.clear();
+                                            next_frame_id = None;
+                                            waiting_for_keyframe = true;
+                                            break;
                                         }
                                     }
+                                }
+                                if waiting_for_keyframe
+                                    && last_keyframe_request.elapsed() >= Duration::from_millis(100)
+                                {
+                                    request_keyframe(&socket, &mut outgoing);
+                                    last_keyframe_request = Instant::now();
                                 }
                             }
                             Ok(None) => {}
                             Err(error) => {
                                 warn!("Video reassembly failed: {error}");
+                                metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                decode_queue.require_keyframe();
+                                completed_frames.clear();
+                                next_frame_id = None;
                                 waiting_for_keyframe = true;
                                 if last_keyframe_request.elapsed() >= Duration::from_millis(250) {
                                     request_keyframe(&socket, &mut outgoing);
@@ -991,16 +1146,104 @@ fn spawn_client(
             let elapsed = stats_started.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 let seconds = elapsed.as_secs_f32();
-                let _ = events.send(SessionEvent::Stats {
-                    fps: stats_frames as f32 / seconds,
-                    megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+                let received_frames = metrics.reassembled_frames.swap(0, Ordering::Relaxed);
+                let decoded_frames = metrics.decoded_frames.swap(0, Ordering::Relaxed);
+                let received_bytes = metrics.received_bytes.swap(0, Ordering::Relaxed);
+                let dropped_frames = metrics.dropped_frames.swap(0, Ordering::Relaxed);
+                let _ = events.send(SessionEvent::ClientStats {
+                    received_fps: received_frames as f32 / seconds,
+                    decoded_fps: decoded_frames as f32 / seconds,
+                    megabits_per_second: received_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+                    dropped_frames,
                 });
                 stats_started = Instant::now();
-                stats_frames = 0;
-                stats_bytes = 0;
             }
         }
     })
+}
+
+fn spawn_video_decoder(
+    running: Arc<AtomicBool>,
+    decode_queue: DecodeQueue,
+    latest_frame: LatestFrame,
+    metrics: Arc<ClientMetrics>,
+    needs_keyframe: Arc<AtomicBool>,
+    events: mpsc::Sender<SessionEvent>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        {
+            match decoder_macos::run_decoder(
+                running.clone(),
+                decode_queue.clone(),
+                latest_frame.clone(),
+                metrics.clone(),
+                needs_keyframe.clone(),
+                events.clone(),
+            ) {
+                Ok(()) => return,
+                Err(error) => {
+                    warn!("VideoToolbox decoder unavailable: {error}");
+                    let _ = events.send(SessionEvent::VideoBackend(format!(
+                        "OpenH264 fallback (VideoToolbox unavailable: {error})"
+                    )));
+                    needs_keyframe.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        if let Err(error) = run_software_video_decoder(
+            running,
+            decode_queue,
+            latest_frame,
+            metrics,
+            needs_keyframe,
+            events.clone(),
+        ) {
+            let _ = events.send(SessionEvent::Error(error));
+        }
+    })
+}
+
+fn run_software_video_decoder(
+    running: Arc<AtomicBool>,
+    decode_queue: DecodeQueue,
+    latest_frame: LatestFrame,
+    metrics: Arc<ClientMetrics>,
+    needs_keyframe: Arc<AtomicBool>,
+    events: mpsc::Sender<SessionEvent>,
+) -> Result<(), String> {
+    let mut decoder =
+        Decoder::new().map_err(|error| format!("Unable to initialize H.264 decoder: {error}"))?;
+    let _ = events.send(SessionEvent::VideoBackend(
+        "OpenH264 software decoder · separate receive thread".to_owned(),
+    ));
+
+    while running.load(Ordering::Relaxed) {
+        let Some(frame) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
+            continue;
+        };
+        match decoder.decode(&frame.payload) {
+            Ok(Some(decoded)) => {
+                let (width, height) = decoded.dimensions();
+                let mut rgba = vec![0; width * height * 4];
+                decoded.write_rgba8(&mut rgba);
+                *latest_frame.lock().unwrap() = Some(DisplayFrame {
+                    width,
+                    height,
+                    rgba,
+                });
+                metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!("H.264 decode failed: {error}");
+                metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                needs_keyframe.store(true, Ordering::Release);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn request_keyframe(socket: &UdpSocket, outgoing: &mut Vec<u8>) {

@@ -65,9 +65,9 @@ type NvencCreateInstance = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST
 type NvencGetMaxVersion = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 
 struct CaptureFlags {
-    socket: Arc<UdpSocket>,
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     force_keyframe: Arc<AtomicBool>,
+    encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
     bitrate_bps: u32,
@@ -85,10 +85,13 @@ struct HardwareCapture {
     frame_interval: Duration,
     next_frame_at: Instant,
     frame_id: u64,
-    stats_started: Instant,
-    stats_frames: u64,
-    stats_bytes: u64,
-    packet: Vec<u8>,
+}
+
+struct EncodedHardwareFrame {
+    frame_id: u64,
+    timestamp_us: u64,
+    is_keyframe: bool,
+    data: Vec<u8>,
 }
 
 struct D3dScaler {
@@ -181,6 +184,18 @@ fn run_hardware_pipeline(
     width: u32,
     height: u32,
 ) -> Result<(), String> {
+    // Keep the capture callback bounded. UDP packetization and the many send
+    // syscalls needed for a large H.264 frame must never hold the Windows
+    // Graphics Capture frame-pool callback.
+    let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
+    let sender_handle = spawn_hardware_sender(
+        socket,
+        running.clone(),
+        active_peer.clone(),
+        force_keyframe.clone(),
+        events.clone(),
+        encoded_rx,
+    );
     let monitor =
         Monitor::primary().map_err(|error| format!("Unable to find primary display: {error}"))?;
     let settings = Settings::new(
@@ -189,9 +204,9 @@ fn run_hardware_pipeline(
         DrawBorderSettings::WithoutBorder,
         ColorFormat::Bgra8,
         CaptureFlags {
-            socket,
             active_peer,
             force_keyframe,
+            encoded_frames: encoded_tx,
             events: events.clone(),
             frames_per_second,
             bitrate_bps,
@@ -207,7 +222,7 @@ fn run_hardware_pipeline(
         thread::sleep(Duration::from_millis(20));
     }
 
-    if running.load(Ordering::Relaxed) {
+    let capture_result = if running.load(Ordering::Relaxed) {
         control
             .wait()
             .map_err(|error| format!("D3D11 screen capture stopped: {error}"))
@@ -215,7 +230,9 @@ fn run_hardware_pipeline(
         control
             .stop()
             .map_err(|error| format!("Unable to stop D3D11 screen capture: {error}"))
-    }
+    };
+    let _ = sender_handle.join();
+    capture_result
 }
 
 impl GraphicsCaptureApiHandler for HardwareCapture {
@@ -249,10 +266,6 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
             frame_interval,
             next_frame_at: Instant::now(),
             frame_id: 0,
-            stats_started: Instant::now(),
-            stats_frames: 0,
-            stats_bytes: 0,
-            packet: Vec::with_capacity(MAX_DATAGRAM_SIZE),
         })
     }
 
@@ -261,10 +274,10 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
         frame: &mut Frame,
         _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let Some(peer) = *self.flags.active_peer.lock().unwrap() else {
+        if self.flags.active_peer.lock().unwrap().is_none() {
             self.next_frame_at = Instant::now();
             return Ok(());
-        };
+        }
         let now = Instant::now();
         if now + Duration::from_millis(1) < self.next_frame_at {
             return Ok(());
@@ -313,25 +326,18 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
             return Ok(());
         };
         let timestamp_us = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        let fragments =
-            fragment_video_frame(self.frame_id, timestamp_us, is_keyframe, encoded.as_slice())
-                .map_err(|error| format!("NVENC frame cannot be packetized: {error}"))?;
-
-        let mut frame_sent = true;
-        for fragment in fragments {
-            Packet::Video(fragment).encode(&mut self.packet);
-            if let Err(error) = self.flags.socket.send_to(&self.packet, peer) {
-                warn!("Video send to {peer} failed: {error}");
-                frame_sent = false;
-                break;
-            }
-            self.stats_bytes = self.stats_bytes.saturating_add(self.packet.len() as u64);
-        }
+        let frame = EncodedHardwareFrame {
+            frame_id: self.frame_id,
+            timestamp_us,
+            is_keyframe,
+            data: encoded,
+        };
         self.frame_id = self.frame_id.wrapping_add(1);
-        if frame_sent {
-            self.stats_frames = self.stats_frames.saturating_add(1);
+        if self.flags.encoded_frames.try_send(frame).is_err() {
+            // The sender is behind. Drop immediately and make the next
+            // successfully queued frame independently decodable.
+            self.flags.force_keyframe.store(true, Ordering::Release);
         }
-        self.report_stats();
         Ok(())
     }
 
@@ -340,21 +346,96 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
     }
 }
 
-impl HardwareCapture {
-    fn report_stats(&mut self) {
-        let elapsed = self.stats_started.elapsed();
-        if elapsed < Duration::from_secs(1) {
-            return;
+#[allow(clippy::too_many_arguments)]
+fn spawn_hardware_sender(
+    socket: Arc<UdpSocket>,
+    running: Arc<AtomicBool>,
+    active_peer: Arc<Mutex<Option<SocketAddr>>>,
+    force_keyframe: Arc<AtomicBool>,
+    events: mpsc::Sender<SessionEvent>,
+    encoded_frames: mpsc::Receiver<EncodedHardwareFrame>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut packet = Vec::with_capacity(MAX_DATAGRAM_SIZE);
+        let mut stats_started = Instant::now();
+        let mut stats_frames = 0_u64;
+        let mut stats_bytes = 0_u64;
+
+        while running.load(Ordering::Relaxed) {
+            let frame = match encoded_frames.recv_timeout(Duration::from_millis(20)) {
+                Ok(frame) => frame,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    report_sender_stats(
+                        &events,
+                        &mut stats_started,
+                        &mut stats_frames,
+                        &mut stats_bytes,
+                    );
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let Some(peer) = *active_peer.lock().unwrap() else {
+                continue;
+            };
+            let fragments = match fragment_video_frame(
+                frame.frame_id,
+                frame.timestamp_us,
+                frame.is_keyframe,
+                &frame.data,
+            ) {
+                Ok(fragments) => fragments,
+                Err(error) => {
+                    let _ = events.send(SessionEvent::Error(format!(
+                        "NVENC frame cannot be packetized: {error}"
+                    )));
+                    force_keyframe.store(true, Ordering::Release);
+                    continue;
+                }
+            };
+
+            let mut frame_sent = true;
+            for fragment in fragments {
+                Packet::Video(fragment).encode(&mut packet);
+                if let Err(error) = socket.send_to(&packet, peer) {
+                    warn!("Video send to {peer} failed: {error}");
+                    frame_sent = false;
+                    force_keyframe.store(true, Ordering::Release);
+                    break;
+                }
+                stats_bytes = stats_bytes.saturating_add(packet.len() as u64);
+            }
+            if frame_sent {
+                stats_frames = stats_frames.saturating_add(1);
+            }
+            report_sender_stats(
+                &events,
+                &mut stats_started,
+                &mut stats_frames,
+                &mut stats_bytes,
+            );
         }
-        let seconds = elapsed.as_secs_f32();
-        let _ = self.flags.events.send(SessionEvent::Stats {
-            fps: self.stats_frames as f32 / seconds,
-            megabits_per_second: self.stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
-        });
-        self.stats_started = Instant::now();
-        self.stats_frames = 0;
-        self.stats_bytes = 0;
+    })
+}
+
+fn report_sender_stats(
+    events: &mpsc::Sender<SessionEvent>,
+    stats_started: &mut Instant,
+    stats_frames: &mut u64,
+    stats_bytes: &mut u64,
+) {
+    let elapsed = stats_started.elapsed();
+    if elapsed < Duration::from_secs(1) {
+        return;
     }
+    let seconds = elapsed.as_secs_f32();
+    let _ = events.send(SessionEvent::Stats {
+        fps: *stats_frames as f32 / seconds,
+        megabits_per_second: *stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+    });
+    *stats_started = Instant::now();
+    *stats_frames = 0;
+    *stats_bytes = 0;
 }
 
 fn create_output_texture(

@@ -16,6 +16,7 @@ opus = "0.3.0"
 rayon = "1.10.0"
 scap = "0.0.8"
 serde_json.workspace = true
+socket2 = "0.6.3"
 tracing.workspace = true
 tracing-subscriber = "0.3.19"
 
