@@ -768,9 +768,8 @@ fn spawn_encoder(
             .complexity(Complexity::Low)
             .adaptive_quantization(false)
             .background_detection(false)
-            .skip_frames(false)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(frames_per_second))
-            .max_slice_len(32 * 1024);
+            .skip_frames(true)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(frames_per_second));
         let mut encoder = match Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
         {
             Ok(encoder) => encoder,

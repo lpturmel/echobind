@@ -41,8 +41,8 @@ use windows::{
             Direct3D11::{
                 ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
                 ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-                ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_VIDEO_ENCODER,
-                D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+                ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_TEX2D_VPIV,
+                D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
                 D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
                 D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
@@ -454,7 +454,13 @@ fn create_output_texture(
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER).0 as u32,
+        // NVENC accepts externally allocated DirectX textures through
+        // nvEncRegisterResource and does not require the Direct3D video-encoder
+        // bind flag. That flag targets the D3D11.1 video-encoder API and some
+        // drivers reject it for BGRA textures with E_INVALIDARG. Render-target
+        // binding is retained because the D3D11 video processor writes here
+        // when downscaling.
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
         CPUAccessFlags: 0,
         MiscFlags: 0,
     };
