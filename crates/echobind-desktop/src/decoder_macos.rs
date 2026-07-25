@@ -44,8 +44,17 @@ pub(super) fn run_decoder(
     let mut format_description = None::<CMFormatDescription>;
     let mut parameter_sets = None::<(Vec<u8>, Vec<u8>)>;
     let decode_started = Arc::new(Mutex::new(BTreeMap::<i64, Instant>::new()));
+    let mut decoder_generation = decode_queue.generation();
 
     while running.load(Ordering::Relaxed) {
+        let generation = decode_queue.generation();
+        if generation != decoder_generation {
+            decoder = None;
+            format_description = None;
+            parameter_sets = None;
+            decode_started.lock().unwrap().clear();
+            decoder_generation = generation;
+        }
         let Some(received) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
             continue;
         };
@@ -86,6 +95,8 @@ pub(super) fn run_decoder(
                 };
                 let session = match create_decoder(
                     &description,
+                    decode_queue.clone(),
+                    decoder_generation,
                     latest_frame.clone(),
                     metrics.clone(),
                     needs_keyframe.clone(),
@@ -158,8 +169,11 @@ fn mark_corrupt_frame(metrics: &ClientMetrics, needs_keyframe: &AtomicBool, erro
     tracing::warn!("Discarding invalid H.264 frame: {error}");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_decoder(
     description: &CMFormatDescription,
+    decode_queue: DecodeQueue,
+    decoder_generation: u64,
     latest_frame: LatestFrame,
     metrics: Arc<ClientMetrics>,
     needs_keyframe: Arc<AtomicBool>,
@@ -196,6 +210,9 @@ fn create_decoder(
         description,
         Some(&attributes),
         move |decoded| {
+            if decode_queue.generation() != decoder_generation {
+                return;
+            }
             let decode_elapsed = decode_started
                 .lock()
                 .unwrap()

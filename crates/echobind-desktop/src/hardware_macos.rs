@@ -1,6 +1,6 @@
 use super::{
     ensure_software_capture_available, spawn_capture, spawn_encoder, CaptureSlot, SessionEvent,
-    VideoResolution, VIDEO_STALE_AGE,
+    VideoResolution, VIDEO_SEND_STALE_AGE,
 };
 use echobind_core::{
     protocol::{Packet, MAX_DATAGRAM_SIZE},
@@ -180,7 +180,7 @@ fn run_hardware_pipeline(
             continue;
         };
         let capture_elapsed = captured_at.elapsed();
-        if capture_elapsed > VIDEO_STALE_AGE {
+        if capture_elapsed > VIDEO_SEND_STALE_AGE {
             force_keyframe.store(true, Ordering::Release);
             continue;
         }
@@ -218,7 +218,7 @@ fn run_hardware_pipeline(
             force_keyframe.store(false, Ordering::Relaxed);
         }
         encoded_any = true;
-        if captured_at.elapsed() > VIDEO_STALE_AGE {
+        if captured_at.elapsed() > VIDEO_SEND_STALE_AGE {
             force_keyframe.store(true, Ordering::Release);
             continue;
         }

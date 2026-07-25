@@ -1,4 +1,4 @@
-use std::{convert::TryInto, fmt};
+use std::{borrow::Cow, convert::TryInto, fmt};
 
 const MAGIC: &[u8; 4] = b"ECB2";
 const HEADER_LEN: usize = MAGIC.len() + 1;
@@ -6,6 +6,8 @@ const AUDIO_HEADER_LEN: usize = 12;
 const VIDEO_HEADER_LEN: usize = 21;
 const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
+const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
+pub const VIDEO_RECOVERY_HEADER_LEN: usize = 4;
 
 // The standard mode keeps the complete IPv6 packet below an Ethernet 1500-byte
 // MTU. Jumbo mode is only used after the client advertises support and the host
@@ -20,7 +22,7 @@ pub const STANDARD_VIDEO_FRAGMENT_PAYLOAD: usize =
 pub const MAX_VIDEO_FRAGMENT_PAYLOAD: usize = MAX_DATAGRAM_SIZE - HEADER_LEN - VIDEO_HEADER_LEN;
 pub const MAX_VIDEO_FRAME_SIZE: usize = 8 * 1024 * 1024;
 pub const MAX_VIDEO_FRAGMENTS: usize =
-    MAX_VIDEO_FRAME_SIZE.div_ceil(STANDARD_VIDEO_FRAGMENT_PAYLOAD);
+    MAX_VIDEO_FRAME_SIZE.div_ceil(STANDARD_VIDEO_FRAGMENT_PAYLOAD - VIDEO_RECOVERY_HEADER_LEN);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Packet<'a> {
@@ -42,14 +44,15 @@ pub struct AudioFrame<'a> {
     pub payload: &'a [u8],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoFragment<'a> {
     pub frame_id: u64,
     pub timestamp_us: u64,
     pub index: u16,
     pub total: u16,
     pub is_keyframe: bool,
-    pub payload: &'a [u8],
+    pub is_recovery: bool,
+    pub payload: Cow<'a, [u8]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,8 +105,11 @@ impl Packet<'_> {
                 out.extend_from_slice(&fragment.timestamp_us.to_be_bytes());
                 out.extend_from_slice(&fragment.index.to_be_bytes());
                 out.extend_from_slice(&fragment.total.to_be_bytes());
-                out.push(u8::from(fragment.is_keyframe));
-                out.extend_from_slice(fragment.payload);
+                out.push(
+                    u8::from(fragment.is_keyframe)
+                        | (u8::from(fragment.is_recovery) * VIDEO_FLAG_RECOVERY),
+                );
+                out.extend_from_slice(fragment.payload.as_ref());
             }
             Packet::VideoKeyframeRequest => {
                 Self::encode_packet(Self::VIDEO_KEYFRAME_REQUEST, &[], out);
@@ -227,11 +233,14 @@ fn parse_video_fragment(payload: &[u8]) -> Result<VideoFragment<'_>, PacketParse
     );
     let flags = payload[20];
 
+    let is_recovery = flags & VIDEO_FLAG_RECOVERY != 0;
     if total == 0
-        || index >= total
+        || (!is_recovery && index >= total)
+        || (is_recovery && index != total)
         || total as usize > MAX_VIDEO_FRAGMENTS
-        || flags & !VIDEO_FLAG_KEYFRAME != 0
+        || flags & !(VIDEO_FLAG_KEYFRAME | VIDEO_FLAG_RECOVERY) != 0
         || payload.len() - VIDEO_HEADER_LEN > MAX_VIDEO_FRAGMENT_PAYLOAD
+        || (is_recovery && payload.len() - VIDEO_HEADER_LEN <= VIDEO_RECOVERY_HEADER_LEN)
     {
         return Err(PacketParseError::Invalid);
     }
@@ -250,7 +259,8 @@ fn parse_video_fragment(payload: &[u8]) -> Result<VideoFragment<'_>, PacketParse
         index,
         total,
         is_keyframe: flags & VIDEO_FLAG_KEYFRAME != 0,
-        payload: &payload[VIDEO_HEADER_LEN..],
+        is_recovery,
+        payload: Cow::Borrowed(&payload[VIDEO_HEADER_LEN..]),
     })
 }
 
@@ -371,9 +381,10 @@ mod tests {
             index: 1,
             total: 3,
             is_keyframe: true,
-            payload: &[4, 5, 6],
+            is_recovery: false,
+            payload: Cow::Borrowed(&[4, 5, 6]),
         };
-        let encoded = round_trip(Packet::Video(fragment));
+        let encoded = round_trip(Packet::Video(fragment.clone()));
         assert_eq!(
             Packet::try_from(encoded.as_slice()),
             Ok(Packet::Video(fragment))
@@ -390,7 +401,8 @@ mod tests {
             index: 0,
             total: 1,
             is_keyframe: false,
-            payload: &payload,
+            is_recovery: false,
+            payload: Cow::Borrowed(&payload),
         };
         let encoded = round_trip(Packet::Video(fragment));
         assert_eq!(

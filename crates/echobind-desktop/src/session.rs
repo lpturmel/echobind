@@ -45,12 +45,15 @@ mod hardware_macos;
 #[path = "hardware_windows.rs"]
 mod hardware_windows;
 
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const RECONNECT_GRACE: Duration = Duration::from_secs(30);
+const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
 const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(50);
 const VIDEO_DECODE_QUEUE_CAPACITY: usize = 2;
 const VIDEO_REORDER_WINDOW: usize = 2;
 pub(super) const VIDEO_STALE_AGE: Duration = Duration::from_millis(25);
+pub(super) const VIDEO_SEND_STALE_AGE: Duration = Duration::from_millis(50);
 const CLIENT_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const HOST_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const HELLO_INTERVAL: Duration = Duration::from_millis(400);
@@ -174,6 +177,7 @@ pub(super) struct DecodeQueue {
 struct DecodeQueueState {
     frames: VecDeque<ReceivedVideoFrame>,
     waiting_for_keyframe: bool,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +232,12 @@ impl DecodeQueue {
         let mut state = self.inner.0.lock().unwrap();
         state.frames.clear();
         state.waiting_for_keyframe = true;
+        state.generation = state.generation.wrapping_add(1);
+        self.inner.1.notify_all();
+    }
+
+    fn generation(&self) -> u64 {
+        self.inner.0.lock().unwrap().generation
     }
 }
 
@@ -551,8 +561,26 @@ impl DesktopSession {
             queue.inner.1.notify_all();
         }
         self.host_commands.take();
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
+        self.audio_commands.take();
+        let mut handles = self.handles.drain(..);
+        // The network worker owns the UDP socket and has a 20 ms read timeout.
+        // Join it first so an immediate restart can safely bind the same port.
+        if let Some(network_handle) = handles.next() {
+            let _ = network_handle.join();
+        }
+        let handles: Vec<_> = handles.collect();
+        if !handles.is_empty() {
+            // GPU encoders and platform audio APIs can take several seconds to
+            // retire outstanding buffers. Reap them away from egui's render
+            // thread so Stop remains responsive and platform teardown cannot
+            // block inside a UI callback.
+            let _ = thread::Builder::new()
+                .name("echobind-session-shutdown".to_owned())
+                .spawn(move || {
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                });
         }
     }
 }
@@ -654,6 +682,7 @@ fn spawn_host_network(
         let mut response = Vec::with_capacity(MAX_DATAGRAM_SIZE);
         let mut pending_peer = None::<(SocketAddr, usize)>;
         let mut last_seen = None::<Instant>;
+        let mut reconnect_peer = None::<(SocketAddr, usize, Instant)>;
 
         while running.load(Ordering::Relaxed) {
             while let Ok(command) = commands.try_recv() {
@@ -672,6 +701,7 @@ fn spawn_host_network(
                         active_datagram_size.store(datagram_size, Ordering::Release);
                         *active_peer.lock().unwrap() = Some(peer);
                         pending_peer = None;
+                        reconnect_peer = None;
                         last_seen = Some(Instant::now());
                         force_keyframe.store(true, Ordering::Relaxed);
                         let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
@@ -726,6 +756,36 @@ fn spawn_host_network(
                             Packet::Config(config_json).encode(&mut response);
                             let _ = socket.send_to(&response, peer);
                         }
+                        Packet::Hello { .. }
+                            if current_peer.is_none()
+                                && reconnect_peer.is_some_and(|(trusted, _, since)| {
+                                    trusted == peer && since.elapsed() < RECONNECT_GRACE
+                                }) =>
+                        {
+                            let (_, datagram_size, _) = reconnect_peer
+                                .take()
+                                .expect("the reconnect peer was just matched");
+                            active_datagram_size.store(datagram_size, Ordering::Release);
+                            *active_peer.lock().unwrap() = Some(peer);
+                            last_seen = Some(Instant::now());
+                            force_keyframe.store(true, Ordering::Release);
+                            let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
+                                &jumbo_config_json
+                            } else {
+                                &standard_config_json
+                            };
+                            Packet::Config(config_json).encode(&mut response);
+                            if let Err(error) = socket.send_to(&response, peer) {
+                                *active_peer.lock().unwrap() = None;
+                                reconnect_peer = Some((peer, datagram_size, Instant::now()));
+                                last_seen = None;
+                                let _ = events.send(SessionEvent::Error(format!(
+                                    "Unable to restore {peer}: {error}"
+                                )));
+                            } else {
+                                let _ = events.send(SessionEvent::Connected(peer));
+                            }
+                        }
                         Packet::Hello { max_datagram_size } if current_peer.is_none() => {
                             let advertised = usize::from(max_datagram_size)
                                 .clamp(STANDARD_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
@@ -772,12 +832,20 @@ fn spawn_host_network(
 
             if last_seen.is_some_and(|seen| seen.elapsed() >= CONNECTION_TIMEOUT) {
                 if let Some(peer) = active_peer.lock().unwrap().take() {
+                    reconnect_peer = Some((
+                        peer,
+                        active_datagram_size.load(Ordering::Acquire),
+                        Instant::now(),
+                    ));
                     let _ = events.send(SessionEvent::Disconnected(format!(
                         "{peer} stopped responding"
                     )));
                 }
-                active_datagram_size.store(STANDARD_DATAGRAM_SIZE, Ordering::Release);
                 last_seen = None;
+            }
+            if reconnect_peer.is_some_and(|(_, _, since)| since.elapsed() >= RECONNECT_GRACE) {
+                reconnect_peer = None;
+                active_datagram_size.store(STANDARD_DATAGRAM_SIZE, Ordering::Release);
             }
         }
     })
@@ -919,7 +987,7 @@ fn spawn_encoder(
             let Some(capture) = capture else {
                 continue;
             };
-            if capture.captured_at.elapsed() > VIDEO_STALE_AGE {
+            if capture.captured_at.elapsed() > VIDEO_SEND_STALE_AGE {
                 force_keyframe.store(true, Ordering::Release);
                 continue;
             }
@@ -957,7 +1025,7 @@ fn spawn_encoder(
                 .elapsed()
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
-            if capture.captured_at.elapsed() > VIDEO_STALE_AGE {
+            if capture.captured_at.elapsed() > VIDEO_SEND_STALE_AGE {
                 force_keyframe.store(true, Ordering::Release);
                 continue;
             }
@@ -1088,7 +1156,7 @@ fn spawn_client_network(
                 completed_frames.clear();
                 next_frame_id = None;
                 waiting_for_keyframe = true;
-                if accepted && last_keyframe_request.elapsed() >= Duration::from_millis(100) {
+                if accepted && last_keyframe_request.elapsed() >= KEYFRAME_RETRY_INTERVAL {
                     request_keyframe(&socket, &mut outgoing);
                     last_keyframe_request = Instant::now();
                 }
@@ -1098,7 +1166,7 @@ fn spawn_client_network(
                 completed_frames.clear();
                 next_frame_id = None;
                 waiting_for_keyframe = true;
-                if accepted && last_keyframe_request.elapsed() >= Duration::from_millis(100) {
+                if accepted && last_keyframe_request.elapsed() >= KEYFRAME_RETRY_INTERVAL {
                     request_keyframe(&socket, &mut outgoing);
                     last_keyframe_request = Instant::now();
                 }
@@ -1297,7 +1365,7 @@ fn spawn_client_network(
                                     if waiting_for_keyframe && !frame.is_keyframe {
                                         metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                                         if last_keyframe_request.elapsed()
-                                            >= Duration::from_millis(250)
+                                            >= KEYFRAME_RETRY_INTERVAL
                                         {
                                             request_keyframe(&socket, &mut outgoing);
                                             last_keyframe_request = Instant::now();
@@ -1378,7 +1446,7 @@ fn spawn_client_network(
                                     }
                                     if waiting_for_keyframe
                                         && last_keyframe_request.elapsed()
-                                            >= Duration::from_millis(100)
+                                            >= KEYFRAME_RETRY_INTERVAL
                                     {
                                         request_keyframe(&socket, &mut outgoing);
                                         last_keyframe_request = Instant::now();
@@ -1394,8 +1462,7 @@ fn spawn_client_network(
                                     completed_frames.clear();
                                     next_frame_id = None;
                                     waiting_for_keyframe = true;
-                                    if last_keyframe_request.elapsed() >= Duration::from_millis(250)
-                                    {
+                                    if last_keyframe_request.elapsed() >= KEYFRAME_RETRY_INTERVAL {
                                         request_keyframe(&socket, &mut outgoing);
                                         last_keyframe_request = Instant::now();
                                     }
@@ -1422,9 +1489,17 @@ fn spawn_client_network(
 
             if accepted && last_server_response.elapsed() >= CONNECTION_TIMEOUT {
                 let _ = events.send(SessionEvent::Disconnected(
-                    "Host stopped responding".to_owned(),
+                    "Host stopped responding; reconnecting…".to_owned(),
                 ));
-                return;
+                accepted = false;
+                reassembler = VideoReassembler::new(8, VIDEO_REASSEMBLY_AGE);
+                reassembly_started.clear();
+                completed_frames.clear();
+                decode_queue.require_keyframe();
+                next_frame_id = None;
+                waiting_for_keyframe = true;
+                last_hello = Instant::now() - HELLO_INTERVAL;
+                last_server_response = Instant::now();
             }
 
             let elapsed = stats_started.elapsed();
@@ -1518,11 +1593,18 @@ fn run_software_video_decoder(
 ) -> Result<(), String> {
     let mut decoder =
         Decoder::new().map_err(|error| format!("Unable to initialize H.264 decoder: {error}"))?;
+    let mut decoder_generation = decode_queue.generation();
     let _ = events.send(SessionEvent::VideoBackend(
         "OpenH264 software decoder · separate receive thread".to_owned(),
     ));
 
     while running.load(Ordering::Relaxed) {
+        let generation = decode_queue.generation();
+        if generation != decoder_generation {
+            decoder = Decoder::new()
+                .map_err(|error| format!("Unable to reset H.264 decoder: {error}"))?;
+            decoder_generation = generation;
+        }
         let Some(received) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
             continue;
         };

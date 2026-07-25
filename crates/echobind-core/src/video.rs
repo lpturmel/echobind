@@ -1,9 +1,10 @@
 use crate::protocol::{
     VideoFragment, MAX_DATAGRAM_SIZE, MAX_VIDEO_FRAGMENTS, MAX_VIDEO_FRAGMENT_PAYLOAD,
-    MAX_VIDEO_FRAME_SIZE, STANDARD_DATAGRAM_SIZE,
+    MAX_VIDEO_FRAME_SIZE, STANDARD_DATAGRAM_SIZE, VIDEO_RECOVERY_HEADER_LEN,
 };
 use std::{
-    collections::HashMap,
+    borrow::Cow,
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     time::{Duration, Instant},
 };
@@ -71,13 +72,18 @@ pub fn fragment_video_frame_with_datagram_size(
     if !(STANDARD_DATAGRAM_SIZE..=MAX_DATAGRAM_SIZE).contains(&datagram_size) {
         return Err(VideoFragmentationError::InvalidDatagramSize);
     }
-    let fragment_payload = datagram_size - (MAX_DATAGRAM_SIZE - MAX_VIDEO_FRAGMENT_PAYLOAD);
+    // Reserve four payload bytes in every datagram so the parity packet can
+    // carry the exact encoded-frame length without exceeding the negotiated
+    // MTU. One XOR packet per frame repairs any single lost UDP fragment.
+    let fragment_payload = datagram_size
+        - (MAX_DATAGRAM_SIZE - MAX_VIDEO_FRAGMENT_PAYLOAD)
+        - VIDEO_RECOVERY_HEADER_LEN;
     let total = payload.len().div_ceil(fragment_payload);
     if total > MAX_VIDEO_FRAGMENTS || total > u16::MAX as usize {
         return Err(VideoFragmentationError::FrameTooLarge);
     }
 
-    Ok(payload
+    let mut fragments: Vec<_> = payload
         .chunks(fragment_payload)
         .enumerate()
         .map(|(index, chunk)| VideoFragment {
@@ -86,9 +92,30 @@ pub fn fragment_video_frame_with_datagram_size(
             index: index as u16,
             total: total as u16,
             is_keyframe,
-            payload: chunk,
+            is_recovery: false,
+            payload: Cow::Borrowed(chunk),
         })
-        .collect())
+        .collect();
+    if total > 1 {
+        let mut recovery = vec![0_u8; VIDEO_RECOVERY_HEADER_LEN + fragment_payload];
+        recovery[..VIDEO_RECOVERY_HEADER_LEN]
+            .copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        for chunk in payload.chunks(fragment_payload) {
+            for (parity, byte) in recovery[VIDEO_RECOVERY_HEADER_LEN..].iter_mut().zip(chunk) {
+                *parity ^= *byte;
+            }
+        }
+        fragments.push(VideoFragment {
+            frame_id,
+            timestamp_us,
+            index: total as u16,
+            total: total as u16,
+            is_keyframe,
+            is_recovery: true,
+            payload: Cow::Owned(recovery),
+        });
+    }
+    Ok(fragments)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +143,8 @@ impl std::error::Error for VideoReassemblyError {}
 
 pub struct VideoReassembler {
     frames: HashMap<u64, PendingVideoFrame>,
+    completed: HashSet<u64>,
+    completed_order: VecDeque<u64>,
     max_pending_frames: usize,
     max_age: Duration,
 }
@@ -128,6 +157,8 @@ impl VideoReassembler {
         );
         Self {
             frames: HashMap::new(),
+            completed: HashSet::new(),
+            completed_order: VecDeque::new(),
             max_pending_frames,
             max_age,
         }
@@ -138,7 +169,11 @@ impl VideoReassembler {
         fragment: VideoFragment<'_>,
     ) -> Result<Option<VideoFrame>, VideoReassemblyError> {
         self.expire_stale();
-        self.validate_fragment(fragment)?;
+        self.validate_fragment(&fragment)?;
+        let frame_id = fragment.frame_id;
+        if self.completed.contains(&frame_id) {
+            return Ok(None);
+        }
 
         if !self.frames.contains_key(&fragment.frame_id)
             && self.frames.len() >= self.max_pending_frames
@@ -149,10 +184,10 @@ impl VideoReassembler {
         let frame = self
             .frames
             .entry(fragment.frame_id)
-            .or_insert_with(|| PendingVideoFrame::new(fragment));
+            .or_insert_with(|| PendingVideoFrame::new(&fragment));
 
-        if !frame.matches(fragment) {
-            self.frames.remove(&fragment.frame_id);
+        if !frame.matches(&fragment) {
+            self.frames.remove(&frame_id);
             return Err(VideoReassemblyError::FrameMetadataChanged);
         }
 
@@ -161,8 +196,15 @@ impl VideoReassembler {
             return Ok(None);
         }
 
-        let frame = self.frames.remove(&fragment.frame_id).unwrap();
-        frame.finish().map(Some)
+        let frame = self.frames.remove(&frame_id).unwrap().finish()?;
+        self.completed.insert(frame_id);
+        self.completed_order.push_back(frame_id);
+        while self.completed_order.len() > 64 {
+            if let Some(expired) = self.completed_order.pop_front() {
+                self.completed.remove(&expired);
+            }
+        }
+        Ok(Some(frame))
     }
 
     pub fn pending_frames(&self) -> usize {
@@ -177,12 +219,14 @@ impl VideoReassembler {
         before - self.frames.len()
     }
 
-    fn validate_fragment(&self, fragment: VideoFragment<'_>) -> Result<(), VideoReassemblyError> {
+    fn validate_fragment(&self, fragment: &VideoFragment<'_>) -> Result<(), VideoReassemblyError> {
         if fragment.total == 0
-            || fragment.index >= fragment.total
+            || (!fragment.is_recovery && fragment.index >= fragment.total)
+            || (fragment.is_recovery && fragment.index != fragment.total)
             || fragment.total as usize > MAX_VIDEO_FRAGMENTS
             || fragment.payload.is_empty()
             || fragment.payload.len() > MAX_VIDEO_FRAGMENT_PAYLOAD
+            || (fragment.is_recovery && fragment.payload.len() <= VIDEO_RECOVERY_HEADER_LEN)
         {
             return Err(VideoReassemblyError::InvalidFragment);
         }
@@ -209,11 +253,12 @@ struct PendingVideoFrame {
     chunks: Vec<Option<Vec<u8>>>,
     received: usize,
     encoded_size: usize,
+    recovery: Option<Vec<u8>>,
     last_updated: Instant,
 }
 
 impl PendingVideoFrame {
-    fn new(fragment: VideoFragment<'_>) -> Self {
+    fn new(fragment: &VideoFragment<'_>) -> Self {
         Self {
             frame_id: fragment.frame_id,
             timestamp_us: fragment.timestamp_us,
@@ -222,11 +267,12 @@ impl PendingVideoFrame {
             chunks: vec![None; fragment.total as usize],
             received: 0,
             encoded_size: 0,
+            recovery: None,
             last_updated: Instant::now(),
         }
     }
 
-    fn matches(&self, fragment: VideoFragment<'_>) -> bool {
+    fn matches(&self, fragment: &VideoFragment<'_>) -> bool {
         self.timestamp_us == fragment.timestamp_us
             && self.is_keyframe == fragment.is_keyframe
             && self.total == fragment.total
@@ -234,20 +280,30 @@ impl PendingVideoFrame {
 
     fn push(&mut self, fragment: VideoFragment<'_>) {
         self.last_updated = Instant::now();
+        if fragment.is_recovery {
+            if self.recovery.is_none() {
+                self.recovery = Some(fragment.payload.into_owned());
+            }
+            return;
+        }
         let slot = &mut self.chunks[fragment.index as usize];
         if slot.is_none() {
             self.encoded_size += fragment.payload.len();
-            *slot = Some(fragment.payload.to_vec());
+            *slot = Some(fragment.payload.into_owned());
             self.received += 1;
         }
     }
 
     fn is_complete(&self) -> bool {
         self.received == self.total as usize
+            || (self.recovery.is_some() && self.received + 1 == self.total as usize)
     }
 
-    fn finish(self) -> Result<VideoFrame, VideoReassemblyError> {
-        if self.encoded_size > MAX_VIDEO_FRAME_SIZE {
+    fn finish(mut self) -> Result<VideoFrame, VideoReassemblyError> {
+        if self.received + 1 == self.total as usize {
+            self.recover_missing_fragment()?;
+        }
+        if self.encoded_size > MAX_VIDEO_FRAME_SIZE || self.received != self.total as usize {
             return Err(VideoReassemblyError::FrameTooLarge);
         }
 
@@ -263,6 +319,55 @@ impl PendingVideoFrame {
             payload,
         })
     }
+
+    fn recover_missing_fragment(&mut self) -> Result<(), VideoReassemblyError> {
+        let recovery = self
+            .recovery
+            .take()
+            .ok_or(VideoReassemblyError::InvalidFragment)?;
+        let declared_size = u32::from_be_bytes(
+            recovery[..VIDEO_RECOVERY_HEADER_LEN]
+                .try_into()
+                .map_err(|_| VideoReassemblyError::InvalidFragment)?,
+        ) as usize;
+        let chunk_size = recovery.len() - VIDEO_RECOVERY_HEADER_LEN;
+        let total = self.total as usize;
+        if declared_size == 0
+            || declared_size > MAX_VIDEO_FRAME_SIZE
+            || chunk_size == 0
+            || declared_size <= chunk_size.saturating_mul(total.saturating_sub(1))
+            || declared_size > chunk_size.saturating_mul(total)
+        {
+            return Err(VideoReassemblyError::InvalidFragment);
+        }
+        let missing = self
+            .chunks
+            .iter()
+            .position(Option::is_none)
+            .ok_or(VideoReassemblyError::InvalidFragment)?;
+        let missing_size = if missing + 1 == total {
+            declared_size - chunk_size * (total - 1)
+        } else {
+            chunk_size
+        };
+        let mut recovered = recovery[VIDEO_RECOVERY_HEADER_LEN..].to_vec();
+        for chunk in self.chunks.iter().flatten() {
+            if chunk.len() > recovered.len() {
+                return Err(VideoReassemblyError::InvalidFragment);
+            }
+            for (target, byte) in recovered.iter_mut().zip(chunk) {
+                *target ^= *byte;
+            }
+        }
+        recovered.truncate(missing_size);
+        self.encoded_size = self.encoded_size.saturating_add(recovered.len());
+        self.chunks[missing] = Some(recovered);
+        self.received += 1;
+        if self.encoded_size != declared_size {
+            return Err(VideoReassemblyError::InvalidFragment);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -274,12 +379,12 @@ mod tests {
     fn fragments_and_reassembles_out_of_order() {
         let payload = vec![7; STANDARD_VIDEO_FRAGMENT_PAYLOAD * 2 + 17];
         let fragments = fragment_video_frame(42, 123_456, true, &payload).unwrap();
-        assert_eq!(fragments.len(), 3);
+        assert_eq!(fragments.len(), 4);
 
         let mut reassembler = VideoReassembler::new(3, Duration::from_secs(1));
-        assert_eq!(reassembler.push(fragments[2]).unwrap(), None);
-        assert_eq!(reassembler.push(fragments[0]).unwrap(), None);
-        let frame = reassembler.push(fragments[1]).unwrap().unwrap();
+        assert_eq!(reassembler.push(fragments[2].clone()).unwrap(), None);
+        assert_eq!(reassembler.push(fragments[0].clone()).unwrap(), None);
+        let frame = reassembler.push(fragments[1].clone()).unwrap().unwrap();
 
         assert_eq!(frame.frame_id, 42);
         assert_eq!(frame.timestamp_us, 123_456);
@@ -293,12 +398,50 @@ mod tests {
         let fragments = fragment_video_frame(8, 99, false, &payload).unwrap();
         let mut reassembler = VideoReassembler::new(2, Duration::from_secs(1));
 
-        assert_eq!(reassembler.push(fragments[0]).unwrap(), None);
-        assert_eq!(reassembler.push(fragments[0]).unwrap(), None);
+        assert_eq!(reassembler.push(fragments[0].clone()).unwrap(), None);
+        assert_eq!(reassembler.push(fragments[0].clone()).unwrap(), None);
         assert_eq!(
-            reassembler.push(fragments[1]).unwrap().unwrap().payload,
+            reassembler
+                .push(fragments[1].clone())
+                .unwrap()
+                .unwrap()
+                .payload,
             payload
         );
+    }
+
+    #[test]
+    fn recovery_fragment_repairs_one_lost_datagram() {
+        let payload = (0..STANDARD_VIDEO_FRAGMENT_PAYLOAD * 3 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let fragments = fragment_video_frame(11, 500, false, &payload).unwrap();
+        let delayed_fragment = fragments[1].clone();
+        let mut reassembler = VideoReassembler::new(3, Duration::from_secs(1));
+        let mut completed = None;
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            if index != 1 {
+                completed = reassembler.push(fragment).unwrap().or(completed);
+            }
+        }
+        assert_eq!(completed.unwrap().payload, payload);
+        assert_eq!(reassembler.push(delayed_fragment).unwrap(), None);
+        assert_eq!(reassembler.pending_frames(), 0);
+    }
+
+    #[test]
+    fn recovery_fragment_does_not_emit_with_two_losses() {
+        let payload = vec![9; STANDARD_VIDEO_FRAGMENT_PAYLOAD * 3];
+        let fragments = fragment_video_frame(12, 600, false, &payload).unwrap();
+        let mut reassembler = VideoReassembler::new(3, Duration::from_secs(1));
+        let mut completed = None;
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            if index != 0 && index != 2 {
+                completed = reassembler.push(fragment).unwrap().or(completed);
+            }
+        }
+        assert!(completed.is_none());
+        assert_eq!(reassembler.pending_frames(), 1);
     }
 
     #[test]
@@ -308,8 +451,8 @@ mod tests {
         let second = fragment_video_frame(2, 1, false, &payload).unwrap();
         let mut reassembler = VideoReassembler::new(1, Duration::from_secs(1));
 
-        reassembler.push(first[0]).unwrap();
-        reassembler.push(second[0]).unwrap();
+        reassembler.push(first[0].clone()).unwrap();
+        reassembler.push(second[0].clone()).unwrap();
         assert_eq!(reassembler.pending_frames(), 1);
     }
 

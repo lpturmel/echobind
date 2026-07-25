@@ -1,6 +1,6 @@
 use super::{
     ensure_software_capture_available, spawn_capture, spawn_encoder, CaptureSlot, SessionEvent,
-    VideoResolution, VIDEO_STALE_AGE,
+    VideoResolution, VIDEO_SEND_STALE_AGE,
 };
 use echobind_core::{
     protocol::{Packet, MAX_DATAGRAM_SIZE},
@@ -777,6 +777,8 @@ fn spawn_hardware_sender(
         let mut stats_encode_us = 0_u64;
         let mut stats_send_us = 0_u64;
         let mut stats_encode_queue_us = 0_u64;
+        let mut last_sent_frame = None::<u64>;
+        let mut waiting_for_keyframe = true;
 
         while running.load(Ordering::Relaxed) {
             let frame = match encoded_frames.recv_timeout(Duration::from_millis(20)) {
@@ -797,11 +799,25 @@ fn spawn_hardware_sender(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             let encode_queue_elapsed = frame.encoded_at.elapsed();
-            if frame.captured_at.elapsed() > VIDEO_STALE_AGE {
+            if last_sent_frame.is_some_and(|last| frame.frame_id != last.wrapping_add(1)) {
+                waiting_for_keyframe = true;
+                force_keyframe.store(true, Ordering::Release);
+            }
+            if frame.captured_at.elapsed() > VIDEO_SEND_STALE_AGE {
+                waiting_for_keyframe = true;
                 force_keyframe.store(true, Ordering::Release);
                 continue;
             }
+            if waiting_for_keyframe && !frame.is_keyframe {
+                force_keyframe.store(true, Ordering::Release);
+                continue;
+            }
+            if frame.is_keyframe {
+                waiting_for_keyframe = false;
+            }
             let Some(peer) = *active_peer.lock().unwrap() else {
+                waiting_for_keyframe = true;
+                last_sent_frame = None;
                 continue;
             };
             let fragments = match fragment_video_frame_with_datagram_size(
@@ -816,6 +832,8 @@ fn spawn_hardware_sender(
                     let _ = events.send(SessionEvent::Error(format!(
                         "NVENC frame cannot be packetized: {error}"
                     )));
+                    waiting_for_keyframe = true;
+                    last_sent_frame = None;
                     force_keyframe.store(true, Ordering::Release);
                     continue;
                 }
@@ -834,6 +852,7 @@ fn spawn_hardware_sender(
                 stats_bytes = stats_bytes.saturating_add(packet.len() as u64);
             }
             if frame_sent {
+                last_sent_frame = Some(frame.frame_id);
                 stats_frames = stats_frames.saturating_add(1);
                 stats_capture_us = stats_capture_us.saturating_add(frame.capture_us);
                 stats_encode_us = stats_encode_us.saturating_add(frame.encode_us);
@@ -843,6 +862,9 @@ fn spawn_hardware_sender(
                 stats_encode_queue_us = stats_encode_queue_us.saturating_add(
                     encode_queue_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
                 );
+            } else {
+                waiting_for_keyframe = true;
+                last_sent_frame = None;
             }
             report_sender_stats(
                 &events,
