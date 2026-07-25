@@ -7,7 +7,10 @@ const VIDEO_HEADER_LEN: usize = 21;
 const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 
-pub const MAX_DATAGRAM_SIZE: usize = 1200;
+// Keep the complete IPv6 packet below the Ethernet 1500-byte MTU while using
+// most of each LAN datagram (40-byte IPv6 + 8-byte UDP + 1400-byte payload).
+// Avoiding IP fragmentation is essential for stable high-frame-rate video.
+pub const MAX_DATAGRAM_SIZE: usize = 1400;
 pub const MAX_CLIPBOARD_CHUNK_PAYLOAD: usize = 1024;
 pub const MAX_AUDIO_FRAME_PAYLOAD: usize = MAX_DATAGRAM_SIZE - HEADER_LEN - AUDIO_HEADER_LEN;
 pub const MAX_VIDEO_FRAGMENT_PAYLOAD: usize = MAX_DATAGRAM_SIZE - HEADER_LEN - VIDEO_HEADER_LEN;

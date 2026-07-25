@@ -1,6 +1,13 @@
-use crate::session::{DesktopSession, SessionEvent, VideoResolution};
+use crate::session::{DesktopSession, DisplayFrameData, SessionEvent, VideoResolution};
 use eframe::egui;
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -27,6 +34,7 @@ pub struct EchobindApp {
     pending_peer: Option<SocketAddr>,
     session: Option<DesktopSession>,
     texture: Option<GpuVideoTexture>,
+    nv12_ready: bool,
     render_state: eframe::egui_wgpu::RenderState,
     stream_fps: f32,
     received_fps: f32,
@@ -39,6 +47,16 @@ pub struct EchobindApp {
     audio_output_device: Option<String>,
     audio_backend: String,
     fullscreen: bool,
+    presented_frames: Arc<AtomicU64>,
+    present_latency_us: Arc<AtomicU64>,
+    present_fps: f32,
+    present_latency_ms: f32,
+    present_stats_at: Instant,
+    capture_ms: f32,
+    encode_ms: f32,
+    send_ms: f32,
+    reassembly_ms: f32,
+    decode_ms: f32,
 }
 
 impl EchobindApp {
@@ -49,6 +67,23 @@ impl EchobindApp {
             .wgpu_render_state
             .clone()
             .expect("Echobind requires the wgpu renderer");
+        let presented_frames = Arc::new(AtomicU64::new(0));
+        let present_latency_us = Arc::new(AtomicU64::new(0));
+        #[cfg(target_os = "macos")]
+        {
+            let video_renderer = crate::video_renderer_macos::MacVideoRenderer::new(
+                &render_state.device,
+                render_state.target_format,
+                presented_frames.clone(),
+                present_latency_us.clone(),
+            )
+            .expect("Echobind requires Metal video-texture interop");
+            render_state
+                .renderer
+                .write()
+                .callback_resources
+                .insert(video_renderer);
+        }
 
         Self {
             mode: Mode::Connect,
@@ -56,12 +91,13 @@ impl EchobindApp {
             server_ip: "127.0.0.1".to_owned(),
             port: 3013,
             frames_per_second: 60,
-            bitrate_mbps: 6,
+            bitrate_mbps: 20,
             resolution: VideoResolution::Native,
             status: "Ready".to_owned(),
             pending_peer: None,
             session: None,
             texture: None,
+            nv12_ready: false,
             render_state,
             stream_fps: 0.0,
             received_fps: 0.0,
@@ -74,6 +110,16 @@ impl EchobindApp {
             audio_output_device: None,
             audio_backend: "System default output".to_owned(),
             fullscreen: false,
+            presented_frames,
+            present_latency_us,
+            present_fps: 0.0,
+            present_latency_ms: 0.0,
+            present_stats_at: Instant::now(),
+            capture_ms: 0.0,
+            encode_ms: 0.0,
+            send_ms: 0.0,
+            reassembly_ms: 0.0,
+            decode_ms: 0.0,
         }
     }
 
@@ -126,21 +172,31 @@ impl EchobindApp {
                 SessionEvent::Stats {
                     fps,
                     megabits_per_second,
+                    capture_ms,
+                    encode_ms,
+                    send_ms,
                 } => {
                     self.stream_fps = fps;
                     self.received_fps = fps;
                     self.stream_mbps = megabits_per_second;
+                    self.capture_ms = capture_ms;
+                    self.encode_ms = encode_ms;
+                    self.send_ms = send_ms;
                 }
                 SessionEvent::ClientStats {
                     received_fps,
                     decoded_fps,
                     megabits_per_second,
                     dropped_frames,
+                    reassembly_ms,
+                    decode_ms,
                 } => {
                     self.received_fps = received_fps;
                     self.stream_fps = decoded_fps;
                     self.stream_mbps = megabits_per_second;
                     self.dropped_frames = dropped_frames;
+                    self.reassembly_ms = reassembly_ms;
+                    self.decode_ms = decode_ms;
                 }
                 SessionEvent::Error(error) => {
                     self.status = format!("Error: {error}");
@@ -152,6 +208,18 @@ impl EchobindApp {
             self.stream_width = frame.width as u32;
             self.stream_height = frame.height as u32;
             self.upload_frame(frame);
+        }
+        let present_elapsed = self.present_stats_at.elapsed();
+        if present_elapsed >= std::time::Duration::from_secs(1) {
+            let frames = self.presented_frames.swap(0, Ordering::Relaxed);
+            let latency_us = self.present_latency_us.swap(0, Ordering::Relaxed);
+            self.present_fps = frames as f32 / present_elapsed.as_secs_f32();
+            self.present_latency_ms = if frames == 0 {
+                0.0
+            } else {
+                latency_us as f32 / frames as f32 / 1_000.0
+            };
+            self.present_stats_at = Instant::now();
         }
 
         context.request_repaint_after(std::time::Duration::from_millis(8));
@@ -218,14 +286,59 @@ impl EchobindApp {
         self.stream_height = 0;
         self.video_backend = "initializing".to_owned();
         self.audio_backend = "System default output".to_owned();
+        self.present_fps = 0.0;
+        self.present_latency_ms = 0.0;
+        self.capture_ms = 0.0;
+        self.encode_ms = 0.0;
+        self.send_ms = 0.0;
+        self.reassembly_ms = 0.0;
+        self.decode_ms = 0.0;
         self.status = "Ready".to_owned();
     }
 
     fn upload_frame(&mut self, frame: crate::session::DisplayFrame) {
+        match frame.data {
+            DisplayFrameData::Rgba(rgba) => {
+                self.nv12_ready = false;
+                self.upload_rgba(frame.width, frame.height, &rgba);
+            }
+            #[cfg(target_os = "macos")]
+            DisplayFrameData::Nv12(pixel_buffer) => {
+                let import_result = {
+                    let mut renderer = self.render_state.renderer.write();
+                    renderer
+                        .callback_resources
+                        .get_mut::<crate::video_renderer_macos::MacVideoRenderer>()
+                        .ok_or_else(|| "Metal video renderer is unavailable".to_owned())
+                        .and_then(|video| {
+                            video.set_frame(
+                                &self.render_state.device,
+                                pixel_buffer,
+                                frame.decoded_at,
+                            )
+                        })
+                };
+                match import_result {
+                    Ok(()) => {
+                        self.nv12_ready = true;
+                        if let Some(texture) = self.texture.take() {
+                            self.render_state.renderer.write().free_texture(&texture.id);
+                        }
+                    }
+                    Err(error) => {
+                        self.nv12_ready = false;
+                        self.status = format!("Metal video import failed: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn upload_rgba(&mut self, width: usize, height: usize, rgba: &[u8]) {
         let needs_texture = self
             .texture
             .as_ref()
-            .is_none_or(|texture| texture.width != frame.width || texture.height != frame.height);
+            .is_none_or(|texture| texture.width != width || texture.height != height);
         if needs_texture {
             self.clear_texture();
             let texture =
@@ -234,8 +347,8 @@ impl EchobindApp {
                     .create_texture(&eframe::wgpu::TextureDescriptor {
                         label: Some("echobind_remote_video"),
                         size: eframe::wgpu::Extent3d {
-                            width: frame.width as u32,
-                            height: frame.height as u32,
+                            width: width as u32,
+                            height: height as u32,
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: 1,
@@ -255,8 +368,8 @@ impl EchobindApp {
             self.texture = Some(GpuVideoTexture {
                 texture,
                 id,
-                width: frame.width,
-                height: frame.height,
+                width,
+                height,
             });
         }
 
@@ -268,23 +381,34 @@ impl EchobindApp {
                 origin: eframe::wgpu::Origin3d::ZERO,
                 aspect: eframe::wgpu::TextureAspect::All,
             },
-            &frame.rgba,
+            rgba,
             eframe::wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some((frame.width * 4) as u32),
-                rows_per_image: Some(frame.height as u32),
+                bytes_per_row: Some((width * 4) as u32),
+                rows_per_image: Some(height as u32),
             },
             eframe::wgpu::Extent3d {
-                width: frame.width as u32,
-                height: frame.height as u32,
+                width: width as u32,
+                height: height as u32,
                 depth_or_array_layers: 1,
             },
         );
     }
 
     fn clear_texture(&mut self) {
+        self.nv12_ready = false;
         if let Some(texture) = self.texture.take() {
             self.render_state.renderer.write().free_texture(&texture.id);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(renderer) = self
+            .render_state
+            .renderer
+            .write()
+            .callback_resources
+            .get_mut::<crate::video_renderer_macos::MacVideoRenderer>()
+        {
+            renderer.clear();
         }
     }
 
@@ -347,7 +471,7 @@ impl EchobindApp {
                 ui.label("FPS");
                 ui.add(egui::DragValue::new(&mut self.frames_per_second).range(15..=120));
                 ui.label("Mbps");
-                ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=20));
+                ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=100));
             }
 
             let active = self.session.is_some();
@@ -367,7 +491,7 @@ impl EchobindApp {
                 self.stop();
             }
 
-            if self.texture.is_some() && ui.button("Fullscreen").clicked() {
+            if (self.texture.is_some() || self.nv12_ready) && ui.button("Fullscreen").clicked() {
                 self.set_fullscreen(ui.ctx(), true);
             }
         });
@@ -446,15 +570,24 @@ impl EchobindApp {
                     "{:.1} FPS sent · {:.2} Mbps · {resolution} H.264 · {} · {}",
                     self.stream_fps, self.stream_mbps, self.video_backend, self.audio_backend,
                 ));
+                ui.label(format!(
+                    "pipeline avg: capture {:.2} ms · encode {:.2} ms · send {:.2} ms",
+                    self.capture_ms, self.encode_ms, self.send_ms,
+                ));
             } else {
                 ui.label(format!(
-                    "{:.1} FPS decoded · {:.1} received · {} dropped · {:.2} Mbps · {resolution} H.264 · {} · {}",
+                    "{:.1} decoded · {:.1} received · {:.1} presented · {} dropped · {:.2} Mbps · {resolution} H.264 · {} · {}",
                     self.stream_fps,
                     self.received_fps,
+                    self.present_fps,
                     self.dropped_frames,
                     self.stream_mbps,
                     self.video_backend,
                     self.audio_backend,
+                ));
+                ui.label(format!(
+                    "pipeline avg: reassemble {:.2} ms · decode {:.2} ms · decode→present {:.2} ms",
+                    self.reassembly_ms, self.decode_ms, self.present_latency_ms,
                 ));
             }
         }
@@ -466,7 +599,7 @@ impl EchobindApp {
     }
 
     fn show_video(&self, ui: &mut egui::Ui) {
-        let Some(texture) = &self.texture else {
+        if self.texture.is_none() && !self.nv12_ready {
             ui.centered_and_justified(|ui| {
                 ui.label(if self.mode == Mode::Host {
                     "Start a server and accept a viewer to begin sharing."
@@ -475,16 +608,26 @@ impl EchobindApp {
                 });
             });
             return;
-        };
+        }
 
         let available = ui.available_size();
-        let source = egui::vec2(texture.width as f32, texture.height as f32);
+        let source = egui::vec2(self.stream_width as f32, self.stream_height as f32);
         let scale = (available.x / source.x)
             .min(available.y / source.y)
             .max(0.01);
         let display_size = source * scale;
         ui.centered_and_justified(|ui| {
-            ui.add(egui::Image::from_texture((texture.id, source)).fit_to_exact_size(display_size));
+            if self.nv12_ready {
+                let (_rect, _) = ui.allocate_exact_size(display_size, egui::Sense::hover());
+                #[cfg(target_os = "macos")]
+                ui.painter().add(egui::Shape::Callback(
+                    crate::video_renderer_macos::paint_callback(_rect),
+                ));
+            } else if let Some(texture) = &self.texture {
+                ui.add(
+                    egui::Image::from_texture((texture.id, source)).fit_to_exact_size(display_size),
+                );
+            }
         });
     }
 }

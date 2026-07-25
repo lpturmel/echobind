@@ -121,7 +121,16 @@ pub(super) type LatestFrame = Arc<Mutex<Option<DisplayFrame>>>;
 pub(super) struct DisplayFrame {
     pub width: usize,
     pub height: usize,
-    pub rgba: Vec<u8>,
+    pub data: DisplayFrameData,
+    #[cfg(target_os = "macos")]
+    pub decoded_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum DisplayFrameData {
+    Rgba(Vec<u8>),
+    #[cfg(target_os = "macos")]
+    Nv12(apple_cf::cv::CVPixelBuffer),
 }
 
 #[derive(Default)]
@@ -130,6 +139,10 @@ pub(super) struct ClientMetrics {
     reassembled_frames: AtomicU64,
     decoded_frames: AtomicU64,
     dropped_frames: AtomicU64,
+    reassembly_us: AtomicU64,
+    reassembly_samples: AtomicU64,
+    decode_us: AtomicU64,
+    decode_samples: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -211,12 +224,17 @@ pub enum SessionEvent {
     Stats {
         fps: f32,
         megabits_per_second: f32,
+        capture_ms: f32,
+        encode_ms: f32,
+        send_ms: f32,
     },
     ClientStats {
         received_fps: f32,
         decoded_fps: f32,
         megabits_per_second: f32,
         dropped_frames: u64,
+        reassembly_ms: f32,
+        decode_ms: f32,
     },
     Error(String),
 }
@@ -485,7 +503,9 @@ impl DesktopSession {
             queue.inner.1.notify_all();
         }
         self.host_commands.take();
-        self.handles.clear();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -791,6 +811,9 @@ fn spawn_encoder(
         let mut stats_started = Instant::now();
         let mut stats_frames = 0_u64;
         let mut stats_bytes = 0_u64;
+        let mut stats_capture_us = 0_u64;
+        let mut stats_encode_us = 0_u64;
+        let mut stats_send_us = 0_u64;
         let mut frame = I420Frame::default();
 
         while running.load(Ordering::Relaxed) {
@@ -811,17 +834,23 @@ fn spawn_encoder(
                 continue;
             };
 
+            let capture_started = Instant::now();
             if let Err(error) = capture.update_i420(&mut frame, resolution) {
                 let _ = events.send(SessionEvent::Error(format!(
                     "Unable to convert captured frame: {error}"
                 )));
                 continue;
             }
+            let capture_us = capture_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
 
             if encoded_any && force_keyframe.swap(false, Ordering::Relaxed) {
                 encoder.force_intra_frame();
             }
 
+            let encode_started = Instant::now();
             let encoded = match encoder.encode(&frame) {
                 Ok(encoded) => encoded,
                 Err(error) => {
@@ -831,6 +860,10 @@ fn spawn_encoder(
                     continue;
                 }
             };
+            let encode_us = encode_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
             let frame_type = encoded.frame_type();
             if frame_type == EncodedFrameType::Skip {
                 continue;
@@ -857,6 +890,7 @@ fn spawn_encoder(
                     }
                 };
 
+            let send_started = Instant::now();
             let mut frame_sent = true;
             for fragment in fragments {
                 Packet::Video(fragment).encode(&mut packet);
@@ -870,6 +904,11 @@ fn spawn_encoder(
             frame_id = frame_id.wrapping_add(1);
             if frame_sent {
                 stats_frames = stats_frames.saturating_add(1);
+                stats_capture_us = stats_capture_us.saturating_add(capture_us);
+                stats_encode_us = stats_encode_us.saturating_add(encode_us);
+                stats_send_us = stats_send_us.saturating_add(
+                    send_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                );
             }
 
             let elapsed = stats_started.elapsed();
@@ -878,10 +917,16 @@ fn spawn_encoder(
                 let _ = events.send(SessionEvent::Stats {
                     fps: stats_frames as f32 / seconds,
                     megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+                    capture_ms: average_milliseconds(stats_capture_us, stats_frames),
+                    encode_ms: average_milliseconds(stats_encode_us, stats_frames),
+                    send_ms: average_milliseconds(stats_send_us, stats_frames),
                 });
                 stats_started = Instant::now();
                 stats_frames = 0;
                 stats_bytes = 0;
+                stats_capture_us = 0;
+                stats_encode_us = 0;
+                stats_send_us = 0;
             }
         }
     })
@@ -912,6 +957,7 @@ fn spawn_client_network(
         let mut stats_started = Instant::now();
         let mut next_frame_id = None::<u64>;
         let mut completed_frames = BTreeMap::<u64, VideoFrame>::new();
+        let mut reassembly_started = BTreeMap::<u64, Instant>::new();
         let mut waiting_for_keyframe = true;
         let mut audio_config = None::<AudioConfig>;
         let mut audio_configured = false;
@@ -1035,88 +1081,115 @@ fn spawn_client_network(
                                 playback.push(frame);
                             }
                         }
-                        Packet::Video(fragment) if accepted => match reassembler.push(fragment) {
-                            Ok(Some(frame)) => {
-                                metrics.reassembled_frames.fetch_add(1, Ordering::Relaxed);
-                                if waiting_for_keyframe && !frame.is_keyframe {
+                        Packet::Video(fragment) if accepted => {
+                            let fragmented_frame_id = fragment.frame_id;
+                            reassembly_started
+                                .entry(fragmented_frame_id)
+                                .or_insert_with(Instant::now);
+                            while reassembly_started.len() > 16 {
+                                reassembly_started.pop_first();
+                            }
+                            match reassembler.push(fragment) {
+                                Ok(Some(frame)) => {
+                                    if let Some(started) =
+                                        reassembly_started.remove(&frame.frame_id)
+                                    {
+                                        metrics.reassembly_us.fetch_add(
+                                            started.elapsed().as_micros().min(u128::from(u64::MAX))
+                                                as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        metrics.reassembly_samples.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    metrics.reassembled_frames.fetch_add(1, Ordering::Relaxed);
+                                    if waiting_for_keyframe && !frame.is_keyframe {
+                                        metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                        if last_keyframe_request.elapsed()
+                                            >= Duration::from_millis(250)
+                                        {
+                                            request_keyframe(&socket, &mut outgoing);
+                                            last_keyframe_request = Instant::now();
+                                        }
+                                        continue;
+                                    }
+
+                                    // A complete later frame can arrive before an earlier frame when
+                                    // UDP reorders datagrams. Hold a tiny reorder window instead of
+                                    // treating that as packet loss immediately.
+                                    if frame.is_keyframe && next_frame_id != Some(frame.frame_id) {
+                                        completed_frames.clear();
+                                        next_frame_id = Some(frame.frame_id);
+                                        waiting_for_keyframe = false;
+                                    } else if waiting_for_keyframe {
+                                        next_frame_id = Some(frame.frame_id);
+                                        waiting_for_keyframe = false;
+                                    }
+                                    let frame_id = frame.frame_id;
+                                    if next_frame_id.is_some_and(|next| frame_id < next) {
+                                        metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    completed_frames.entry(frame_id).or_insert(frame);
+
+                                    let expected =
+                                        next_frame_id.expect("a completed frame sets order");
+                                    if !completed_frames.contains_key(&expected)
+                                        && completed_frames.len() >= 3
+                                    {
+                                        metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                        completed_frames.clear();
+                                        decode_queue.require_keyframe();
+                                        next_frame_id = None;
+                                        waiting_for_keyframe = true;
+                                    }
+
+                                    while let Some(expected) = next_frame_id {
+                                        let Some(ordered_frame) =
+                                            completed_frames.remove(&expected)
+                                        else {
+                                            break;
+                                        };
+                                        match decode_queue.push(ordered_frame) {
+                                            DecodeQueuePush::Queued => {
+                                                next_frame_id = Some(expected.wrapping_add(1));
+                                            }
+                                            DecodeQueuePush::WaitingForKeyframe
+                                            | DecodeQueuePush::Overflowed => {
+                                                metrics
+                                                    .dropped_frames
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                completed_frames.clear();
+                                                next_frame_id = None;
+                                                waiting_for_keyframe = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if waiting_for_keyframe
+                                        && last_keyframe_request.elapsed()
+                                            >= Duration::from_millis(100)
+                                    {
+                                        request_keyframe(&socket, &mut outgoing);
+                                        last_keyframe_request = Instant::now();
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    reassembly_started.remove(&fragmented_frame_id);
+                                    warn!("Video reassembly failed: {error}");
                                     metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                                    decode_queue.require_keyframe();
+                                    completed_frames.clear();
+                                    next_frame_id = None;
+                                    waiting_for_keyframe = true;
                                     if last_keyframe_request.elapsed() >= Duration::from_millis(250)
                                     {
                                         request_keyframe(&socket, &mut outgoing);
                                         last_keyframe_request = Instant::now();
                                     }
-                                    continue;
-                                }
-
-                                // A complete later frame can arrive before an earlier frame when
-                                // UDP reorders datagrams. Hold a tiny reorder window instead of
-                                // treating that as packet loss immediately.
-                                if frame.is_keyframe && next_frame_id != Some(frame.frame_id) {
-                                    completed_frames.clear();
-                                    next_frame_id = Some(frame.frame_id);
-                                    waiting_for_keyframe = false;
-                                } else if waiting_for_keyframe {
-                                    next_frame_id = Some(frame.frame_id);
-                                    waiting_for_keyframe = false;
-                                }
-                                let frame_id = frame.frame_id;
-                                if next_frame_id.is_some_and(|next| frame_id < next) {
-                                    metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                                completed_frames.entry(frame_id).or_insert(frame);
-
-                                let expected = next_frame_id.expect("a completed frame sets order");
-                                if !completed_frames.contains_key(&expected)
-                                    && completed_frames.len() >= 3
-                                {
-                                    metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                                    completed_frames.clear();
-                                    decode_queue.require_keyframe();
-                                    next_frame_id = None;
-                                    waiting_for_keyframe = true;
-                                }
-
-                                while let Some(expected) = next_frame_id {
-                                    let Some(ordered_frame) = completed_frames.remove(&expected)
-                                    else {
-                                        break;
-                                    };
-                                    match decode_queue.push(ordered_frame) {
-                                        DecodeQueuePush::Queued => {
-                                            next_frame_id = Some(expected.wrapping_add(1));
-                                        }
-                                        DecodeQueuePush::WaitingForKeyframe
-                                        | DecodeQueuePush::Overflowed => {
-                                            metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                                            completed_frames.clear();
-                                            next_frame_id = None;
-                                            waiting_for_keyframe = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if waiting_for_keyframe
-                                    && last_keyframe_request.elapsed() >= Duration::from_millis(100)
-                                {
-                                    request_keyframe(&socket, &mut outgoing);
-                                    last_keyframe_request = Instant::now();
                                 }
                             }
-                            Ok(None) => {}
-                            Err(error) => {
-                                warn!("Video reassembly failed: {error}");
-                                metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                                decode_queue.require_keyframe();
-                                completed_frames.clear();
-                                next_frame_id = None;
-                                waiting_for_keyframe = true;
-                                if last_keyframe_request.elapsed() >= Duration::from_millis(250) {
-                                    request_keyframe(&socket, &mut outgoing);
-                                    last_keyframe_request = Instant::now();
-                                }
-                            }
-                        },
+                        }
                         Packet::Hello
                         | Packet::Clipboard(_)
                         | Packet::Audio(_)
@@ -1149,11 +1222,17 @@ fn spawn_client_network(
                 let decoded_frames = metrics.decoded_frames.swap(0, Ordering::Relaxed);
                 let received_bytes = metrics.received_bytes.swap(0, Ordering::Relaxed);
                 let dropped_frames = metrics.dropped_frames.swap(0, Ordering::Relaxed);
+                let reassembly_us = metrics.reassembly_us.swap(0, Ordering::Relaxed);
+                let reassembly_samples = metrics.reassembly_samples.swap(0, Ordering::Relaxed);
+                let decode_us = metrics.decode_us.swap(0, Ordering::Relaxed);
+                let decode_samples = metrics.decode_samples.swap(0, Ordering::Relaxed);
                 let _ = events.send(SessionEvent::ClientStats {
                     received_fps: received_frames as f32 / seconds,
                     decoded_fps: decoded_frames as f32 / seconds,
                     megabits_per_second: received_bytes as f32 * 8.0 / seconds / 1_000_000.0,
                     dropped_frames,
+                    reassembly_ms: average_milliseconds(reassembly_us, reassembly_samples),
+                    decode_ms: average_milliseconds(decode_us, decode_samples),
                 });
                 stats_started = Instant::now();
             }
@@ -1222,6 +1301,7 @@ fn run_software_video_decoder(
         let Some(frame) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
             continue;
         };
+        let decode_started = Instant::now();
         match decoder.decode(&frame.payload) {
             Ok(Some(decoded)) => {
                 let (width, height) = decoded.dimensions();
@@ -1230,9 +1310,19 @@ fn run_software_video_decoder(
                 *latest_frame.lock().unwrap() = Some(DisplayFrame {
                     width,
                     height,
-                    rgba,
+                    data: DisplayFrameData::Rgba(rgba),
+                    #[cfg(target_os = "macos")]
+                    decoded_at: Instant::now(),
                 });
                 metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
+                metrics.decode_us.fetch_add(
+                    decode_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
+                );
+                metrics.decode_samples.fetch_add(1, Ordering::Relaxed);
             }
             Ok(None) => {}
             Err(error) => {
@@ -1248,4 +1338,12 @@ fn run_software_video_decoder(
 fn request_keyframe(socket: &UdpSocket, outgoing: &mut Vec<u8>) {
     Packet::VideoKeyframeRequest.encode(outgoing);
     let _ = socket.send(outgoing);
+}
+
+fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
+    if samples == 0 {
+        0.0
+    } else {
+        total_us as f32 / samples as f32 / 1_000.0
+    }
 }

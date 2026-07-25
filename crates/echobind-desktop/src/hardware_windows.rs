@@ -11,14 +11,15 @@ use moq_nvenc::sys::nvEncodeAPI::{
     NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION, NVENCAPI_VERSION, NVENCSTATUS,
     NV_ENCODE_API_FUNCTION_LIST, NV_ENCODE_API_FUNCTION_LIST_VER, NV_ENC_BUFFER_FORMAT,
     NV_ENC_BUFFER_USAGE, NV_ENC_CODEC_H264_GUID, NV_ENC_CONFIG_VER, NV_ENC_CREATE_BITSTREAM_BUFFER,
-    NV_ENC_CREATE_BITSTREAM_BUFFER_VER, NV_ENC_DEVICE_TYPE, NV_ENC_H264_PROFILE_HIGH_GUID,
-    NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER, NV_ENC_INPUT_RESOURCE_TYPE,
-    NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER, NV_ENC_MAP_INPUT_RESOURCE,
-    NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
-    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS,
-    NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
-    NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID,
-    NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER, NV_ENC_TUNING_INFO,
+    NV_ENC_CREATE_BITSTREAM_BUFFER_VER, NV_ENC_DEVICE_TYPE, NV_ENC_EVENT_PARAMS,
+    NV_ENC_EVENT_PARAMS_VER, NV_ENC_H264_PROFILE_HIGH_GUID, NV_ENC_INITIALIZE_PARAMS,
+    NV_ENC_INITIALIZE_PARAMS_VER, NV_ENC_INPUT_RESOURCE_TYPE, NV_ENC_LOCK_BITSTREAM,
+    NV_ENC_LOCK_BITSTREAM_VER, NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_MAP_INPUT_RESOURCE_VER,
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+    NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER,
+    NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE, NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER,
+    NV_ENC_PRESET_P1_GUID, NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER,
+    NV_ENC_TUNING_INFO,
 };
 use std::{
     ffi::c_void,
@@ -36,7 +37,7 @@ use tracing::warn;
 use windows::{
     core::Interface,
     Win32::{
-        Foundation::{RECT, TRUE},
+        Foundation::{CloseHandle, HANDLE, RECT, TRUE, WAIT_OBJECT_0},
         Graphics::{
             Direct3D11::{
                 ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
@@ -51,6 +52,7 @@ use windows::{
             },
             Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC},
         },
+        System::Threading::{CreateEventW, WaitForSingleObject},
     },
 };
 use windows_capture::{
@@ -63,6 +65,9 @@ use windows_capture::{
 
 type NvencCreateInstance = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
 type NvencGetMaxVersion = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
+
+const NVENC_BUFFER_COUNT: usize = 4;
+const ENCODE_COMPLETION_TIMEOUT_MS: u32 = 1_000;
 
 struct CaptureFlags {
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
@@ -77,9 +82,12 @@ struct CaptureFlags {
 
 struct HardwareCapture {
     device_context: ID3D11DeviceContext,
-    encoder: NvencEncoder,
-    scaler: Option<D3dScaler>,
-    output_texture: ID3D11Texture2D,
+    encoder: Arc<NvencEncoder>,
+    scalers: Vec<Option<D3dScaler>>,
+    free_slots_tx: mpsc::SyncSender<usize>,
+    free_slots: mpsc::Receiver<usize>,
+    completion_tx: Option<mpsc::SyncSender<PendingNvencFrame>>,
+    completion_handle: Option<JoinHandle<()>>,
     flags: CaptureFlags,
     started: Instant,
     frame_interval: Duration,
@@ -92,7 +100,20 @@ struct EncodedHardwareFrame {
     timestamp_us: u64,
     is_keyframe: bool,
     data: Vec<u8>,
+    capture_us: u64,
+    encode_us: u64,
 }
+
+struct PendingNvencFrame {
+    slot: usize,
+    mapped_resource: *mut c_void,
+    frame_id: u64,
+    timestamp_us: u64,
+    capture_us: u64,
+    encode_started: Instant,
+}
+
+unsafe impl Send for PendingNvencFrame {}
 
 struct D3dScaler {
     source_width: u32,
@@ -112,14 +133,22 @@ struct NvencApi {
 struct NvencEncoder {
     api: NvencApi,
     encoder: *mut c_void,
-    registered_resource: *mut c_void,
-    bitstream: *mut c_void,
+    slots: Vec<NvencSlot>,
     width: u32,
     height: u32,
 }
 
-// NVENC owns no Rust references and is only used from the capture callback thread.
+struct NvencSlot {
+    texture: ID3D11Texture2D,
+    registered_resource: *mut c_void,
+    bitstream: *mut c_void,
+    completion_event: HANDLE,
+}
+
+// The NVENC API explicitly supports submission and completion on separate
+// threads when asynchronous encoding is enabled.
 unsafe impl Send for NvencEncoder {}
+unsafe impl Sync for NvencEncoder {}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_hardware_pipeline(
@@ -187,6 +216,9 @@ fn run_hardware_pipeline(
     // Keep the capture callback bounded. UDP packetization and the many send
     // syscalls needed for a large H.264 frame must never hold the Windows
     // Graphics Capture frame-pool callback.
+    // Keep only two completed frames ahead of the socket. If the network ever
+    // falls behind, dropping to a fresh keyframe is preferable to displaying
+    // an increasingly stale queue.
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
     let sender_handle = spawn_hardware_sender(
         socket,
@@ -240,18 +272,29 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
     type Error = String;
 
     fn new(context: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let output_texture =
-            create_output_texture(&context.device, context.flags.width, context.flags.height)?;
-        let encoder = NvencEncoder::new(
+        let encoder = Arc::new(NvencEncoder::new(
             &context.device,
-            &output_texture,
             context.flags.width,
             context.flags.height,
             context.flags.frames_per_second,
             context.flags.bitrate_bps,
-        )?;
+        )?);
+        let (free_slots_tx, free_slots) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
+        for slot in 0..NVENC_BUFFER_COUNT {
+            free_slots_tx
+                .send(slot)
+                .map_err(|_| "Unable to initialize the NVENC buffer ring".to_owned())?;
+        }
+        let (completion_tx, completion_rx) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
+        let completion_handle = spawn_nvenc_completion(
+            encoder.clone(),
+            completion_rx,
+            free_slots_tx.clone(),
+            context.flags.encoded_frames.clone(),
+            context.flags.force_keyframe.clone(),
+        );
         let _ = context.flags.events.send(SessionEvent::VideoBackend(
-            "NVIDIA NVENC H.264 · D3D11 zero-copy".to_owned(),
+            "NVIDIA NVENC H.264 · D3D11 zero-copy · 4-buffer async".to_owned(),
         ));
         let frame_interval =
             Duration::from_secs_f64(1.0 / f64::from(context.flags.frames_per_second.max(1)));
@@ -259,8 +302,13 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
         Ok(Self {
             device_context: context.device_context,
             encoder,
-            scaler: None,
-            output_texture,
+            scalers: std::iter::repeat_with(|| None)
+                .take(NVENC_BUFFER_COUNT)
+                .collect(),
+            free_slots_tx,
+            free_slots,
+            completion_tx: Some(completion_tx),
+            completion_handle: Some(completion_handle),
             flags: context.flags,
             started: Instant::now(),
             frame_interval,
@@ -286,34 +334,53 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
         if self.next_frame_at <= now {
             self.next_frame_at = now + self.frame_interval;
         }
+        let Ok(slot) = self.free_slots.try_recv() else {
+            // All four frames are still being encoded. Never block the WGC
+            // callback; sampling a newer capture is lower latency.
+            return Ok(());
+        };
+        let capture_started = Instant::now();
+        let output_texture = &self.encoder.slots[slot].texture;
 
         // The capture texture never leaves GPU memory. CopyResource is used at
         // native size; the D3D11 video processor performs downscaling otherwise.
         let source_texture = unsafe { frame.as_raw_texture() };
-        if frame.width() == self.flags.width && frame.height() == self.flags.height {
-            unsafe {
-                self.device_context
-                    .CopyResource(&self.output_texture, source_texture);
-            }
-        } else {
-            let scaler_needs_rebuild = self.scaler.as_ref().is_none_or(|scaler| {
-                scaler.source_width != frame.width() || scaler.source_height != frame.height()
-            });
-            if scaler_needs_rebuild {
-                self.scaler = Some(D3dScaler::new(
-                    &self.device_context,
-                    &self.output_texture,
-                    frame.width(),
-                    frame.height(),
-                    self.flags.width,
-                    self.flags.height,
-                    self.flags.frames_per_second,
-                )?);
-            }
-            self.scaler
-                .as_ref()
-                .expect("scaler was initialized")
-                .scale(source_texture)?;
+        let prepare_result =
+            if frame.width() == self.flags.width && frame.height() == self.flags.height {
+                unsafe {
+                    self.device_context
+                        .CopyResource(output_texture, source_texture);
+                }
+                Ok(())
+            } else {
+                let scaler_needs_rebuild = self.scalers[slot].as_ref().is_none_or(|scaler| {
+                    scaler.source_width != frame.width() || scaler.source_height != frame.height()
+                });
+                if scaler_needs_rebuild {
+                    match D3dScaler::new(
+                        &self.device_context,
+                        output_texture,
+                        frame.width(),
+                        frame.height(),
+                        self.flags.width,
+                        self.flags.height,
+                        self.flags.frames_per_second,
+                    ) {
+                        Ok(scaler) => self.scalers[slot] = Some(scaler),
+                        Err(error) => {
+                            let _ = self.free_slots_tx.try_send(slot);
+                            return Err(error);
+                        }
+                    }
+                }
+                self.scalers[slot]
+                    .as_ref()
+                    .expect("scaler was initialized")
+                    .scale(source_texture)
+            };
+        if let Err(error) = prepare_result {
+            let _ = self.free_slots_tx.try_send(slot);
+            return Err(error);
         }
         // Submit the copy/scale before NVENC maps the DirectX resource. This is
         // asynchronous; NVENC performs the required GPU-side synchronization.
@@ -322,21 +389,36 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
         }
 
         let force_idr = self.flags.force_keyframe.swap(false, Ordering::Relaxed);
-        let Some((encoded, is_keyframe)) = self.encoder.encode(force_idr)? else {
-            return Ok(());
-        };
         let timestamp_us = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        let frame = EncodedHardwareFrame {
+        let capture_us = capture_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let encode_started = Instant::now();
+        let mapped_resource = match self.encoder.submit(slot, force_idr) {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                let _ = self.free_slots_tx.try_send(slot);
+                return Err(error);
+            }
+        };
+        let pending = PendingNvencFrame {
+            slot,
+            mapped_resource,
             frame_id: self.frame_id,
             timestamp_us,
-            is_keyframe,
-            data: encoded,
+            capture_us,
+            encode_started,
         };
         self.frame_id = self.frame_id.wrapping_add(1);
-        if self.flags.encoded_frames.try_send(frame).is_err() {
-            // The sender is behind. Drop immediately and make the next
-            // successfully queued frame independently decodable.
+        if self
+            .completion_tx
+            .as_ref()
+            .is_none_or(|sender| sender.send(pending).is_err())
+        {
             self.flags.force_keyframe.store(true, Ordering::Release);
+            let _ = self.encoder.unmap(mapped_resource);
+            let _ = self.free_slots_tx.try_send(slot);
         }
         Ok(())
     }
@@ -344,6 +426,41 @@ impl GraphicsCaptureApiHandler for HardwareCapture {
     fn on_closed(&mut self) -> Result<(), Self::Error> {
         Err("The captured display was closed".to_owned())
     }
+}
+
+impl Drop for HardwareCapture {
+    fn drop(&mut self) {
+        self.completion_tx.take();
+        if let Some(handle) = self.completion_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_nvenc_completion(
+    encoder: Arc<NvencEncoder>,
+    pending_frames: mpsc::Receiver<PendingNvencFrame>,
+    free_slots: mpsc::SyncSender<usize>,
+    encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
+    force_keyframe: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(pending) = pending_frames.recv() {
+            let result = encoder.complete(&pending);
+            let _ = free_slots.try_send(pending.slot);
+            match result {
+                Ok(frame) => {
+                    if encoded_frames.try_send(frame).is_err() {
+                        force_keyframe.store(true, Ordering::Release);
+                    }
+                }
+                Err(error) => {
+                    warn!("Asynchronous NVENC completion failed: {error}");
+                    force_keyframe.store(true, Ordering::Release);
+                }
+            }
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,6 +477,9 @@ fn spawn_hardware_sender(
         let mut stats_started = Instant::now();
         let mut stats_frames = 0_u64;
         let mut stats_bytes = 0_u64;
+        let mut stats_capture_us = 0_u64;
+        let mut stats_encode_us = 0_u64;
+        let mut stats_send_us = 0_u64;
 
         while running.load(Ordering::Relaxed) {
             let frame = match encoded_frames.recv_timeout(Duration::from_millis(20)) {
@@ -370,6 +490,9 @@ fn spawn_hardware_sender(
                         &mut stats_started,
                         &mut stats_frames,
                         &mut stats_bytes,
+                        &mut stats_capture_us,
+                        &mut stats_encode_us,
+                        &mut stats_send_us,
                     );
                     continue;
                 }
@@ -394,6 +517,7 @@ fn spawn_hardware_sender(
                 }
             };
 
+            let send_started = Instant::now();
             let mut frame_sent = true;
             for fragment in fragments {
                 Packet::Video(fragment).encode(&mut packet);
@@ -407,12 +531,20 @@ fn spawn_hardware_sender(
             }
             if frame_sent {
                 stats_frames = stats_frames.saturating_add(1);
+                stats_capture_us = stats_capture_us.saturating_add(frame.capture_us);
+                stats_encode_us = stats_encode_us.saturating_add(frame.encode_us);
+                stats_send_us = stats_send_us.saturating_add(
+                    send_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                );
             }
             report_sender_stats(
                 &events,
                 &mut stats_started,
                 &mut stats_frames,
                 &mut stats_bytes,
+                &mut stats_capture_us,
+                &mut stats_encode_us,
+                &mut stats_send_us,
             );
         }
     })
@@ -423,6 +555,9 @@ fn report_sender_stats(
     stats_started: &mut Instant,
     stats_frames: &mut u64,
     stats_bytes: &mut u64,
+    stats_capture_us: &mut u64,
+    stats_encode_us: &mut u64,
+    stats_send_us: &mut u64,
 ) {
     let elapsed = stats_started.elapsed();
     if elapsed < Duration::from_secs(1) {
@@ -432,10 +567,24 @@ fn report_sender_stats(
     let _ = events.send(SessionEvent::Stats {
         fps: *stats_frames as f32 / seconds,
         megabits_per_second: *stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+        capture_ms: average_milliseconds(*stats_capture_us, *stats_frames),
+        encode_ms: average_milliseconds(*stats_encode_us, *stats_frames),
+        send_ms: average_milliseconds(*stats_send_us, *stats_frames),
     });
     *stats_started = Instant::now();
     *stats_frames = 0;
     *stats_bytes = 0;
+    *stats_capture_us = 0;
+    *stats_encode_us = 0;
+    *stats_send_us = 0;
+}
+
+fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
+    if samples == 0 {
+        0.0
+    } else {
+        total_us as f32 / samples as f32 / 1_000.0
+    }
 }
 
 fn create_output_texture(
@@ -671,7 +820,6 @@ impl NvencApi {
 impl NvencEncoder {
     fn new(
         device: &ID3D11Device,
-        texture: &ID3D11Texture2D,
         width: u32,
         height: u32,
         frames_per_second: u32,
@@ -681,15 +829,15 @@ impl NvencEncoder {
         let mut result = Self {
             api,
             encoder: ptr::null_mut(),
-            registered_resource: ptr::null_mut(),
-            bitstream: ptr::null_mut(),
+            slots: Vec::with_capacity(NVENC_BUFFER_COUNT),
             width,
             height,
         };
         result.open(device)?;
         result.initialize(frames_per_second, bitrate_bps)?;
-        result.register(texture)?;
-        result.create_bitstream()?;
+        for _ in 0..NVENC_BUFFER_COUNT {
+            result.create_slot(device)?;
+        }
         Ok(result)
     }
 
@@ -750,7 +898,10 @@ impl NvencEncoder {
         config.rcParams.set_zeroReorderDelay(1);
         let mut h264 = unsafe { config.encodeCodecConfig.h264Config };
         h264.idrPeriod = frames_per_second.max(1);
-        h264.sliceMode = 3;
+        // One slice per picture. Row-per-slice mode creates hundreds of NAL
+        // units at native ultrawide resolutions without reducing latency
+        // unless sub-frame bitstream output is also enabled.
+        h264.sliceMode = 2;
         h264.sliceModeData = 1;
         h264.set_repeatSPSPPS(1);
         config.encodeCodecConfig.h264Config = h264;
@@ -765,6 +916,7 @@ impl NvencEncoder {
             darHeight: self.height,
             frameRateNum: frames_per_second,
             frameRateDen: 1,
+            enableEncodeAsync: 1,
             enablePTD: 1,
             encodeConfig: &mut config,
             maxEncodeWidth: self.width,
@@ -783,7 +935,12 @@ impl NvencEncoder {
         )
     }
 
-    fn register(&mut self, texture: &ID3D11Texture2D) -> Result<(), String> {
+    fn create_slot(&mut self, device: &ID3D11Device) -> Result<(), String> {
+        let register_event = required(
+            self.api.functions.nvEncRegisterAsyncEvent,
+            "NvEncRegisterAsyncEvent",
+        )?;
+        let texture = create_output_texture(device, self.width, self.height)?;
         let register_resource = required(
             self.api.functions.nvEncRegisterResource,
             "NvEncRegisterResource",
@@ -802,11 +959,7 @@ impl NvencEncoder {
             unsafe { register_resource(self.encoder, &mut resource) },
             "register D3D11 texture with NVENC",
         )?;
-        self.registered_resource = resource.registeredResource;
-        Ok(())
-    }
 
-    fn create_bitstream(&mut self) -> Result<(), String> {
         let create = required(
             self.api.functions.nvEncCreateBitstreamBuffer,
             "NvEncCreateBitstreamBuffer",
@@ -815,32 +968,75 @@ impl NvencEncoder {
             version: NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
             ..Default::default()
         };
-        nvenc_status(
+        if let Err(error) = nvenc_status(
             unsafe { create(self.encoder, &mut bitstream) },
             "create NVENC bitstream buffer",
-        )?;
-        self.bitstream = bitstream.bitstreamBuffer;
+        ) {
+            unsafe {
+                if let Some(unregister) = self.api.functions.nvEncUnregisterResource {
+                    let _ = unregister(self.encoder, resource.registeredResource);
+                }
+            }
+            return Err(error);
+        }
+
+        let completion_event = match unsafe { CreateEventW(None, false, false, None) } {
+            Ok(event) => event,
+            Err(error) => {
+                unsafe {
+                    if let Some(destroy) = self.api.functions.nvEncDestroyBitstreamBuffer {
+                        let _ = destroy(self.encoder, bitstream.bitstreamBuffer);
+                    }
+                    if let Some(unregister) = self.api.functions.nvEncUnregisterResource {
+                        let _ = unregister(self.encoder, resource.registeredResource);
+                    }
+                }
+                return Err(format!("Unable to create NVENC completion event: {error}"));
+            }
+        };
+        let mut event = NV_ENC_EVENT_PARAMS {
+            version: NV_ENC_EVENT_PARAMS_VER,
+            completionEvent: completion_event.0 as *mut c_void,
+            ..Default::default()
+        };
+        if let Err(error) = nvenc_status(
+            unsafe { register_event(self.encoder, &mut event) },
+            "register NVENC completion event",
+        ) {
+            unsafe {
+                let _ = CloseHandle(completion_event);
+                if let Some(destroy) = self.api.functions.nvEncDestroyBitstreamBuffer {
+                    let _ = destroy(self.encoder, bitstream.bitstreamBuffer);
+                }
+                if let Some(unregister) = self.api.functions.nvEncUnregisterResource {
+                    let _ = unregister(self.encoder, resource.registeredResource);
+                }
+            }
+            return Err(error);
+        }
+
+        self.slots.push(NvencSlot {
+            texture,
+            registered_resource: resource.registeredResource,
+            bitstream: bitstream.bitstreamBuffer,
+            completion_event,
+        });
         Ok(())
     }
 
-    fn encode(&mut self, force_idr: bool) -> Result<Option<(Vec<u8>, bool)>, String> {
+    fn submit(&self, slot_index: usize, force_idr: bool) -> Result<*mut c_void, String> {
+        let slot = self
+            .slots
+            .get(slot_index)
+            .ok_or_else(|| format!("Invalid NVENC slot {slot_index}"))?;
         let map_input = required(
             self.api.functions.nvEncMapInputResource,
             "NvEncMapInputResource",
         )?;
         let encode_picture = required(self.api.functions.nvEncEncodePicture, "NvEncEncodePicture")?;
-        let unmap_input = required(
-            self.api.functions.nvEncUnmapInputResource,
-            "NvEncUnmapInputResource",
-        )?;
-        let lock_bitstream = required(self.api.functions.nvEncLockBitstream, "NvEncLockBitstream")?;
-        let unlock = required(
-            self.api.functions.nvEncUnlockBitstream,
-            "NvEncUnlockBitstream",
-        )?;
         let mut mapped = NV_ENC_MAP_INPUT_RESOURCE {
             version: NV_ENC_MAP_INPUT_RESOURCE_VER,
-            registeredResource: self.registered_resource,
+            registeredResource: slot.registered_resource,
             ..Default::default()
         };
         nvenc_status(
@@ -859,25 +1055,51 @@ impl NvencEncoder {
             inputHeight: self.height,
             encodePicFlags: flags,
             inputBuffer: mapped.mappedResource,
-            outputBitstream: self.bitstream,
+            outputBitstream: slot.bitstream,
+            completionEvent: slot.completion_event.0 as *mut c_void,
             bufferFmt: mapped.mappedBufferFmt,
             pictureStruct: NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME,
             ..Default::default()
         };
         let encode_status = unsafe { encode_picture(self.encoder, &mut picture) };
-        let unmap_status = unsafe { unmap_input(self.encoder, mapped.mappedResource) };
-        nvenc_status(encode_status, "encode NVENC frame")?;
-        nvenc_status(unmap_status, "unmap NVENC input texture")?;
+        if let Err(error) = nvenc_status(encode_status, "submit asynchronous NVENC frame") {
+            let _ = self.unmap(mapped.mappedResource);
+            return Err(error);
+        }
+        Ok(mapped.mappedResource)
+    }
 
+    fn complete(&self, pending: &PendingNvencFrame) -> Result<EncodedHardwareFrame, String> {
+        let slot = self
+            .slots
+            .get(pending.slot)
+            .ok_or_else(|| format!("Invalid NVENC completion slot {}", pending.slot))?;
+        let wait =
+            unsafe { WaitForSingleObject(slot.completion_event, ENCODE_COMPLETION_TIMEOUT_MS) };
+        if wait != WAIT_OBJECT_0 {
+            let _ = self.unmap(pending.mapped_resource);
+            return Err(format!(
+                "NVENC completion event timed out or failed ({wait:?})"
+            ));
+        }
+        let lock_bitstream = required(self.api.functions.nvEncLockBitstream, "NvEncLockBitstream")?;
+        let unlock = required(
+            self.api.functions.nvEncUnlockBitstream,
+            "NvEncUnlockBitstream",
+        )?;
         let mut lock = NV_ENC_LOCK_BITSTREAM {
             version: NV_ENC_LOCK_BITSTREAM_VER,
-            outputBitstream: self.bitstream,
+            outputBitstream: slot.bitstream,
             ..Default::default()
         };
-        nvenc_status(
+        lock.set_doNotWait(1);
+        if let Err(error) = nvenc_status(
             unsafe { lock_bitstream(self.encoder, &mut lock) },
-            "lock NVENC bitstream",
-        )?;
+            "lock completed NVENC bitstream",
+        ) {
+            let _ = self.unmap(pending.mapped_resource);
+            return Err(error);
+        }
         let data = if lock.bitstreamBufferPtr.is_null() || lock.bitstreamSizeInBytes == 0 {
             Vec::new()
         } else {
@@ -890,35 +1112,73 @@ impl NvencEncoder {
             }
         };
         let picture_type = lock.pictureType;
-        nvenc_status(
-            unsafe { unlock(self.encoder, self.bitstream) },
+        let unlock_result = nvenc_status(
+            unsafe { unlock(self.encoder, slot.bitstream) },
             "unlock NVENC bitstream",
-        )?;
+        );
+        let unmap_result = self.unmap(pending.mapped_resource);
+        unlock_result?;
+        unmap_result?;
         if data.is_empty() {
-            return Ok(None);
+            return Err("NVENC completed an empty frame".to_owned());
         }
         let is_keyframe = matches!(
             picture_type,
             NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
         );
-        Ok(Some((data, is_keyframe)))
+        Ok(EncodedHardwareFrame {
+            frame_id: pending.frame_id,
+            timestamp_us: pending.timestamp_us,
+            is_keyframe,
+            data,
+            capture_us: pending.capture_us,
+            encode_us: pending
+                .encode_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+        })
+    }
+
+    fn unmap(&self, mapped_resource: *mut c_void) -> Result<(), String> {
+        let unmap_input = required(
+            self.api.functions.nvEncUnmapInputResource,
+            "NvEncUnmapInputResource",
+        )?;
+        nvenc_status(
+            unsafe { unmap_input(self.encoder, mapped_resource) },
+            "unmap NVENC input texture",
+        )
     }
 }
 
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
         unsafe {
-            if !self.bitstream.is_null() && !self.encoder.is_null() {
-                if let Some(destroy) = self.api.functions.nvEncDestroyBitstreamBuffer {
-                    let _ = destroy(self.encoder, self.bitstream);
-                }
-            }
-            if !self.registered_resource.is_null() && !self.encoder.is_null() {
-                if let Some(unregister) = self.api.functions.nvEncUnregisterResource {
-                    let _ = unregister(self.encoder, self.registered_resource);
-                }
-            }
             if !self.encoder.is_null() {
+                for slot in &self.slots {
+                    if let Some(unregister_event) = self.api.functions.nvEncUnregisterAsyncEvent {
+                        let mut event = NV_ENC_EVENT_PARAMS {
+                            version: NV_ENC_EVENT_PARAMS_VER,
+                            completionEvent: slot.completion_event.0 as *mut c_void,
+                            ..Default::default()
+                        };
+                        let _ = unregister_event(self.encoder, &mut event);
+                    }
+                    if let Some(destroy) = self.api.functions.nvEncDestroyBitstreamBuffer {
+                        if !slot.bitstream.is_null() {
+                            let _ = destroy(self.encoder, slot.bitstream);
+                        }
+                    }
+                    if let Some(unregister) = self.api.functions.nvEncUnregisterResource {
+                        if !slot.registered_resource.is_null() {
+                            let _ = unregister(self.encoder, slot.registered_resource);
+                        }
+                    }
+                    if !slot.completion_event.is_invalid() {
+                        let _ = CloseHandle(slot.completion_event);
+                    }
+                }
                 if let Some(destroy) = self.api.functions.nvEncDestroyEncoder {
                     let _ = destroy(self.encoder);
                 }

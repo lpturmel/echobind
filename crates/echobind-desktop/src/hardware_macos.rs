@@ -229,6 +229,9 @@ fn run_hardware_pipeline(
             let _ = events.send(SessionEvent::Stats {
                 fps: stats_frames as f32 / seconds,
                 megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+                capture_ms: 0.0,
+                encode_ms: 0.0,
+                send_ms: 0.0,
             });
             stats_started = Instant::now();
             stats_frames = 0;
@@ -749,5 +752,98 @@ mod tests {
             .unwrap()
             .expect("hardware keyframe should decode");
         assert_eq!(decoded.dimensions(), (1280, 720));
+    }
+
+    #[test]
+    #[ignore = "requires Apple hardware H.264 encode and decode"]
+    fn hardware_frame_decodes_to_nv12_iosurface() {
+        use super::super::{
+            decoder_macos, ClientMetrics, DecodeQueue, DisplayFrameData, LatestFrame,
+        };
+        use echobind_core::video::VideoFrame;
+        use std::sync::atomic::AtomicU64;
+
+        let surface =
+            apple_cf::iosurface::IOSurface::create(1280, 720, u32::from_be_bytes(*b"BGRA"), 4)
+                .expect("IOSurface allocation should succeed");
+        let encoder = create_encoder(1280, 720, 30, 4_000_000).unwrap();
+        let encoded = encoder.encode(&surface, (0, 30), true).unwrap();
+        let (annex_b, is_keyframe) = avcc_frame_to_annex_b(&encoded).unwrap();
+        assert!(is_keyframe);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let queue = DecodeQueue::new();
+        let latest: LatestFrame = Arc::new(Mutex::new(None));
+        let metrics = Arc::new(ClientMetrics::default());
+        let needs_keyframe = Arc::new(AtomicBool::new(false));
+        let (events, _event_rx) = mpsc::channel();
+        let decoder_running = running.clone();
+        let decoder_queue = queue.clone();
+        let decoder_latest = latest.clone();
+        let decoder_metrics = metrics.clone();
+        let decoder_needs_keyframe = needs_keyframe.clone();
+        let decoder = thread::spawn(move || {
+            decoder_macos::run_decoder(
+                decoder_running,
+                decoder_queue,
+                decoder_latest,
+                decoder_metrics,
+                decoder_needs_keyframe,
+                events,
+            )
+        });
+        let _ = queue.push(VideoFrame {
+            frame_id: 0,
+            timestamp_us: 0,
+            is_keyframe: true,
+            payload: annex_b,
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while latest.lock().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        running.store(false, Ordering::Release);
+        queue.inner.1.notify_all();
+        decoder.join().unwrap().unwrap();
+
+        let decoded = latest
+            .lock()
+            .unwrap()
+            .take()
+            .expect("VideoToolbox should output a frame");
+        match &decoded.data {
+            DisplayFrameData::Nv12(pixel_buffer) => {
+                assert_eq!(pixel_buffer.plane_count(), 2);
+                assert!(pixel_buffer.io_surface().is_some());
+
+                let instance = eframe::wgpu::Instance::new(
+                    eframe::wgpu::InstanceDescriptor::new_without_display_handle(),
+                );
+                let adapter = pollster::block_on(instance.request_adapter(
+                    &eframe::wgpu::RequestAdapterOptions {
+                        power_preference: eframe::wgpu::PowerPreference::HighPerformance,
+                        force_fallback_adapter: false,
+                        compatible_surface: None,
+                    },
+                ))
+                .expect("Metal adapter should be available");
+                let (device, _queue) = pollster::block_on(
+                    adapter.request_device(&eframe::wgpu::DeviceDescriptor::default()),
+                )
+                .expect("Metal device should be available");
+                let mut renderer = crate::video_renderer_macos::MacVideoRenderer::new(
+                    &device,
+                    eframe::wgpu::TextureFormat::Bgra8Unorm,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                )
+                .expect("Metal renderer should initialize");
+                renderer
+                    .set_frame(&device, pixel_buffer.clone(), decoded.decoded_at)
+                    .expect("NV12 IOSurface should import into Metal without copying");
+            }
+            DisplayFrameData::Rgba(_) => panic!("expected zero-copy NV12 output"),
+        }
     }
 }

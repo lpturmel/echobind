@@ -1,16 +1,19 @@
-use super::{ClientMetrics, DecodeQueue, DisplayFrame, LatestFrame, SessionEvent};
+use super::{
+    ClientMetrics, DecodeQueue, DisplayFrame, DisplayFrameData, LatestFrame, SessionEvent,
+};
 use apple_cf::{
     cf::{CFDictionary, CFNumber, CFType},
     cm::{CMBlockBuffer, CMFormatDescription, CMSampleBuffer},
     raw,
 };
 use std::{
+    collections::BTreeMap,
     ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use videotoolbox::{
     ffi::{kVTDecodeFrame_1xRealTimePlayback, kVTDecodeFrame_EnableAsynchronousDecompression},
@@ -38,6 +41,7 @@ pub(super) fn run_decoder(
     let mut decoder = None::<DecompressionSession>;
     let mut format_description = None::<CMFormatDescription>;
     let mut parameter_sets = None::<(Vec<u8>, Vec<u8>)>;
+    let decode_started = Arc::new(Mutex::new(BTreeMap::<i64, Instant>::new()));
 
     while running.load(Ordering::Relaxed) {
         let Some(frame) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
@@ -71,6 +75,7 @@ pub(super) fn run_decoder(
                     latest_frame.clone(),
                     metrics.clone(),
                     needs_keyframe.clone(),
+                    decode_started.clone(),
                 ) {
                     Ok(session) => session,
                     Err(error) => {
@@ -103,11 +108,20 @@ pub(super) fn run_decoder(
                 continue;
             }
         };
+        let timestamp_key = frame.timestamp_us.min(i64::MAX as u64) as i64;
+        {
+            let mut pending = decode_started.lock().unwrap();
+            pending.insert(timestamp_key, Instant::now());
+            while pending.len() > 16 {
+                pending.pop_first();
+            }
+        }
         if let Err(error) = session.decode_with_options(
             &sample,
             kVTDecodeFrame_EnableAsynchronousDecompression | kVTDecodeFrame_1xRealTimePlayback,
             None,
         ) {
+            decode_started.lock().unwrap().remove(&timestamp_key);
             metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
             needs_keyframe.store(true, Ordering::Release);
             decoder = None;
@@ -134,55 +148,90 @@ fn create_decoder(
     latest_frame: LatestFrame,
     metrics: Arc<ClientMetrics>,
     needs_keyframe: Arc<AtomicBool>,
+    decode_started: Arc<Mutex<BTreeMap<i64, Instant>>>,
 ) -> Result<DecompressionSession, String> {
     let pixel_format_key = unsafe {
         CFType::from_raw_retained(raw::kCVPixelBufferPixelFormatTypeKey.cast_mut().cast())
             .ok_or_else(|| "CoreVideo returned no pixel-format key".to_owned())?
     };
-    let pixel_format = CFNumber::from_u64(u64::from(raw::kCVPixelFormatType_32RGBA));
-    let attributes = CFDictionary::from_pairs(&[(&pixel_format_key, &pixel_format)]);
+    let io_surface_key = unsafe {
+        CFType::from_raw_retained(raw::kCVPixelBufferIOSurfacePropertiesKey.cast_mut().cast())
+            .ok_or_else(|| "CoreVideo returned no IOSurface key".to_owned())?
+    };
+    let metal_compatibility_key = unsafe {
+        CFType::from_raw_retained(raw::kCVPixelBufferMetalCompatibilityKey.cast_mut().cast())
+            .ok_or_else(|| "CoreVideo returned no Metal-compatibility key".to_owned())?
+    };
+    let boolean_true = unsafe {
+        CFType::from_raw_retained(raw::kCFBooleanTrue.cast_mut().cast())
+            .ok_or_else(|| "CoreFoundation returned no true value".to_owned())?
+    };
+    let pixel_format = CFNumber::from_u64(u64::from(
+        raw::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    ));
+    let io_surface_properties = CFDictionary::from_pairs(&[]);
+    let attributes = CFDictionary::from_pairs(&[
+        (&pixel_format_key, &pixel_format),
+        (&io_surface_key, &io_surface_properties),
+        (&metal_compatibility_key, &boolean_true),
+    ]);
 
     let decoder = DecompressionSession::new_with_image_buffer_attributes(
         description,
         Some(&attributes),
         move |decoded| {
+            let decode_elapsed = decode_started
+                .lock()
+                .unwrap()
+                .remove(&decoded.presentation_time.0)
+                .map(|started| started.elapsed());
             if decoded.status != 0 {
+                tracing::warn!(
+                    status = decoded.status,
+                    flags = decoded.info_flags,
+                    "VideoToolbox decode callback failed"
+                );
                 metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 needs_keyframe.store(true, Ordering::Release);
                 return;
             }
             let Some(pixel_buffer) = decoded.image_buffer else {
+                tracing::warn!(
+                    flags = decoded.info_flags,
+                    "VideoToolbox returned no pixel buffer"
+                );
                 metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 return;
             };
             let width = pixel_buffer.width();
             let height = pixel_buffer.height();
-            let row_bytes = width.saturating_mul(4);
-            let Ok(guard) = pixel_buffer.lock_read_only() else {
-                metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                return;
-            };
-            if pixel_buffer.pixel_format() != raw::kCVPixelFormatType_32RGBA
-                || guard.bytes_per_row() < row_bytes
+            if pixel_buffer.pixel_format() != raw::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                || pixel_buffer.plane_count() != 2
+                || pixel_buffer.io_surface().is_none()
             {
+                tracing::warn!(
+                    format = pixel_buffer.pixel_format(),
+                    planes = pixel_buffer.plane_count(),
+                    "VideoToolbox returned an incompatible pixel buffer"
+                );
                 metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 needs_keyframe.store(true, Ordering::Release);
                 return;
             }
-            let mut rgba = vec![0_u8; row_bytes.saturating_mul(height)];
-            for (row_index, destination) in rgba.chunks_exact_mut(row_bytes).enumerate() {
-                let Some(source) = guard.row(row_index) else {
-                    metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                    return;
-                };
-                destination.copy_from_slice(&source[..row_bytes]);
-            }
             *latest_frame.lock().unwrap() = Some(DisplayFrame {
                 width,
                 height,
-                rgba,
+                data: DisplayFrameData::Nv12(pixel_buffer),
+                decoded_at: std::time::Instant::now(),
             });
             metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
+            if let Some(elapsed) = decode_elapsed {
+                metrics.decode_us.fetch_add(
+                    elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
+                );
+                metrics.decode_samples.fetch_add(1, Ordering::Relaxed);
+            }
         },
     )
     .map_err(|error| format!("Unable to create VideoToolbox decoder: {error}"))?;
