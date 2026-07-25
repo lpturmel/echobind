@@ -73,7 +73,7 @@ use windows::{
     },
 };
 use windows_capture::{
-    capture::{Context, GraphicsCaptureApiHandler},
+    capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
     frame::Frame,
     graphics_capture_api::InternalCaptureControl,
     monitor::Monitor,
@@ -85,9 +85,11 @@ type NvencGetMaxVersion = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 
 const NVENC_BUFFER_COUNT: usize = 4;
 const ENCODE_COMPLETION_TIMEOUT_MS: u32 = 1_000;
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const GPU_COPY_COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 const DXGI_CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const ACTIVE_CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+const ACTIVE_ENCODE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
 const CAPTURE_ACTIVITY_THRESHOLD: u64 = 3;
 const MAX_IMMEDIATE_HARDWARE_FAILURES: u32 = 3;
@@ -116,6 +118,7 @@ struct HardwareCapture {
     free_slots: mpsc::Receiver<usize>,
     completion_tx: Option<mpsc::SyncSender<PendingNvencFrame>>,
     completion_handle: Option<JoinHandle<()>>,
+    completion_done: mpsc::Receiver<()>,
     completion_failure: Arc<Mutex<Option<String>>>,
     flags: CaptureFlags,
     started: Instant,
@@ -168,6 +171,7 @@ struct NvencEncoder {
     slots: Vec<NvencSlot>,
     width: u32,
     height: u32,
+    poisoned: AtomicBool,
 }
 
 struct NvencSlot {
@@ -287,7 +291,7 @@ pub(super) fn spawn_hardware_pipeline(
                 let _ = events.send(SessionEvent::VideoBackend(format!(
                     "Rebuilding Windows hardware video pipeline in {delay_ms} ms after device failure"
                 )));
-                thread::sleep(Duration::from_millis(delay_ms));
+                wait_while_running(&running, Duration::from_millis(delay_ms));
                 continue;
             }
             break Err(format!(
@@ -321,9 +325,21 @@ pub(super) fn spawn_hardware_pipeline(
     })
 }
 
+fn wait_while_running(running: &AtomicBool, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while running.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(20)));
+    }
+}
+
 #[derive(Debug)]
 enum DxgiCaptureFailure {
     AccessLost(String),
+    EncoderStalled(String),
     Fatal(String),
 }
 
@@ -342,9 +358,11 @@ fn run_dxgi_pipeline(
     hardware_progress: Arc<AtomicU64>,
 ) -> Result<(), String> {
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
+    let sender_running = Arc::new(AtomicBool::new(true));
     let sender_handle = spawn_hardware_sender(
         socket,
         running.clone(),
+        sender_running.clone(),
         active_peer.clone(),
         force_keyframe.clone(),
         events.clone(),
@@ -389,6 +407,10 @@ fn run_dxgi_pipeline(
                 }
                 thread::sleep(Duration::from_millis(25));
             }
+            Err(DxgiCaptureFailure::EncoderStalled(error)) => {
+                force_keyframe.store(true, Ordering::Release);
+                break Err(error);
+            }
             Err(DxgiCaptureFailure::Fatal(error)) => {
                 force_keyframe.store(true, Ordering::Release);
                 if immediate_failures >= MAX_IMMEDIATE_HARDWARE_FAILURES {
@@ -402,6 +424,7 @@ fn run_dxgi_pipeline(
             }
         }
     };
+    sender_running.store(false, Ordering::Release);
     drop(encoded_tx);
     let _ = sender_handle.join();
     result
@@ -454,6 +477,8 @@ fn run_dxgi_capture_session(
     let mut activity_frames = 0_u64;
     let mut active_video_seen = false;
     let mut last_desktop_frame = None::<Instant>;
+    let mut observed_encoded_progress = hardware_progress.load(Ordering::Acquire);
+    let mut last_encoded_progress = None::<Instant>;
 
     while running.load(Ordering::Relaxed) {
         match acquire_dxgi_frame(&duplication, &mut capture) {
@@ -466,10 +491,17 @@ fn run_dxgi_capture_session(
                     activity_frames = 0;
                     active_video_seen = false;
                     last_desktop_frame = None;
+                    observed_encoded_progress = hardware_progress.load(Ordering::Acquire);
+                    last_encoded_progress = None;
                     continue;
                 }
                 let now = Instant::now();
                 let active_since = *peer_became_active.get_or_insert(now);
+                let encoded_progress = hardware_progress.load(Ordering::Acquire);
+                if encoded_progress > observed_encoded_progress {
+                    observed_encoded_progress = encoded_progress;
+                    last_encoded_progress = Some(now);
+                }
                 if acquired {
                     captured_for_peer = true;
                     last_desktop_frame = Some(now);
@@ -509,10 +541,24 @@ fn run_dxgi_capture_session(
                         ACTIVE_CAPTURE_STALL_TIMEOUT.as_millis()
                     )));
                 }
+                if active_video_seen
+                    && last_encoded_progress.unwrap_or(active_since).elapsed()
+                        >= ACTIVE_ENCODE_STALL_TIMEOUT
+                {
+                    drop(capture);
+                    return Err(DxgiCaptureFailure::EncoderStalled(format!(
+                        "NVENC completed no frames for {} ms while DXGI capture remained active",
+                        ACTIVE_ENCODE_STALL_TIMEOUT.as_millis()
+                    )));
+                }
             }
             Err(DxgiCaptureFailure::AccessLost(error)) => {
                 drop(capture);
                 return Err(DxgiCaptureFailure::AccessLost(error));
+            }
+            Err(DxgiCaptureFailure::EncoderStalled(error)) => {
+                drop(capture);
+                return Err(DxgiCaptureFailure::EncoderStalled(error));
             }
             Err(error) => {
                 drop(capture);
@@ -656,9 +702,11 @@ fn run_wgc_pipeline(
     // falls behind, dropping to a fresh keyframe is preferable to displaying
     // an increasingly stale queue.
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
+    let sender_running = Arc::new(AtomicBool::new(true));
     let sender_handle = spawn_hardware_sender(
         socket,
         running.clone(),
+        sender_running.clone(),
         active_peer.clone(),
         force_keyframe.clone(),
         events.clone(),
@@ -757,12 +805,43 @@ fn run_wgc_pipeline(
             .wait()
             .map_err(|error| format!("D3D11 screen capture stopped: {error}"))
     } else {
-        control
-            .stop()
-            .map_err(|error| format!("Unable to stop D3D11 screen capture: {error}"))
+        stop_wgc_for_session_shutdown(control)
     };
+    sender_running.store(false, Ordering::Release);
     let _ = sender_handle.join();
     capture_result
+}
+
+fn stop_wgc_for_session_shutdown(
+    control: CaptureControl<HardwareCapture, String>,
+) -> Result<(), String> {
+    let (done_tx, done_rx) = mpsc::channel();
+    let stop_handle = thread::Builder::new()
+        .name("echobind-wgc-shutdown".to_owned())
+        .spawn(move || {
+            let result = control
+                .stop()
+                .map_err(|error| format!("Unable to stop D3D11 screen capture: {error}"));
+            let _ = done_tx.send(result);
+        })
+        .map_err(|error| format!("Unable to start bounded WGC shutdown: {error}"))?;
+    match done_rx.recv_timeout(WORKER_SHUTDOWN_TIMEOUT) {
+        Ok(result) => {
+            let _ = stop_handle.join();
+            result
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = stop_handle.join();
+            Err("Windows Graphics Capture shutdown worker exited unexpectedly".to_owned())
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            warn!(
+                "Windows Graphics Capture did not stop within {} ms; detaching the blocked capture worker so the session socket can close",
+                WORKER_SHUTDOWN_TIMEOUT.as_millis()
+            );
+            Err("Windows Graphics Capture driver teardown timed out and was detached".to_owned())
+        }
+    }
 }
 
 impl GraphicsCaptureApiHandler for HardwareCapture {
@@ -815,6 +894,7 @@ impl HardwareCapture {
                 .map_err(|_| "Unable to initialize the NVENC buffer ring".to_owned())?;
         }
         let (completion_tx, completion_rx) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
+        let (completion_done_tx, completion_done) = mpsc::channel();
         let completion_failure = Arc::new(Mutex::new(None));
         let completion_handle = spawn_nvenc_completion(
             encoder.clone(),
@@ -826,6 +906,7 @@ impl HardwareCapture {
             completion_failure.clone(),
             flags.hardware_progress.clone(),
             flags.events.clone(),
+            completion_done_tx,
         );
         let _ = flags
             .events
@@ -844,6 +925,7 @@ impl HardwareCapture {
             free_slots,
             completion_tx: Some(completion_tx),
             completion_handle: Some(completion_handle),
+            completion_done,
             completion_failure,
             flags,
             started: Instant::now(),
@@ -1035,7 +1117,18 @@ impl Drop for HardwareCapture {
     fn drop(&mut self) {
         self.completion_tx.take();
         if let Some(handle) = self.completion_handle.take() {
-            let _ = handle.join();
+            match self.completion_done.recv_timeout(WORKER_SHUTDOWN_TIMEOUT) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = handle.join();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.encoder.poison();
+                    warn!(
+                        "NVENC completion worker did not stop within {} ms; detaching the poisoned driver worker so session shutdown can continue",
+                        WORKER_SHUTDOWN_TIMEOUT.as_millis()
+                    );
+                }
+            }
         }
     }
 }
@@ -1050,6 +1143,7 @@ fn spawn_nvenc_completion(
     completion_failure: Arc<Mutex<Option<String>>>,
     hardware_progress: Arc<AtomicU64>,
     events: mpsc::Sender<SessionEvent>,
+    completion_done: mpsc::Sender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         raise_current_thread_priority("NVENC completion");
@@ -1089,6 +1183,7 @@ fn spawn_nvenc_completion(
             // instead of dropping a reference frame and starting an IDR storm.
             let _ = free_slots.try_send(pending.slot);
         }
+        let _ = completion_done.send(());
     })
 }
 
@@ -1096,6 +1191,7 @@ fn spawn_nvenc_completion(
 fn spawn_hardware_sender(
     socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
+    pipeline_running: Arc<AtomicBool>,
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     force_keyframe: Arc<AtomicBool>,
     events: mpsc::Sender<SessionEvent>,
@@ -1115,7 +1211,7 @@ fn spawn_hardware_sender(
         let mut last_sent_frame = None::<u64>;
         let mut waiting_for_keyframe = true;
 
-        while running.load(Ordering::Relaxed) {
+        while running.load(Ordering::Relaxed) && pipeline_running.load(Ordering::Acquire) {
             let frame = match encoded_frames.recv_timeout(Duration::from_millis(20)) {
                 Ok(frame) => frame,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1533,6 +1629,7 @@ impl NvencEncoder {
             slots: Vec::with_capacity(NVENC_BUFFER_COUNT),
             width,
             height,
+            poisoned: AtomicBool::new(false),
         };
         result.open(device)?;
         result.initialize(frames_per_second, bitrate_bps)?;
@@ -1794,7 +1891,11 @@ impl NvencEncoder {
         let wait =
             unsafe { WaitForSingleObject(slot.completion_event, ENCODE_COMPLETION_TIMEOUT_MS) };
         if wait != WAIT_OBJECT_0 {
-            let _ = self.unmap(pending.mapped_resource);
+            // A timed-out NVENC driver must not be called again here.
+            // nvEncUnmapInputResource can itself wait indefinitely on the
+            // suspended GPU context, hiding the original error and preventing
+            // the owning session from ever releasing its socket.
+            self.poison();
             return Err(format!(
                 "NVENC completion event timed out or failed ({wait:?})"
             ));
@@ -1814,7 +1915,7 @@ impl NvencEncoder {
             unsafe { lock_bitstream(self.encoder, &mut lock) },
             "lock completed NVENC bitstream",
         ) {
-            let _ = self.unmap(pending.mapped_resource);
+            self.poison();
             return Err(error);
         }
         let data = if lock.bitstreamBufferPtr.is_null() || lock.bitstreamSizeInBytes == 0 {
@@ -1833,9 +1934,14 @@ impl NvencEncoder {
             unsafe { unlock(self.encoder, slot.bitstream) },
             "unlock NVENC bitstream",
         );
-        let unmap_result = self.unmap(pending.mapped_resource);
-        unlock_result?;
-        unmap_result?;
+        if let Err(error) = unlock_result {
+            self.poison();
+            return Err(error);
+        }
+        if let Err(error) = self.unmap(pending.mapped_resource) {
+            self.poison();
+            return Err(error);
+        }
         if data.is_empty() {
             return Err("NVENC completed an empty frame".to_owned());
         }
@@ -1869,12 +1975,29 @@ impl NvencEncoder {
             "unmap NVENC input texture",
         )
     }
+
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
         unsafe {
             if !self.encoder.is_null() {
+                if self.poisoned.load(Ordering::Acquire) {
+                    // Once an NVENC call has timed out, further driver calls
+                    // (especially unmap/unregister/destroy) are not safe
+                    // teardown primitives: they can wait forever on the same
+                    // suspended context. Dropping the D3D device reclaims its
+                    // resources; only close the process-owned event handles.
+                    for slot in &self.slots {
+                        if !slot.completion_event.is_invalid() {
+                            let _ = CloseHandle(slot.completion_event);
+                        }
+                    }
+                    return;
+                }
                 for slot in &self.slots {
                     if let Some(unregister_event) = self.api.functions.nvEncUnregisterAsyncEvent {
                         let mut event = NV_ENC_EVENT_PARAMS {
