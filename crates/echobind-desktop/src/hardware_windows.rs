@@ -82,7 +82,8 @@ const ACTIVE_CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const ACTIVE_ENCODE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
 const CAPTURE_ACTIVITY_THRESHOLD: u64 = 3;
-const MAX_CONSECUTIVE_ACCESS_LOSSES: u32 = 3;
+const ACCESS_LOST_RETRY_DELAY_MS: u64 = 25;
+const ACCESS_LOST_MAX_RETRY_DELAY_MS: u64 = 200;
 
 struct CaptureFlags {
     running: Arc<AtomicBool>,
@@ -293,17 +294,27 @@ fn run_dxgi_pipeline(
             Ok(()) => break Ok(()),
             Err(DxgiCaptureFailure::AccessLost(error)) => {
                 force_keyframe.store(true, Ordering::Release);
-                let _ = events.send(SessionEvent::VideoBackend(
-                    "DXGI display mode changed · rebuilding capture and forcing IDR".to_owned(),
-                ));
-                warn!("DXGI capture session was invalidated: {error}");
                 consecutive_access_losses = consecutive_access_losses.saturating_add(1);
-                if consecutive_access_losses >= MAX_CONSECUTIVE_ACCESS_LOSSES {
-                    break Err(format!(
-                        "DXGI repeatedly failed before producing a frame: {error}"
+                if consecutive_access_losses == 1 {
+                    let _ = events.send(SessionEvent::VideoBackend(
+                        "DXGI display mode changed · rebuilding capture and forcing IDR".to_owned(),
                     ));
+                    warn!("DXGI capture session was invalidated: {error}");
+                } else if consecutive_access_losses % 20 == 0 {
+                    warn!(
+                        "DXGI capture is still unavailable after {consecutive_access_losses} rebuild attempts: {error}"
+                    );
                 }
-                thread::sleep(Duration::from_millis(25));
+                // ACCESS_LOST is the documented Desktop Duplication response
+                // to full-screen application, display-mode, and desktop
+                // switches. It does not mean the D3D device or NVENC session
+                // failed. Keep recreating the capture session with a bounded
+                // backoff; promoting three quick transitions to a fatal error
+                // made normal game startup abort the process.
+                let retry_shift = consecutive_access_losses.saturating_sub(1).min(3);
+                let retry_delay_ms =
+                    (ACCESS_LOST_RETRY_DELAY_MS << retry_shift).min(ACCESS_LOST_MAX_RETRY_DELAY_MS);
+                thread::sleep(Duration::from_millis(retry_delay_ms));
             }
             Err(DxgiCaptureFailure::DeviceLost(error)) => {
                 // A removed D3D device cannot recover. Retrying this inner
@@ -623,19 +634,35 @@ fn acquire_dxgi_frame(
         }
         capture.process_texture(&texture, description.Width, description.Height)
     })();
-    let release_result = unsafe { duplication.ReleaseFrame() }
-        .map_err(|error| format!("Unable to release DXGI desktop frame: {error}"));
+    let release_result = unsafe { duplication.ReleaseFrame() }.map_err(|error| {
+        let message = format!("Unable to release DXGI desktop frame: {error}");
+        if error.code() == DXGI_ERROR_ACCESS_LOST {
+            DxgiCaptureFailure::AccessLost(message)
+        } else {
+            classify_dxgi_capture_error(message)
+        }
+    });
     processing_result.map_err(classify_dxgi_capture_error)?;
-    release_result.map_err(classify_dxgi_capture_error)?;
+    release_result?;
     Ok(true)
 }
 
 fn classify_dxgi_capture_error(error: String) -> DxgiCaptureFailure {
-    if is_d3d_device_lost_error(&error) {
+    if is_dxgi_access_lost_error(&error) {
+        DxgiCaptureFailure::AccessLost(error)
+    } else if is_d3d_device_lost_error(&error) {
         DxgiCaptureFailure::DeviceLost(error)
     } else {
         DxgiCaptureFailure::Fatal(error)
     }
+}
+
+fn is_dxgi_access_lost_error(error: &str) -> bool {
+    // Some D3D/DXGI entry points reach this shared string-based classifier.
+    // Preserve ACCESS_LOST as recoverable regardless of whether windows-rs
+    // rendered the symbolic name or only the HRESULT.
+    let error = error.to_ascii_uppercase();
+    error.contains("0X887A0026") || error.contains("DXGI_ERROR_ACCESS_LOST")
 }
 
 fn is_d3d_device_lost_error(error: &str) -> bool {
