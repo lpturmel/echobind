@@ -410,7 +410,6 @@ impl DesktopSession {
                 bitrate_bps,
                 width,
                 height,
-                resolution,
                 active_datagram_size.clone(),
             );
             (None, vec![hardware_handle])
