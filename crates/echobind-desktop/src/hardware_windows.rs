@@ -45,7 +45,7 @@ use windows::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
                 ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
                 ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
-                D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_BIND_VIDEO_ENCODER,
+                D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
                 D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
@@ -54,7 +54,7 @@ use windows::{
                 D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
                 D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
-                D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+                D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
                 D3D11_VPOV_DIMENSION_TEXTURE2D,
             },
             Dxgi::{
@@ -161,7 +161,7 @@ struct D3dScaler {
 }
 
 struct NvencApi {
-    _library: Library,
+    library: Option<Library>,
     functions: NV_ENCODE_API_FUNCTION_LIST,
 }
 
@@ -223,46 +223,62 @@ pub(super) fn spawn_hardware_pipeline(
                 Err(_) => break Ok(()),
             };
             debug!("DXGI/NVENC pipeline unavailable: {dxgi_error}");
-            let _ = events.send(SessionEvent::VideoBackend(format!(
-                "Windows Graphics Capture takeover after DXGI: {dxgi_error}"
-            )));
+            let dxgi_device_lost = is_d3d_device_lost_error(&dxgi_error);
+            let _ = events.send(SessionEvent::VideoBackend(if dxgi_device_lost {
+                format!("GPU reset detected; retiring D3D11/NVENC device: {dxgi_error}")
+            } else {
+                format!("Windows Graphics Capture takeover after DXGI: {dxgi_error}")
+            }));
 
             let mut immediate_failures = 0_u32;
-            let wgc_error = loop {
-                let progress_before = hardware_progress.load(Ordering::Acquire);
-                match run_wgc_pipeline(
-                    socket.clone(),
-                    running.clone(),
-                    active_peer.clone(),
-                    force_keyframe.clone(),
-                    events.clone(),
-                    frames_per_second,
-                    bitrate_bps,
-                    width,
-                    height,
-                    active_datagram_size.clone(),
-                    hardware_progress.clone(),
-                ) {
-                    Ok(()) => break None,
-                    Err(error) if running.load(Ordering::Relaxed) => {
-                        if hardware_progress.load(Ordering::Acquire) > progress_before {
-                            immediate_failures = 0;
-                        } else {
-                            immediate_failures = immediate_failures.saturating_add(1);
+            let wgc_error = if dxgi_device_lost {
+                // A device removal applies to the adapter, not just Desktop
+                // Duplication. Starting WGC on it immediately creates another
+                // doomed D3D/NVENC session while Windows is resetting the GPU.
+                Some("not attempted while the GPU driver resets".to_owned())
+            } else {
+                loop {
+                    let progress_before = hardware_progress.load(Ordering::Acquire);
+                    match run_wgc_pipeline(
+                        socket.clone(),
+                        running.clone(),
+                        active_peer.clone(),
+                        force_keyframe.clone(),
+                        events.clone(),
+                        frames_per_second,
+                        bitrate_bps,
+                        width,
+                        height,
+                        active_datagram_size.clone(),
+                        hardware_progress.clone(),
+                    ) {
+                        Ok(()) => break None,
+                        Err(error) if running.load(Ordering::Relaxed) => {
+                            if is_d3d_device_lost_error(&error) {
+                                // The underlying device is permanently invalid.
+                                // Let the outer recovery loop wait for the driver
+                                // reset and create an entirely fresh pipeline.
+                                break Some(error);
+                            }
+                            if hardware_progress.load(Ordering::Acquire) > progress_before {
+                                immediate_failures = 0;
+                            } else {
+                                immediate_failures = immediate_failures.saturating_add(1);
+                            }
+                            if immediate_failures >= MAX_IMMEDIATE_HARDWARE_FAILURES {
+                                break Some(error);
+                            }
+                            debug!(
+                                "Windows Graphics Capture/NVENC stopped; rebuilding hardware pipeline: {error}"
+                            );
+                            force_keyframe.store(true, Ordering::Release);
+                            let _ = events.send(SessionEvent::VideoBackend(format!(
+                                "Windows Graphics Capture/NVENC restarting after: {error}"
+                            )));
+                            thread::sleep(Duration::from_millis(50));
                         }
-                        if immediate_failures >= MAX_IMMEDIATE_HARDWARE_FAILURES {
-                            break Some(error);
-                        }
-                        debug!(
-                            "Windows Graphics Capture/NVENC stopped; rebuilding hardware pipeline: {error}"
-                        );
-                        force_keyframe.store(true, Ordering::Release);
-                        let _ = events.send(SessionEvent::VideoBackend(format!(
-                            "Windows Graphics Capture/NVENC restarting after: {error}"
-                        )));
-                        thread::sleep(Duration::from_millis(50));
+                        Err(_) => break None,
                     }
-                    Err(_) => break None,
                 }
             };
             let Some(wgc_error) = wgc_error else {
@@ -339,6 +355,7 @@ fn wait_while_running(running: &AtomicBool, duration: Duration) {
 #[derive(Debug)]
 enum DxgiCaptureFailure {
     AccessLost(String),
+    DeviceLost(String),
     EncoderStalled(String),
     Fatal(String),
 }
@@ -407,6 +424,13 @@ fn run_dxgi_pipeline(
                 }
                 thread::sleep(Duration::from_millis(25));
             }
+            Err(DxgiCaptureFailure::DeviceLost(error)) => {
+                // A removed D3D device cannot recover. Retrying this inner
+                // loop only creates another encoder while the driver is still
+                // resetting and can exhaust the process NVENC-session limit.
+                force_keyframe.store(true, Ordering::Release);
+                break Err(error);
+            }
             Err(DxgiCaptureFailure::EncoderStalled(error)) => {
                 force_keyframe.store(true, Ordering::Release);
                 break Err(error);
@@ -444,12 +468,12 @@ fn run_dxgi_capture_session(
     hardware_progress: Arc<AtomicU64>,
 ) -> Result<(), DxgiCaptureFailure> {
     let (device, device_context, output) =
-        create_dxgi_device_for_primary_display().map_err(DxgiCaptureFailure::Fatal)?;
+        create_dxgi_device_for_primary_display().map_err(classify_dxgi_capture_error)?;
     let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|error| {
         if error.code() == DXGI_ERROR_ACCESS_LOST {
             DxgiCaptureFailure::AccessLost(format!("Unable to duplicate primary display: {error}"))
         } else {
-            DxgiCaptureFailure::Fatal(format!("Unable to duplicate primary display: {error}"))
+            classify_dxgi_capture_error(format!("Unable to duplicate primary display: {error}"))
         }
     })?;
     let peer_state = active_peer.clone();
@@ -470,7 +494,7 @@ fn run_dxgi_capture_session(
         },
         "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · D3D11 BGRA→NV12 · 4-buffer async",
     )
-    .map_err(DxgiCaptureFailure::Fatal)?;
+    .map_err(classify_dxgi_capture_error)?;
     let mut peer_became_active = None::<Instant>;
     let mut captured_for_peer = false;
     let mut activity_window_started = Instant::now();
@@ -555,6 +579,10 @@ fn run_dxgi_capture_session(
             Err(DxgiCaptureFailure::AccessLost(error)) => {
                 drop(capture);
                 return Err(DxgiCaptureFailure::AccessLost(error));
+            }
+            Err(DxgiCaptureFailure::DeviceLost(error)) => {
+                drop(capture);
+                return Err(DxgiCaptureFailure::DeviceLost(error));
             }
             Err(DxgiCaptureFailure::EncoderStalled(error)) => {
                 drop(capture);
@@ -650,7 +678,7 @@ fn acquire_dxgi_frame(
             )))
         }
         Err(error) => {
-            return Err(DxgiCaptureFailure::Fatal(format!(
+            return Err(classify_dxgi_capture_error(format!(
                 "Unable to acquire DXGI desktop frame: {error}"
             )))
         }
@@ -676,9 +704,26 @@ fn acquire_dxgi_frame(
     })();
     let release_result = unsafe { duplication.ReleaseFrame() }
         .map_err(|error| format!("Unable to release DXGI desktop frame: {error}"));
-    processing_result.map_err(DxgiCaptureFailure::Fatal)?;
-    release_result.map_err(DxgiCaptureFailure::Fatal)?;
+    processing_result.map_err(classify_dxgi_capture_error)?;
+    release_result.map_err(classify_dxgi_capture_error)?;
     Ok(true)
+}
+
+fn classify_dxgi_capture_error(error: String) -> DxgiCaptureFailure {
+    if is_d3d_device_lost_error(&error) {
+        DxgiCaptureFailure::DeviceLost(error)
+    } else {
+        DxgiCaptureFailure::Fatal(error)
+    }
+}
+
+fn is_d3d_device_lost_error(error: &str) -> bool {
+    // DXGI_ERROR_DEVICE_REMOVED, DEVICE_HUNG, DEVICE_RESET, and
+    // DRIVER_INTERNAL_ERROR. Error strings include both the immediate HRESULT
+    // and GetDeviceRemovedReason, so matching either one retires the device.
+    ["0x887A0005", "0x887A0006", "0x887A0007", "0x887A0020"]
+        .iter()
+        .any(|code| error.contains(code))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1055,24 +1100,29 @@ impl HardwareCapture {
                 return Err("D3D11 desktop copy cancelled while stopping".to_owned());
             }
             let mut complete = BOOL::default();
-            unsafe {
+            let completion = unsafe {
                 self.device_context.GetData(
                     &self.copy_completion_query,
                     Some((&mut complete as *mut BOOL).cast()),
                     std::mem::size_of::<BOOL>() as u32,
                     D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
                 )
-            }
-            .map_err(|error| {
-                format!(
+            };
+            if let Err(error) = completion {
+                // The encoder owns resources on this same D3D device. Mark it
+                // unusable before teardown so Drop does not issue a sequence
+                // of unregister/unmap calls into a removed driver context.
+                self.encoder.poison();
+                return Err(format!(
                     "Unable to query D3D11 copy completion: {error}; {}",
                     d3d11_device_removed_reason(&self.device_context)
-                )
-            })?;
+                ));
+            }
             if complete.as_bool() {
                 return Ok(());
             }
             if started.elapsed() >= GPU_COPY_COMPLETION_TIMEOUT {
+                self.encoder.poison();
                 return Err(format!(
                     "D3D11 desktop copy did not finish within {} ms",
                     GPU_COPY_COMPLETION_TIMEOUT.as_millis()
@@ -1375,10 +1425,11 @@ fn create_output_texture(
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        // This is both a D3D11 video-processor output and an NVENC input. The
-        // encoder bind flag is valid for NV12 (unlike the former BGRA path)
-        // and tells the driver about both intended hardware-video uses.
-        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32,
+        // NVIDIA's D3D11 NVENC path registers a normal render-target texture
+        // directly. D3D11_BIND_VIDEO_ENCODER is for the D3D11 video-encoder
+        // API, not NVENC, and combining it with the video-processor output has
+        // caused NVIDIA drivers to remove the device under sustained load.
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
         CPUAccessFlags: 0,
         MiscFlags: 0,
     };
@@ -1427,7 +1478,7 @@ impl D3dScaler {
             },
             OutputWidth: output_width,
             OutputHeight: output_height,
-            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+            Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
         };
         let enumerator = unsafe {
             video_device
@@ -1608,7 +1659,7 @@ impl NvencApi {
             "initialize NVENC API",
         )?;
         Ok(Self {
-            _library: library,
+            library: Some(library),
             functions,
         })
     }
@@ -1986,16 +2037,41 @@ impl Drop for NvencEncoder {
         unsafe {
             if !self.encoder.is_null() {
                 if self.poisoned.load(Ordering::Acquire) {
-                    // Once an NVENC call has timed out, further driver calls
-                    // (especially unmap/unregister/destroy) are not safe
-                    // teardown primitives: they can wait forever on the same
-                    // suspended context. Dropping the D3D device reclaims its
-                    // resources; only close the process-owned event handles.
-                    for slot in &self.slots {
-                        if !slot.completion_event.is_invalid() {
-                            let _ = CloseHandle(slot.completion_event);
+                    // Unmap/unregister calls can block forever after a D3D
+                    // device removal, but omitting nvEncDestroyEncoder leaks a
+                    // hardware session. After several rebuilds the GeForce
+                    // session limit is exhausted and recovery fails for good.
+                    // Retire the whole encoder on a detached reaper: the app
+                    // and socket shutdown stay bounded while the NVIDIA driver
+                    // gets one chance to reclaim the session atomically.
+                    let encoder = self.encoder as usize;
+                    self.encoder = ptr::null_mut();
+                    let destroy = self.api.functions.nvEncDestroyEncoder;
+                    let library = self.api.library.take();
+                    let textures = self
+                        .slots
+                        .iter()
+                        .map(|slot| slot.texture.clone())
+                        .collect::<Vec<_>>();
+                    let completion_events = self
+                        .slots
+                        .iter()
+                        .filter(|slot| !slot.completion_event.is_invalid())
+                        .map(|slot| slot.completion_event.0 as usize)
+                        .collect::<Vec<_>>();
+                    thread::spawn(move || {
+                        let _textures = textures;
+                        let _library = library;
+                        if let Some(destroy) = destroy {
+                            let status = destroy(encoder as *mut c_void);
+                            if status != NVENCSTATUS::NV_ENC_SUCCESS {
+                                warn!("Unable to retire poisoned NVENC session: {status:?}");
+                            }
                         }
-                    }
+                        for event in completion_events {
+                            let _ = CloseHandle(HANDLE(event as *mut c_void));
+                        }
+                    });
                     return;
                 }
                 for slot in &self.slots {
