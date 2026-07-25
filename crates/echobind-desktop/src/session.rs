@@ -83,6 +83,7 @@ impl VideoResolution {
         }
     }
 
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn capture_resolution(self) -> Resolution {
         match self {
             Self::Native => Resolution::Captured,
@@ -92,11 +93,13 @@ impl VideoResolution {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 enum CapturedFrame {
     Nv12(YUVFrame),
     Bgra(BGRAFrame),
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 impl CapturedFrame {
     fn update_i420(
         &self,
@@ -119,6 +122,7 @@ impl CapturedFrame {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 struct CapturedSample {
     frame: CapturedFrame,
     captured_at: Instant,
@@ -581,6 +585,7 @@ fn configure_socket_buffers(socket: &UdpSocket, requested_size: usize) -> Result
     Ok(())
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn ensure_software_capture_available() -> Result<(), String> {
     if !scap::is_supported() {
         return Err("Screen capture is not supported on this system".to_owned());
@@ -868,6 +873,7 @@ fn spawn_host_network(
     })
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn spawn_capture(
     running: Arc<AtomicBool>,
     capture_slot: CaptureSlot,
@@ -940,6 +946,7 @@ fn spawn_capture(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn spawn_encoder(
     socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,

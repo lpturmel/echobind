@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", allow(dead_code))]
+
 use openh264::formats::YUVSource;
 use rayon::prelude::*;
 use scap::frame::{BGRAFrame, YUVFrame};

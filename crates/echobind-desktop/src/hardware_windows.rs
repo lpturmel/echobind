@@ -39,16 +39,16 @@ use windows::{
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
             Direct3D11::{
-                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11InfoQueue, ID3D11Query,
-                ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
-                ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
-                D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_DEBUG,
-                D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MESSAGE, D3D11_QUERY_DESC,
-                D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-                D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-                D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-                D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11InfoQueue,
+                ID3D11Multithread, ID3D11Query, ID3D11Texture2D, ID3D11VideoContext,
+                ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+                ID3D11VideoProcessorOutputView, D3D11_ASYNC_GETDATA_DONOTFLUSH,
+                D3D11_BIND_RENDER_TARGET, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_DEBUG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MESSAGE,
+                D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
+                D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
+                D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
                 D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
                 D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
@@ -168,6 +168,7 @@ struct NvencEncoder {
     slots: Vec<NvencSlot>,
     width: u32,
     height: u32,
+    gpu_api_lock: Mutex<()>,
     poisoned: AtomicBool,
 }
 
@@ -548,17 +549,34 @@ fn create_dxgi_device_for_primary_display(
                 create_result.map_err(|error| {
                     format!("Unable to create primary-GPU D3D11 device: {error}")
                 })?;
-                return Ok((
-                    device.ok_or_else(|| "D3D11 returned no device".to_owned())?,
-                    context.ok_or_else(|| "D3D11 returned no immediate context".to_owned())?,
-                    output,
-                ));
+                let device = device.ok_or_else(|| "D3D11 returned no device".to_owned())?;
+                let context =
+                    context.ok_or_else(|| "D3D11 returned no immediate context".to_owned())?;
+                enable_d3d11_multithread_protection(&context)?;
+                return Ok((device, context, output));
             }
             output_index += 1;
         }
         adapter_index += 1;
     }
     Err("The primary monitor was not found among the active DXGI outputs".to_owned())
+}
+
+fn enable_d3d11_multithread_protection(context: &ID3D11DeviceContext) -> Result<(), String> {
+    // NVENC documents that NvEncLockBitstream may use the application's
+    // DirectX device on its completion thread. D3D11 immediate-context
+    // protection is off by default, so leaving this disabled permits that
+    // internal use to race CopyResource/GetData on the capture thread.
+    let multithread: ID3D11Multithread = context.cast().map_err(|error| {
+        format!("Unable to enable D3D11 immediate-context thread protection: {error}")
+    })?;
+    unsafe {
+        let _ = multithread.SetMultithreadProtected(TRUE);
+    }
+    if !unsafe { multithread.GetMultithreadProtected() }.as_bool() {
+        return Err("D3D11 refused to enable immediate-context thread protection".to_owned());
+    }
+    Ok(())
 }
 
 fn acquire_dxgi_frame(
@@ -720,19 +738,25 @@ impl HardwareCapture {
             self.next_frame_at = now + self.frame_interval;
         }
         let Ok(slot) = self.free_slots.try_recv() else {
-            // All four frames are still being encoded. Never block the WGC
-            // callback; sampling a newer capture is lower latency.
+            // All four frames are still being encoded. Never block desktop
+            // acquisition; sampling a newer capture is lower latency.
             return Ok(());
         };
+        // NvEncLockBitstream/NvEncUnlockBitstream can internally touch this
+        // same D3D11 device from the completion thread. Serialize those calls
+        // with capture copying/scaling and submission. GPU encoding remains
+        // asynchronous; this protects only the short CPU-side API sequences.
+        let encoder = self.encoder.clone();
+        let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
         let capture_started = Instant::now();
         let output_texture = self.encoder.slots[slot].texture.clone();
         let requires_scaling =
             source_width != self.flags.width || source_height != self.flags.height;
 
         if requires_scaling {
-            // Capture APIs own their source texture and may recycle it as soon
-            // as this callback returns. Downscaling therefore starts with a
-            // per-slot GPU copy whose lifetime extends through the encode.
+            // DXGI owns its source texture and may recycle it after
+            // ReleaseFrame. Downscaling therefore starts with a per-slot GPU
+            // copy whose lifetime extends through the encode.
             let capture_texture_needs_rebuild =
                 self.capture_textures[slot].as_ref().is_none_or(|texture| {
                     texture.width != source_width || texture.height != source_height
@@ -826,6 +850,7 @@ impl HardwareCapture {
                 return Err(error);
             }
         };
+        drop(gpu_api_guard);
         let pending = PendingNvencFrame {
             slot,
             mapped_resource,
@@ -1518,6 +1543,7 @@ impl NvencEncoder {
             slots: Vec::with_capacity(NVENC_BUFFER_COUNT),
             width,
             height,
+            gpu_api_lock: Mutex::new(()),
             poisoned: AtomicBool::new(false),
         };
         result.open(device)?;
@@ -1794,6 +1820,7 @@ impl NvencEncoder {
                 "NVENC completion event timed out or failed ({wait:?})"
             ));
         }
+        let _gpu_api_guard = self.gpu_api_lock.lock().unwrap();
         let lock_bitstream = required(self.api.functions.nvEncLockBitstream, "NvEncLockBitstream")?;
         let unlock = required(
             self.api.functions.nvEncUnlockBitstream,
