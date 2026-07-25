@@ -1,4 +1,5 @@
 use openh264::formats::YUVSource;
+use rayon::prelude::*;
 use scap::frame::{BGRAFrame, YUVFrame};
 
 #[derive(Default)]
@@ -99,42 +100,47 @@ impl I420Frame {
         }
 
         let chroma_width = width / 2;
-        for row in (0..height).step_by(2) {
-            let source_top_row = self.source_rows[row];
-            let source_bottom_row = self.source_rows[row + 1];
-            let (top_y, remaining_y) = self.y.split_at_mut((row + 1) * width);
-            let top_y = &mut top_y[row * width..];
-            let bottom_y = &mut remaining_y[..width];
-            let chroma_row = row / 2;
-            let u_row = &mut self.u[chroma_row * chroma_width..(chroma_row + 1) * chroma_width];
-            let v_row = &mut self.v[chroma_row * chroma_width..(chroma_row + 1) * chroma_width];
+        self.y
+            .par_chunks_mut(width * 2)
+            .zip(self.u.par_chunks_mut(chroma_width))
+            .zip(self.v.par_chunks_mut(chroma_width))
+            .enumerate()
+            .for_each(|(chroma_row, ((y_rows, u_row), v_row))| {
+                let row = chroma_row * 2;
+                let source_top_row = self.source_rows[row];
+                let source_bottom_row = self.source_rows[row + 1];
+                let (top_y, bottom_y) = y_rows.split_at_mut(width);
 
-            for column in (0..width).step_by(2) {
-                let source_left = self.source_columns[column];
-                let source_right = self.source_columns[column + 1];
-                let top_left =
-                    bgra_components(&frame.data, source_top_row * source_width + source_left);
-                let top_right =
-                    bgra_components(&frame.data, source_top_row * source_width + source_right);
-                let bottom_left =
-                    bgra_components(&frame.data, source_bottom_row * source_width + source_left);
-                let bottom_right =
-                    bgra_components(&frame.data, source_bottom_row * source_width + source_right);
+                for column in (0..width).step_by(2) {
+                    let source_left = self.source_columns[column];
+                    let source_right = self.source_columns[column + 1];
+                    let top_left =
+                        bgra_components(&frame.data, source_top_row * source_width + source_left);
+                    let top_right =
+                        bgra_components(&frame.data, source_top_row * source_width + source_right);
+                    let bottom_left = bgra_components(
+                        &frame.data,
+                        source_bottom_row * source_width + source_left,
+                    );
+                    let bottom_right = bgra_components(
+                        &frame.data,
+                        source_bottom_row * source_width + source_right,
+                    );
 
-                top_y[column] = rgb_to_y(top_left);
-                top_y[column + 1] = rgb_to_y(top_right);
-                bottom_y[column] = rgb_to_y(bottom_left);
-                bottom_y[column + 1] = rgb_to_y(bottom_right);
+                    top_y[column] = rgb_to_y(top_left);
+                    top_y[column + 1] = rgb_to_y(top_right);
+                    bottom_y[column] = rgb_to_y(bottom_left);
+                    bottom_y[column + 1] = rgb_to_y(bottom_right);
 
-                let red = top_left.0 + top_right.0 + bottom_left.0 + bottom_right.0;
-                let green = top_left.1 + top_right.1 + bottom_left.1 + bottom_right.1;
-                let blue = top_left.2 + top_right.2 + bottom_left.2 + bottom_right.2;
-                u_row[column / 2] =
-                    clamp_u8(((-38 * red - 74 * green + 112 * blue + 512) >> 10) + 128);
-                v_row[column / 2] =
-                    clamp_u8(((112 * red - 94 * green - 18 * blue + 512) >> 10) + 128);
-            }
-        }
+                    let red = top_left.0 + top_right.0 + bottom_left.0 + bottom_right.0;
+                    let green = top_left.1 + top_right.1 + bottom_left.1 + bottom_right.1;
+                    let blue = top_left.2 + top_right.2 + bottom_left.2 + bottom_right.2;
+                    u_row[column / 2] =
+                        clamp_u8(((-38 * red - 74 * green + 112 * blue + 512) >> 10) + 128);
+                    v_row[column / 2] =
+                        clamp_u8(((112 * red - 94 * green - 18 * blue + 512) >> 10) + 128);
+                }
+            });
 
         Ok(())
     }

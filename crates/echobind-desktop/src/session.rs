@@ -2,7 +2,7 @@ use crate::video::I420Frame;
 use echobind_core::{
     protocol::{Packet, MAX_DATAGRAM_SIZE},
     video::{fragment_video_frame, VideoReassembler},
-    FrameRate as SessionFrameRate, SessionConfig, VideoCodec, VideoConfig,
+    AudioConfig, FrameRate as SessionFrameRate, SessionConfig, VideoCodec, VideoConfig,
 };
 use openh264::{
     decoder::Decoder,
@@ -28,9 +28,16 @@ use std::{
 };
 use tracing::{debug, warn};
 
+#[path = "audio.rs"]
+mod audio;
+
 #[cfg(target_os = "macos")]
 #[path = "hardware_macos.rs"]
 mod hardware_macos;
+
+#[cfg(target_os = "windows")]
+#[path = "hardware_windows.rs"]
+mod hardware_windows;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
@@ -40,20 +47,23 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoResolution {
+    Native,
     P720,
     P1080,
 }
 
 impl VideoResolution {
-    pub const fn dimensions(self) -> (u32, u32) {
+    pub const fn dimensions(self) -> Option<(u32, u32)> {
         match self {
-            Self::P720 => (1280, 720),
-            Self::P1080 => (1920, 1080),
+            Self::Native => None,
+            Self::P720 => Some((1280, 720)),
+            Self::P1080 => Some((1920, 1080)),
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Native => "Native",
             Self::P720 => "720p",
             Self::P1080 => "1080p",
         }
@@ -61,6 +71,7 @@ impl VideoResolution {
 
     fn capture_resolution(self) -> Resolution {
         match self {
+            Self::Native => Resolution::Captured,
             Self::P720 => Resolution::_720p,
             Self::P1080 => Resolution::_1080p,
         }
@@ -81,7 +92,13 @@ impl CapturedFrame {
         match self {
             Self::Nv12(frame) => destination.update_from_nv12(frame),
             Self::Bgra(frame) => {
-                let (width, height) = resolution.dimensions();
+                let (width, height) = match resolution.dimensions() {
+                    Some(dimensions) => dimensions,
+                    None => (
+                        u32::try_from(frame.width).map_err(|_| "negative capture width")?,
+                        u32::try_from(frame.height).map_err(|_| "negative capture height")?,
+                    ),
+                };
                 destination.update_from_bgra_scaled(frame, width, height)
             }
         }
@@ -109,6 +126,7 @@ pub enum SessionEvent {
     CaptureReady,
     VideoConfigured { width: u32, height: u32 },
     VideoBackend(String),
+    AudioBackend(String),
     Stats { fps: f32, megabits_per_second: f32 },
     Error(String),
 }
@@ -122,6 +140,7 @@ enum HostCommand {
 pub struct DesktopSession {
     running: Arc<AtomicBool>,
     host_commands: Option<mpsc::Sender<HostCommand>>,
+    audio_commands: Option<mpsc::Sender<Option<String>>>,
     events: mpsc::Receiver<SessionEvent>,
     latest_frame: LatestFrame,
     capture_slot: Option<CaptureSlot>,
@@ -129,13 +148,21 @@ pub struct DesktopSession {
 }
 
 impl DesktopSession {
+    pub fn audio_output_devices() -> Result<Vec<String>, String> {
+        audio::output_device_names()
+    }
+
     pub fn start_host(
         bind_addr: SocketAddr,
         frames_per_second: u32,
         bitrate_bps: u32,
         resolution: VideoResolution,
     ) -> Result<Self, String> {
-        #[cfg(not(target_os = "macos"))]
+        let (audio_capture, audio_probe_error) = match audio::discover_system_audio_capture() {
+            Ok(settings) => (Some(settings), None),
+            Err(error) => (None, Some(error)),
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             ensure_software_capture_available()?;
         }
@@ -158,9 +185,11 @@ impl DesktopSession {
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
 
-        let (width, height) = resolution.dimensions();
+        let (width, height) = configured_video_dimensions(resolution)?;
         let session_config = SessionConfig {
-            audio: None,
+            audio: audio_capture
+                .as_ref()
+                .map(audio::AudioCaptureSettings::session_config),
             video: Some(VideoConfig {
                 codec: VideoCodec::H264,
                 width,
@@ -184,14 +213,19 @@ impl DesktopSession {
             event_tx.clone(),
             config_json,
         );
+        if let Some(error) = audio_probe_error {
+            let _ = event_tx.send(SessionEvent::AudioBackend(format!(
+                "Audio unavailable: {error}"
+            )));
+        }
 
         #[cfg(target_os = "macos")]
         let (capture_slot, mut media_handles) = {
             let hardware_handle = hardware_macos::spawn_hardware_pipeline(
-                socket,
+                socket.clone(),
                 running.clone(),
-                active_peer,
-                force_keyframe,
+                active_peer.clone(),
+                force_keyframe.clone(),
                 event_tx.clone(),
                 frames_per_second,
                 bitrate_bps,
@@ -200,7 +234,24 @@ impl DesktopSession {
             (None, vec![hardware_handle])
         };
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        let (capture_slot, mut media_handles) = {
+            let hardware_handle = hardware_windows::spawn_hardware_pipeline(
+                socket.clone(),
+                running.clone(),
+                active_peer.clone(),
+                force_keyframe.clone(),
+                event_tx.clone(),
+                frames_per_second,
+                bitrate_bps,
+                width,
+                height,
+                resolution,
+            );
+            (None, vec![hardware_handle])
+        };
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let (capture_slot, mut media_handles) = {
             let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
             let capture_handle = spawn_capture(
@@ -211,10 +262,10 @@ impl DesktopSession {
                 resolution,
             );
             let encoder_handle = spawn_encoder(
-                socket,
+                socket.clone(),
                 running.clone(),
-                active_peer,
-                force_keyframe,
+                active_peer.clone(),
+                force_keyframe.clone(),
                 capture_slot.clone(),
                 event_tx.clone(),
                 frames_per_second,
@@ -224,6 +275,15 @@ impl DesktopSession {
             (Some(capture_slot), vec![capture_handle, encoder_handle])
         };
 
+        if let Some(settings) = audio_capture {
+            media_handles.push(audio::spawn_audio_capture(
+                socket,
+                running.clone(),
+                active_peer,
+                event_tx.clone(),
+                settings,
+            ));
+        }
         let _ = event_tx.send(SessionEvent::Listening(local_addr));
         let _ = event_tx.send(SessionEvent::VideoConfigured { width, height });
         let mut handles = vec![network_handle];
@@ -231,6 +291,7 @@ impl DesktopSession {
         Ok(Self {
             running,
             host_commands: Some(command_tx),
+            audio_commands: None,
             events: event_rx,
             latest_frame,
             capture_slot,
@@ -238,7 +299,10 @@ impl DesktopSession {
         })
     }
 
-    pub fn start_client(server_addr: SocketAddr) -> Result<Self, String> {
+    pub fn start_client(
+        server_addr: SocketAddr,
+        audio_output_device: Option<String>,
+    ) -> Result<Self, String> {
         let bind_addr = if server_addr.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -256,17 +320,21 @@ impl DesktopSession {
         let running = Arc::new(AtomicBool::new(true));
         let latest_frame = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::channel();
+        let (audio_command_tx, audio_command_rx) = mpsc::channel();
         let handle = spawn_client(
             socket,
             server_addr,
             running.clone(),
             latest_frame.clone(),
             event_tx,
+            audio_output_device,
+            audio_command_rx,
         );
 
         Ok(Self {
             running,
             host_commands: None,
+            audio_commands: Some(audio_command_tx),
             events: event_rx,
             latest_frame,
             capture_slot: None,
@@ -283,6 +351,12 @@ impl DesktopSession {
     pub fn reject(&self, peer: SocketAddr) {
         if let Some(commands) = &self.host_commands {
             let _ = commands.send(HostCommand::Reject(peer));
+        }
+    }
+
+    pub fn set_audio_output_device(&self, device: Option<String>) {
+        if let Some(commands) = &self.audio_commands {
+            let _ = commands.send(device);
         }
     }
 
@@ -315,6 +389,55 @@ fn ensure_software_capture_available() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn configured_video_dimensions(resolution: VideoResolution) -> Result<(u32, u32), String> {
+    #[cfg(target_os = "windows")]
+    let (native_width, native_height) = {
+        let monitor = windows_capture::monitor::Monitor::primary()
+            .map_err(|error| format!("Unable to find the primary display: {error}"))?;
+        let width = monitor
+            .width()
+            .map_err(|error| format!("Unable to detect display width: {error}"))?;
+        let height = monitor
+            .height()
+            .map_err(|error| format!("Unable to detect display height: {error}"))?;
+        (width, height)
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let (native_width, native_height) = {
+        let mut probe = Capturer::build(Options {
+            output_resolution: Resolution::Captured,
+            ..Default::default()
+        })
+        .map_err(|error| format!("Unable to detect native display resolution: {error}"))?;
+        let [width, height] = probe.get_output_frame_size();
+        (width, height)
+    };
+
+    let (width, height) = match resolution.dimensions() {
+        Some((max_width, max_height)) => {
+            fit_capture_dimensions(native_width, native_height, max_width, max_height)
+        }
+        None => (native_width & !1, native_height & !1),
+    };
+    if width == 0 || height == 0 {
+        return Err("Native display has invalid dimensions".to_owned());
+    }
+    Ok((width, height))
+}
+
+fn fit_capture_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (max_width, max_height);
+    }
+    let scale = (max_width as f64 / width as f64)
+        .min(max_height as f64 / height as f64)
+        .min(1.0);
+    let fitted_width = ((width as f64 * scale).floor() as u32).max(2) & !1;
+    let fitted_height = ((height as f64 * scale).floor() as u32).max(2) & !1;
+    (fitted_width, fitted_height)
 }
 
 impl Drop for DesktopSession {
@@ -521,8 +644,11 @@ fn spawn_encoder(
             .rate_control_mode(RateControlMode::Bitrate)
             .usage_type(UsageType::ScreenContentRealTime)
             .complexity(Complexity::Low)
+            .adaptive_quantization(false)
+            .background_detection(false)
             .skip_frames(false)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(frames_per_second));
+            .intra_frame_period(IntraFramePeriod::from_num_frames(frames_per_second))
+            .max_slice_len(32 * 1024);
         let mut encoder = match Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
         {
             Ok(encoder) => encoder,
@@ -646,6 +772,8 @@ fn spawn_client(
     running: Arc<AtomicBool>,
     latest_frame: LatestFrame,
     events: mpsc::Sender<SessionEvent>,
+    mut audio_output_device: Option<String>,
+    audio_commands: mpsc::Receiver<Option<String>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut decoder = match Decoder::new() {
@@ -674,9 +802,23 @@ fn spawn_client(
         let mut stats_bytes = 0_u64;
         let mut last_decoded_frame_id = None::<u64>;
         let mut waiting_for_keyframe = true;
+        let mut audio_config = None::<AudioConfig>;
+        let mut audio_configured = false;
+        let mut audio_playback = None::<audio::AudioPlayback>;
         let _ = events.send(SessionEvent::AwaitingApproval);
 
         while running.load(Ordering::Relaxed) {
+            while let Ok(device) = audio_commands.try_recv() {
+                audio_output_device = device;
+                audio_playback.take();
+                if let Some(config) = audio_config.clone() {
+                    audio_playback = Some(audio::spawn_audio_playback(
+                        config,
+                        audio_output_device.clone(),
+                        events.clone(),
+                    ));
+                }
+            }
             if !accepted && last_hello.elapsed() >= HELLO_INTERVAL {
                 Packet::Hello.encode(&mut outgoing);
                 if let Err(error) = socket.send(&outgoing) {
@@ -717,6 +859,21 @@ fn spawn_client(
                                     return;
                                 }
                             };
+                            if !audio_configured {
+                                audio_configured = true;
+                                audio_config = config.audio.clone();
+                                if let Some(config) = audio_config.clone() {
+                                    audio_playback = Some(audio::spawn_audio_playback(
+                                        config,
+                                        audio_output_device.clone(),
+                                        events.clone(),
+                                    ));
+                                } else {
+                                    let _ = events.send(SessionEvent::AudioBackend(
+                                        "Host did not offer audio".to_owned(),
+                                    ));
+                                }
+                            }
                             let Some(video) = config.video else {
                                 let _ = events.send(SessionEvent::Error(
                                     "Host did not offer a video stream".to_owned(),
@@ -749,6 +906,11 @@ fn spawn_client(
                         Packet::Ping(id) => {
                             Packet::Pong(id).encode(&mut outgoing);
                             let _ = socket.send(&outgoing);
+                        }
+                        Packet::Audio(frame) if accepted => {
+                            if let Some(playback) = &audio_playback {
+                                playback.push(frame);
+                            }
                         }
                         Packet::Video(fragment) if accepted => match reassembler.push(fragment) {
                             Ok(Some(frame)) => {
@@ -802,8 +964,8 @@ fn spawn_client(
                             }
                         },
                         Packet::Hello
-                        | Packet::Audio(_)
                         | Packet::Clipboard(_)
+                        | Packet::Audio(_)
                         | Packet::Video(_)
                         | Packet::VideoKeyframeRequest => {}
                     }

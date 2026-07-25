@@ -108,7 +108,9 @@ fn run_hardware_pipeline(
     let display = displays
         .first()
         .ok_or_else(|| "ScreenCaptureKit found no displays".to_owned())?;
-    let (max_width, max_height) = resolution.dimensions();
+    let (max_width, max_height) = resolution
+        .dimensions()
+        .unwrap_or((display.width(), display.height()));
     let (width, height) =
         fit_capture_dimensions(display.width(), display.height(), max_width, max_height);
     let frame_interval = CMTime::new(1, frames_per_second as i32);

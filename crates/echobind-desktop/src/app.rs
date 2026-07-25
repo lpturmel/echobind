@@ -25,12 +25,16 @@ pub struct EchobindApp {
     stream_width: u32,
     stream_height: u32,
     video_backend: String,
+    audio_output_devices: Vec<String>,
+    audio_output_device: Option<String>,
+    audio_backend: String,
     fullscreen: bool,
 }
 
 impl EchobindApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         creation_context.egui_ctx.set_theme(egui::Theme::Dark);
+        let audio_output_devices = DesktopSession::audio_output_devices().unwrap_or_default();
 
         Self {
             mode: Mode::Connect,
@@ -39,7 +43,7 @@ impl EchobindApp {
             port: 3013,
             frames_per_second: 60,
             bitrate_mbps: 6,
-            resolution: VideoResolution::P720,
+            resolution: VideoResolution::Native,
             status: "Ready".to_owned(),
             pending_peer: None,
             session: None,
@@ -49,6 +53,9 @@ impl EchobindApp {
             stream_width: 0,
             stream_height: 0,
             video_backend: "initializing".to_owned(),
+            audio_output_devices,
+            audio_output_device: None,
+            audio_backend: "System default output".to_owned(),
             fullscreen: false,
         }
     }
@@ -95,6 +102,9 @@ impl EchobindApp {
                 }
                 SessionEvent::VideoBackend(backend) => {
                     self.video_backend = backend;
+                }
+                SessionEvent::AudioBackend(backend) => {
+                    self.audio_backend = backend;
                 }
                 SessionEvent::Stats {
                     fps,
@@ -161,7 +171,7 @@ impl EchobindApp {
         };
         self.stop();
 
-        match DesktopSession::start_client(address) {
+        match DesktopSession::start_client(address, self.audio_output_device.clone()) {
             Ok(session) => {
                 self.status = format!("Requesting connection to {address}…");
                 self.session = Some(session);
@@ -183,7 +193,19 @@ impl EchobindApp {
         self.stream_width = 0;
         self.stream_height = 0;
         self.video_backend = "initializing".to_owned();
+        self.audio_backend = "System default output".to_owned();
         self.status = "Ready".to_owned();
+    }
+
+    fn refresh_audio_devices(&mut self) {
+        match DesktopSession::audio_output_devices() {
+            Ok(devices) => {
+                self.audio_output_devices = devices;
+            }
+            Err(error) => {
+                self.audio_backend = format!("Audio outputs unavailable: {error}");
+            }
+        }
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui) {
@@ -223,11 +245,16 @@ impl EchobindApp {
                 egui::ComboBox::from_id_salt("stream-resolution")
                     .selected_text(self.resolution.label())
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.resolution,
+                            VideoResolution::Native,
+                            "Native",
+                        );
                         ui.selectable_value(&mut self.resolution, VideoResolution::P720, "720p");
                         ui.selectable_value(&mut self.resolution, VideoResolution::P1080, "1080p");
                     });
                 ui.label("FPS");
-                ui.add(egui::DragValue::new(&mut self.frames_per_second).range(15..=60));
+                ui.add(egui::DragValue::new(&mut self.frames_per_second).range(15..=120));
                 ui.label("Mbps");
                 ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=20));
             }
@@ -253,6 +280,47 @@ impl EchobindApp {
                 self.set_fullscreen(ui.ctx(), true);
             }
         });
+
+        if self.mode == Mode::Connect {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Audio output");
+                let selected_text = self
+                    .audio_output_device
+                    .as_deref()
+                    .unwrap_or("System default");
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("audio-output-device")
+                    .selected_text(selected_text)
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(&mut self.audio_output_device, None, "System default")
+                            .changed();
+                        for device in &self.audio_output_devices {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.audio_output_device,
+                                    Some(device.clone()),
+                                    device,
+                                )
+                                .changed();
+                        }
+                    });
+                if changed {
+                    if let Some(session) = &self.session {
+                        session.set_audio_output_device(self.audio_output_device.clone());
+                    }
+                }
+                if ui.small_button("Refresh").clicked() {
+                    self.refresh_audio_devices();
+                }
+                if self.session.is_some() {
+                    ui.separator();
+                    ui.label(&self.audio_backend);
+                }
+            });
+        }
 
         if let Some(peer) = self.pending_peer {
             ui.add_space(8.0);
@@ -283,8 +351,8 @@ impl EchobindApp {
                 self.resolution.label().to_owned()
             };
             ui.label(format!(
-                "{:.1} FPS · {:.2} Mbps · {resolution} H.264 · {}",
-                self.stream_fps, self.stream_mbps, self.video_backend,
+                "{:.1} FPS · {:.2} Mbps · {resolution} H.264 · {} · {}",
+                self.stream_fps, self.stream_mbps, self.video_backend, self.audio_backend,
             ));
         }
     }
