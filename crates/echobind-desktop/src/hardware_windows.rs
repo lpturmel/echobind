@@ -33,9 +33,9 @@ use std::{
 };
 use tracing::warn;
 use windows::{
-    core::Interface,
+    core::{w, Interface},
     Win32::{
-        Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, RECT, TRUE, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, LUID, RECT, TRUE, WAIT_OBJECT_0},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
             Direct3D11::{
@@ -59,14 +59,19 @@ use windows::{
                 Common::{
                     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
                 },
-                CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
-                IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+                CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1,
+                IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
                 DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
             },
         },
+        Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        },
         System::Threading::{
-            CreateEventW, GetCurrentThread, SetThreadPriority, WaitForSingleObject,
-            THREAD_PRIORITY_ABOVE_NORMAL,
+            CreateEventW, GetCurrentProcess, GetCurrentThread, OpenProcessToken, SetThreadPriority,
+            WaitForSingleObject, THREAD_PRIORITY, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_HIGHEST,
         },
     },
 };
@@ -74,6 +79,7 @@ use windows_capture::monitor::Monitor;
 
 type NvencCreateInstance = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
 type NvencGetMaxVersion = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
+type D3dKmtSetProcessSchedulingPriorityClass = unsafe extern "system" fn(HANDLE, i32) -> i32;
 
 const NVENC_BUFFER_COUNT: usize = 4;
 const ENCODE_COMPLETION_TIMEOUT_MS: u32 = 1_000;
@@ -90,6 +96,14 @@ const VIDEO_PACING_BATCH_DATAGRAMS: usize = 16;
 const VIDEO_PACING_RATE_MULTIPLIER: u64 = 4;
 const VIDEO_PACING_SLEEP_GUARD: Duration = Duration::from_micros(500);
 const CURSOR_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+// Keep capture/conversion work ahead of a saturated game without using DXGI's
+// absolute realtime priorities, which Microsoft reserves for privileged work
+// and which can make a HAGS system unresponsive when VRAM is exhausted.
+const CAPTURE_GPU_THREAD_PRIORITY: i32 = 7;
+// D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH. Realtime is intentionally not used:
+// NVIDIA documents no contract for it, and production streamers avoid it on
+// HAGS because it can freeze encoding or reset the driver near the VRAM limit.
+const D3DKMT_PROCESS_GPU_PRIORITY_HIGH: i32 = 4;
 
 struct CaptureFlags {
     socket: Arc<UdpSocket>,
@@ -359,6 +373,7 @@ fn run_dxgi_capture_session(
     height: u32,
     hardware_progress: Arc<AtomicU64>,
 ) -> Result<(), DxgiCaptureFailure> {
+    let high_process_gpu_priority = configure_process_gpu_priority();
     let (device, device_context, output) =
         create_dxgi_device_for_primary_display().map_err(classify_dxgi_capture_error)?;
     let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|error| {
@@ -369,6 +384,14 @@ fn run_dxgi_capture_session(
         }
     })?;
     let peer_state = active_peer.clone();
+    let process_priority_label = if high_process_gpu_priority {
+        "process GPU high"
+    } else {
+        "process GPU normal"
+    };
+    let backend = format!(
+        "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · D3D11 BGRA→NV12 · {process_priority_label} / device +7 · 4-buffer async"
+    );
     let mut capture = HardwareCapture::new_with_device(
         &device,
         device_context,
@@ -385,7 +408,7 @@ fn run_dxgi_capture_session(
             width,
             height,
         },
-        "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · D3D11 BGRA→NV12 · 4-buffer async",
+        &backend,
     )
     .map_err(classify_dxgi_capture_error)?;
     let mut peer_became_active = None::<Instant>;
@@ -572,6 +595,7 @@ fn create_dxgi_device_for_primary_display(
                 let context =
                     context.ok_or_else(|| "D3D11 returned no immediate context".to_owned())?;
                 enable_d3d11_multithread_protection(&context)?;
+                configure_capture_gpu_priority(&device)?;
                 return Ok((device, context, output));
             }
             output_index += 1;
@@ -596,6 +620,101 @@ fn enable_d3d11_multithread_protection(context: &ID3D11DeviceContext) -> Result<
         return Err("D3D11 refused to enable immediate-context thread protection".to_owned());
     }
     Ok(())
+}
+
+fn configure_capture_gpu_priority(device: &ID3D11Device) -> Result<(), String> {
+    // With the default priority (0), a game that saturates the graphics queue
+    // can delay our BGRA->NV12 video-processor command for tens of
+    // milliseconds. process_texture must wait for that command before the
+    // acquired duplication surface may be released, so this starvation
+    // directly collapses capture FPS. +7 is DXGI's highest *relative*
+    // priority and applies to work submitted by this D3D11 device only.
+    let dxgi_device: IDXGIDevice = device
+        .cast()
+        .map_err(|error| format!("Unable to configure capture GPU priority: {error}"))?;
+    unsafe { dxgi_device.SetGPUThreadPriority(CAPTURE_GPU_THREAD_PRIORITY) }
+        .map_err(|error| format!("Unable to raise capture GPU priority: {error}"))?;
+    let actual = unsafe { dxgi_device.GetGPUThreadPriority() }
+        .map_err(|error| format!("Unable to verify capture GPU priority: {error}"))?;
+    if actual != CAPTURE_GPU_THREAD_PRIORITY {
+        return Err(format!(
+            "The graphics driver accepted capture GPU priority {}, but reported {actual}",
+            CAPTURE_GPU_THREAD_PRIORITY
+        ));
+    }
+    Ok(())
+}
+
+fn configure_process_gpu_priority() -> bool {
+    // SetGPUThreadPriority controls ordering inside this D3D device, while
+    // D3DKMT's process scheduling class controls how Windows arbitrates our
+    // GPU queues against a game. Both are needed when the game saturates the
+    // graphics engine. Resolve this WDDM entry point dynamically so older
+    // Windows versions fail visibly without adding another linked subsystem.
+    enable_gpu_scheduling_privilege();
+    let library = match unsafe { Library::new("gdi32.dll") } {
+        Ok(library) => library,
+        Err(error) => {
+            warn!("Unable to load gdi32.dll for capture GPU scheduling: {error}");
+            return false;
+        }
+    };
+    let set_priority = match unsafe {
+        library.get::<D3dKmtSetProcessSchedulingPriorityClass>(
+            b"D3DKMTSetProcessSchedulingPriorityClass\0",
+        )
+    } {
+        Ok(function) => function,
+        Err(error) => {
+            warn!("Windows does not expose process GPU scheduling priority: {error}");
+            return false;
+        }
+    };
+    let status = unsafe { set_priority(GetCurrentProcess(), D3DKMT_PROCESS_GPU_PRIORITY_HIGH) };
+    if status < 0 {
+        warn!(
+            "Unable to select high capture GPU scheduling priority (NTSTATUS 0x{:08X}); run the host elevated for full performance under GPU load",
+            status as u32
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn enable_gpu_scheduling_privilege() {
+    let mut token = HANDLE::default();
+    if let Err(error) = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    } {
+        warn!("Unable to open the host process token for GPU scheduling: {error}");
+        return;
+    }
+
+    let result = (|| {
+        let mut luid = LUID::default();
+        unsafe { LookupPrivilegeValueW(None, w!("SeIncreaseBasePriorityPrivilege"), &mut luid) }
+            .map_err(|error| format!("Unable to find the GPU scheduling privilege: {error}"))?;
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) }
+            .map_err(|error| format!("Unable to enable the GPU scheduling privilege: {error}"))
+    })();
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    if let Err(error) = result {
+        warn!("{error}");
+    }
 }
 
 fn acquire_dxgi_frame(
@@ -690,7 +809,7 @@ impl HardwareCapture {
         flags: CaptureFlags,
         backend: &str,
     ) -> Result<Self, String> {
-        raise_current_thread_priority("capture");
+        raise_current_thread_priority("capture", THREAD_PRIORITY_HIGHEST);
         let encoder = Arc::new(NvencEncoder::new(
             device,
             flags.width,
@@ -1076,7 +1195,7 @@ fn spawn_nvenc_completion(
     completion_done: mpsc::Sender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        raise_current_thread_priority("NVENC completion");
+        raise_current_thread_priority("NVENC completion", THREAD_PRIORITY_ABOVE_NORMAL);
         while let Ok(pending) = pending_frames.recv() {
             let result = encoder.complete(&pending);
             match result {
@@ -1133,7 +1252,7 @@ fn spawn_hardware_sender(
     bitrate_bps: u32,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        raise_current_thread_priority("video sender");
+        raise_current_thread_priority("video sender", THREAD_PRIORITY_ABOVE_NORMAL);
         let mut pacer = DatagramPacer::new(bitrate_bps);
         let mut packet = Vec::with_capacity(MAX_DATAGRAM_SIZE);
         let mut stats_started = Instant::now();
@@ -1352,10 +1471,8 @@ fn scale_cursor_coordinate(value: i32, output_size: u32, source_size: u32) -> i3
     scaled.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
-fn raise_current_thread_priority(role: &str) {
-    if let Err(error) =
-        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) }
-    {
+fn raise_current_thread_priority(role: &str, priority: THREAD_PRIORITY) {
+    if let Err(error) = unsafe { SetThreadPriority(GetCurrentThread(), priority) } {
         warn!("Unable to raise {role} thread priority: {error}");
     }
 }
