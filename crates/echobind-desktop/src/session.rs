@@ -265,11 +265,21 @@ pub enum SessionEvent {
     CursorPosition(CursorPosition),
     Stats {
         fps: f32,
+        source_fps: f32,
         megabits_per_second: f32,
         capture_ms: f32,
+        gpu_wait_ms: f32,
+        gpu_lock_ms: f32,
         encode_ms: f32,
         send_ms: f32,
         encode_queue_ms: f32,
+        dxgi_timeouts: u64,
+        dxgi_backlog: u64,
+        dxgi_backlog_max: u64,
+        pacing_skips: u64,
+        encoder_busy_skips: u64,
+        cursor_only_frames: u64,
+        stale_frames: u64,
     },
     ClientStats {
         received_fps: f32,
@@ -1118,11 +1128,21 @@ fn spawn_encoder(
                 let seconds = elapsed.as_secs_f32();
                 let _ = events.send(SessionEvent::Stats {
                     fps: stats_frames as f32 / seconds,
+                    source_fps: stats_frames as f32 / seconds,
                     megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
                     capture_ms: average_milliseconds(stats_capture_us, stats_frames),
+                    gpu_wait_ms: 0.0,
+                    gpu_lock_ms: 0.0,
                     encode_ms: average_milliseconds(stats_encode_us, stats_frames),
                     send_ms: average_milliseconds(stats_send_us, stats_frames),
                     encode_queue_ms: average_milliseconds(stats_encode_queue_us, stats_frames),
+                    dxgi_timeouts: 0,
+                    dxgi_backlog: 0,
+                    dxgi_backlog_max: 0,
+                    pacing_skips: 0,
+                    encoder_busy_skips: 0,
+                    cursor_only_frames: 0,
+                    stale_frames: 0,
                 });
                 stats_started = Instant::now();
                 stats_frames = 0;

@@ -63,10 +63,20 @@ pub struct EchobindApp {
     present_fps: f32,
     present_latency_ms: f32,
     present_stats_at: Instant,
+    source_fps: f32,
     capture_ms: f32,
+    gpu_wait_ms: f32,
+    gpu_lock_ms: f32,
     encode_ms: f32,
     send_ms: f32,
     encode_queue_ms: f32,
+    dxgi_timeouts: u64,
+    dxgi_backlog: u64,
+    dxgi_backlog_max: u64,
+    pacing_skips: u64,
+    encoder_busy_skips: u64,
+    cursor_only_frames: u64,
+    stale_frames: u64,
     reassembly_ms: f32,
     decode_ms: f32,
     decode_queue_ms: f32,
@@ -137,10 +147,20 @@ impl EchobindApp {
             present_fps: 0.0,
             present_latency_ms: 0.0,
             present_stats_at: Instant::now(),
+            source_fps: 0.0,
             capture_ms: 0.0,
+            gpu_wait_ms: 0.0,
+            gpu_lock_ms: 0.0,
             encode_ms: 0.0,
             send_ms: 0.0,
             encode_queue_ms: 0.0,
+            dxgi_timeouts: 0,
+            dxgi_backlog: 0,
+            dxgi_backlog_max: 0,
+            pacing_skips: 0,
+            encoder_busy_skips: 0,
+            cursor_only_frames: 0,
+            stale_frames: 0,
             reassembly_ms: 0.0,
             decode_ms: 0.0,
             decode_queue_ms: 0.0,
@@ -221,19 +241,39 @@ impl EchobindApp {
                 }
                 SessionEvent::Stats {
                     fps,
+                    source_fps,
                     megabits_per_second,
                     capture_ms,
+                    gpu_wait_ms,
+                    gpu_lock_ms,
                     encode_ms,
                     send_ms,
                     encode_queue_ms,
+                    dxgi_timeouts,
+                    dxgi_backlog,
+                    dxgi_backlog_max,
+                    pacing_skips,
+                    encoder_busy_skips,
+                    cursor_only_frames,
+                    stale_frames,
                 } => {
                     self.stream_fps = fps;
                     self.received_fps = fps;
                     self.stream_mbps = megabits_per_second;
+                    self.source_fps = source_fps;
                     self.capture_ms = capture_ms;
+                    self.gpu_wait_ms = gpu_wait_ms;
+                    self.gpu_lock_ms = gpu_lock_ms;
                     self.encode_ms = encode_ms;
                     self.send_ms = send_ms;
                     self.encode_queue_ms = encode_queue_ms;
+                    self.dxgi_timeouts = dxgi_timeouts;
+                    self.dxgi_backlog = dxgi_backlog;
+                    self.dxgi_backlog_max = dxgi_backlog_max;
+                    self.pacing_skips = pacing_skips;
+                    self.encoder_busy_skips = encoder_busy_skips;
+                    self.cursor_only_frames = cursor_only_frames;
+                    self.stale_frames = stale_frames;
                 }
                 SessionEvent::ClientStats {
                     received_fps,
@@ -382,7 +422,10 @@ impl EchobindApp {
         self.audio_backend = "System default output".to_owned();
         self.present_fps = 0.0;
         self.present_latency_ms = 0.0;
+        self.source_fps = 0.0;
         self.capture_ms = 0.0;
+        self.gpu_wait_ms = 0.0;
+        self.gpu_lock_ms = 0.0;
         self.encode_ms = 0.0;
         self.send_ms = 0.0;
         self.reassembly_ms = 0.0;
@@ -392,6 +435,13 @@ impl EchobindApp {
         self.jitter_ms = 0.0;
         self.rtt_ms = 0.0;
         self.lost_frames = 0;
+        self.dxgi_timeouts = 0;
+        self.dxgi_backlog = 0;
+        self.dxgi_backlog_max = 0;
+        self.pacing_skips = 0;
+        self.encoder_busy_skips = 0;
+        self.cursor_only_frames = 0;
+        self.stale_frames = 0;
         self.transport = "standard MTU".to_owned();
         self.status = if self.shutdown.is_some() {
             "Stopping session and releasing media devices and socket…".to_owned()
@@ -684,8 +734,25 @@ impl EchobindApp {
                     self.transport,
                 ));
                 ui.label(format!(
-                    "pipeline avg: capture {:.2} ms · encode {:.2} ms · encode→send {:.2} ms · send {:.2} ms",
-                    self.capture_ms, self.encode_ms, self.encode_queue_ms, self.send_ms,
+                    "pipeline avg: capture {:.2} ms (GPU {:.2} / lock {:.2}) · encode {:.2} ms · encode→send {:.2} ms · send {:.2} ms",
+                    self.capture_ms,
+                    self.gpu_wait_ms,
+                    self.gpu_lock_ms,
+                    self.encode_ms,
+                    self.encode_queue_ms,
+                    self.send_ms,
+                ));
+                #[cfg(target_os = "windows")]
+                ui.label(format!(
+                    "capture: {:.1} source FPS · {} DXGI timeouts · {} accumulated (max {}) · skips pacing {} / encoder busy {} / cursor-only {} / stale {}",
+                    self.source_fps,
+                    self.dxgi_timeouts,
+                    self.dxgi_backlog,
+                    self.dxgi_backlog_max,
+                    self.pacing_skips,
+                    self.encoder_busy_skips,
+                    self.cursor_only_frames,
+                    self.stale_frames,
                 ));
             } else {
                 ui.label(format!(

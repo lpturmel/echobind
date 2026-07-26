@@ -111,6 +111,7 @@ struct CaptureFlags {
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     force_keyframe: Arc<AtomicBool>,
     encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
+    metrics: Arc<WindowsCaptureMetrics>,
     hardware_progress: Arc<AtomicU64>,
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
@@ -119,8 +120,19 @@ struct CaptureFlags {
     height: u32,
 }
 
+#[derive(Default)]
+struct WindowsCaptureMetrics {
+    source_frames: AtomicU64,
+    dxgi_timeouts: AtomicU64,
+    dxgi_backlog: AtomicU64,
+    dxgi_backlog_max: AtomicU64,
+    pacing_skips: AtomicU64,
+    encoder_busy_skips: AtomicU64,
+    cursor_only_frames: AtomicU64,
+    stale_frames: AtomicU64,
+}
+
 struct HardwareCapture {
-    device: ID3D11Device,
     device_context: ID3D11DeviceContext,
     debug_info_queue: Option<ID3D11InfoQueue>,
     gpu_completion_query: ID3D11Query,
@@ -149,6 +161,8 @@ struct EncodedHardwareFrame {
     is_keyframe: bool,
     data: Vec<u8>,
     capture_us: u64,
+    gpu_wait_us: u64,
+    gpu_lock_us: u64,
     encode_us: u64,
     encoded_at: Instant,
     captured_at: Instant,
@@ -160,6 +174,8 @@ struct PendingNvencFrame {
     frame_id: u64,
     timestamp_us: u64,
     capture_us: u64,
+    gpu_wait_us: u64,
+    gpu_lock_us: u64,
     encode_started: Instant,
     captured_at: Instant,
 }
@@ -276,6 +292,7 @@ fn run_dxgi_pipeline(
     hardware_progress: Arc<AtomicU64>,
 ) -> Result<(), String> {
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
+    let metrics = Arc::new(WindowsCaptureMetrics::default());
     let sender_running = Arc::new(AtomicBool::new(true));
     let sender_handle = spawn_hardware_sender(
         socket.clone(),
@@ -287,6 +304,7 @@ fn run_dxgi_pipeline(
         encoded_rx,
         active_datagram_size,
         bitrate_bps,
+        metrics.clone(),
     );
     let mut consecutive_access_losses = 0_u32;
     let result = loop {
@@ -305,6 +323,7 @@ fn run_dxgi_pipeline(
             bitrate_bps,
             width,
             height,
+            metrics.clone(),
             hardware_progress.clone(),
         );
         if hardware_progress.load(Ordering::Acquire) > progress_before {
@@ -371,6 +390,7 @@ fn run_dxgi_capture_session(
     bitrate_bps: u32,
     width: u32,
     height: u32,
+    metrics: Arc<WindowsCaptureMetrics>,
     hardware_progress: Arc<AtomicU64>,
 ) -> Result<(), DxgiCaptureFailure> {
     let high_process_gpu_priority = configure_process_gpu_priority();
@@ -401,6 +421,7 @@ fn run_dxgi_capture_session(
             active_peer,
             force_keyframe,
             encoded_frames,
+            metrics,
             hardware_progress: hardware_progress.clone(),
             events: events.clone(),
             frames_per_second,
@@ -730,7 +751,14 @@ fn acquire_dxgi_frame(
     let mut resource: Option<IDXGIResource> = None;
     match unsafe { duplication.AcquireNextFrame(8, &mut info, &mut resource) } {
         Ok(()) => {}
-        Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+        Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+            capture
+                .flags
+                .metrics
+                .dxgi_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
         Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
             return Err(DxgiCaptureFailure::AccessLost(format!(
                 "Desktop Duplication access was lost: {error}"
@@ -741,6 +769,33 @@ fn acquire_dxgi_frame(
                 "Unable to acquire DXGI desktop frame: {error}"
             )))
         }
+    }
+
+    let desktop_updated = info.LastPresentTime != 0;
+    if desktop_updated {
+        let accumulated = u64::from(info.AccumulatedFrames);
+        let backlog = accumulated.saturating_sub(1);
+        capture
+            .flags
+            .metrics
+            .source_frames
+            .fetch_add(1, Ordering::Relaxed);
+        capture
+            .flags
+            .metrics
+            .dxgi_backlog
+            .fetch_add(backlog, Ordering::Relaxed);
+        capture
+            .flags
+            .metrics
+            .dxgi_backlog_max
+            .fetch_max(backlog, Ordering::Relaxed);
+    } else {
+        capture
+            .flags
+            .metrics
+            .cursor_only_frames
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // A successful acquisition must always be paired with ReleaseFrame, even
@@ -760,7 +815,14 @@ fn acquire_dxgi_frame(
             ));
         }
         capture.send_cursor_update(&info, description.Width, description.Height);
-        capture.process_texture(&texture, description.Width, description.Height)
+        if desktop_updated {
+            capture.process_texture(&texture, description.Width, description.Height)
+        } else {
+            // The cursor is transported independently. Encoding the unchanged
+            // desktop surface wastes an NVENC slot and competes with the next
+            // real game presentation.
+            Ok(())
+        }
     })();
     let release_result = unsafe { duplication.ReleaseFrame() }.map_err(|error| {
         let message = format!("Unable to release DXGI desktop frame: {error}");
@@ -772,7 +834,7 @@ fn acquire_dxgi_frame(
     });
     processing_result.map_err(classify_dxgi_capture_error)?;
     release_result?;
-    Ok(true)
+    Ok(desktop_updated)
 }
 
 fn classify_dxgi_capture_error(error: String) -> DxgiCaptureFailure {
@@ -846,7 +908,6 @@ impl HardwareCapture {
             Duration::from_secs_f64(1.0 / f64::from(flags.frames_per_second.max(1)));
 
         Ok(Self {
-            device: device.clone(),
             device_context,
             debug_info_queue: device.cast().ok(),
             gpu_completion_query,
@@ -937,6 +998,10 @@ impl HardwareCapture {
         }
         let now = Instant::now();
         if now + Duration::from_millis(1) < self.next_frame_at {
+            self.flags
+                .metrics
+                .pacing_skips
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         self.next_frame_at += self.frame_interval;
@@ -946,15 +1011,24 @@ impl HardwareCapture {
         let Ok(slot) = self.free_slots.try_recv() else {
             // All four frames are still being encoded. Never block desktop
             // acquisition; sampling a newer capture is lower latency.
+            self.flags
+                .metrics
+                .encoder_busy_skips
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
         // NvEncLockBitstream/NvEncUnlockBitstream can internally touch this
         // same D3D11 device from the completion thread. Serialize those calls
         // with capture copying/scaling and submission. GPU encoding remains
         // asynchronous; this protects only the short CPU-side API sequences.
-        let encoder = self.encoder.clone();
-        let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
         let capture_started = Instant::now();
+        let encoder = self.encoder.clone();
+        let gpu_lock_started = Instant::now();
+        let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
+        let mut gpu_lock_us = gpu_lock_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
         let output_texture = self.encoder.slots[slot].texture.clone();
         // Convert every captured BGRA texture to NV12 with the fixed-function
         // D3D11 video processor. Submitting BGRA to NVENC makes the driver run
@@ -990,10 +1064,21 @@ impl HardwareCapture {
             let _ = self.free_slots_tx.try_send(slot);
             return Err(error);
         }
+        // Put the completion marker into the immediate-context command stream
+        // while the API mutex is still held. The multithread-protected D3D11
+        // context can then be polled safely without preventing the completion
+        // worker from draining already-finished NVENC buffers.
+        self.begin_gpu_completion();
+        drop(gpu_api_guard);
+        let gpu_wait_started = Instant::now();
         if let Err(error) = self.wait_for_gpu_completion("D3D11 BGRA-to-NV12 video processing") {
             let _ = self.free_slots_tx.try_send(slot);
             return Err(error);
         }
+        let gpu_wait_us = gpu_wait_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
 
         // Loss and capture-timeline changes request an IDR explicitly. Avoid
         // periodic ultrawide IDRs: their packet bursts can occupy several
@@ -1005,6 +1090,14 @@ impl HardwareCapture {
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         let encode_started = Instant::now();
+        let submit_lock_started = Instant::now();
+        let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
+        gpu_lock_us = gpu_lock_us.saturating_add(
+            submit_lock_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+        );
         let mapped_resource = match self.encoder.submit(slot, force_idr) {
             Ok(mapped) => mapped,
             Err(error) => {
@@ -1019,6 +1112,8 @@ impl HardwareCapture {
             frame_id: self.frame_id,
             timestamp_us,
             capture_us,
+            gpu_wait_us,
+            gpu_lock_us,
             encode_started,
             captured_at: capture_started,
         };
@@ -1040,11 +1135,14 @@ impl HardwareCapture {
         self.completion_failure.lock().unwrap().take()
     }
 
-    fn wait_for_gpu_completion(&self, operation: &str) -> Result<(), String> {
+    fn begin_gpu_completion(&self) {
         unsafe {
             self.device_context.End(&self.gpu_completion_query);
             self.device_context.Flush();
         }
+    }
+
+    fn wait_for_gpu_completion(&self, operation: &str) -> Result<(), String> {
         let started = Instant::now();
         let mut spins = 0_u32;
         loop {
@@ -1250,6 +1348,7 @@ fn spawn_hardware_sender(
     encoded_frames: mpsc::Receiver<EncodedHardwareFrame>,
     active_datagram_size: Arc<AtomicUsize>,
     bitrate_bps: u32,
+    metrics: Arc<WindowsCaptureMetrics>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         raise_current_thread_priority("video sender", THREAD_PRIORITY_ABOVE_NORMAL);
@@ -1259,6 +1358,8 @@ fn spawn_hardware_sender(
         let mut stats_frames = 0_u64;
         let mut stats_bytes = 0_u64;
         let mut stats_capture_us = 0_u64;
+        let mut stats_gpu_wait_us = 0_u64;
+        let mut stats_gpu_lock_us = 0_u64;
         let mut stats_encode_us = 0_u64;
         let mut stats_send_us = 0_u64;
         let mut stats_encode_queue_us = 0_u64;
@@ -1275,9 +1376,12 @@ fn spawn_hardware_sender(
                         &mut stats_frames,
                         &mut stats_bytes,
                         &mut stats_capture_us,
+                        &mut stats_gpu_wait_us,
+                        &mut stats_gpu_lock_us,
                         &mut stats_encode_us,
                         &mut stats_send_us,
                         &mut stats_encode_queue_us,
+                        &metrics,
                     );
                     continue;
                 }
@@ -1289,6 +1393,7 @@ fn spawn_hardware_sender(
                 force_keyframe.store(true, Ordering::Release);
             }
             if frame.captured_at.elapsed() > VIDEO_SEND_STALE_AGE {
+                metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
                 waiting_for_keyframe = true;
                 force_keyframe.store(true, Ordering::Release);
                 continue;
@@ -1345,6 +1450,8 @@ fn spawn_hardware_sender(
                 last_sent_frame = Some(frame.frame_id);
                 stats_frames = stats_frames.saturating_add(1);
                 stats_capture_us = stats_capture_us.saturating_add(frame.capture_us);
+                stats_gpu_wait_us = stats_gpu_wait_us.saturating_add(frame.gpu_wait_us);
+                stats_gpu_lock_us = stats_gpu_lock_us.saturating_add(frame.gpu_lock_us);
                 stats_encode_us = stats_encode_us.saturating_add(frame.encode_us);
                 stats_send_us = stats_send_us.saturating_add(
                     send_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
@@ -1362,9 +1469,12 @@ fn spawn_hardware_sender(
                 &mut stats_frames,
                 &mut stats_bytes,
                 &mut stats_capture_us,
+                &mut stats_gpu_wait_us,
+                &mut stats_gpu_lock_us,
                 &mut stats_encode_us,
                 &mut stats_send_us,
                 &mut stats_encode_queue_us,
+                &metrics,
             );
         }
     })
@@ -1429,27 +1539,43 @@ fn report_sender_stats(
     stats_frames: &mut u64,
     stats_bytes: &mut u64,
     stats_capture_us: &mut u64,
+    stats_gpu_wait_us: &mut u64,
+    stats_gpu_lock_us: &mut u64,
     stats_encode_us: &mut u64,
     stats_send_us: &mut u64,
     stats_encode_queue_us: &mut u64,
+    metrics: &WindowsCaptureMetrics,
 ) {
     let elapsed = stats_started.elapsed();
     if elapsed < Duration::from_secs(1) {
         return;
     }
     let seconds = elapsed.as_secs_f32();
+    let source_frames = metrics.source_frames.swap(0, Ordering::Relaxed);
     let _ = events.send(SessionEvent::Stats {
         fps: *stats_frames as f32 / seconds,
+        source_fps: source_frames as f32 / seconds,
         megabits_per_second: *stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
         capture_ms: average_milliseconds(*stats_capture_us, *stats_frames),
+        gpu_wait_ms: average_milliseconds(*stats_gpu_wait_us, *stats_frames),
+        gpu_lock_ms: average_milliseconds(*stats_gpu_lock_us, *stats_frames),
         encode_ms: average_milliseconds(*stats_encode_us, *stats_frames),
         send_ms: average_milliseconds(*stats_send_us, *stats_frames),
         encode_queue_ms: average_milliseconds(*stats_encode_queue_us, *stats_frames),
+        dxgi_timeouts: metrics.dxgi_timeouts.swap(0, Ordering::Relaxed),
+        dxgi_backlog: metrics.dxgi_backlog.swap(0, Ordering::Relaxed),
+        dxgi_backlog_max: metrics.dxgi_backlog_max.swap(0, Ordering::Relaxed),
+        pacing_skips: metrics.pacing_skips.swap(0, Ordering::Relaxed),
+        encoder_busy_skips: metrics.encoder_busy_skips.swap(0, Ordering::Relaxed),
+        cursor_only_frames: metrics.cursor_only_frames.swap(0, Ordering::Relaxed),
+        stale_frames: metrics.stale_frames.swap(0, Ordering::Relaxed),
     });
     *stats_started = Instant::now();
     *stats_frames = 0;
     *stats_bytes = 0;
     *stats_capture_us = 0;
+    *stats_gpu_wait_us = 0;
+    *stats_gpu_lock_us = 0;
     *stats_encode_us = 0;
     *stats_send_us = 0;
     *stats_encode_queue_us = 0;
@@ -2024,7 +2150,14 @@ impl NvencEncoder {
                 "NVENC completion event timed out or failed ({wait:?})"
             ));
         }
+        let completion_lock_started = Instant::now();
         let _gpu_api_guard = self.gpu_api_lock.lock().unwrap();
+        let gpu_lock_us = pending.gpu_lock_us.saturating_add(
+            completion_lock_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+        );
         let lock_bitstream = required(self.api.functions.nvEncLockBitstream, "NvEncLockBitstream")?;
         let unlock = required(
             self.api.functions.nvEncUnlockBitstream,
@@ -2084,6 +2217,8 @@ impl NvencEncoder {
             is_keyframe,
             data,
             capture_us: pending.capture_us,
+            gpu_wait_us: pending.gpu_wait_us,
+            gpu_lock_us,
             encode_us: pending
                 .encode_started
                 .elapsed()

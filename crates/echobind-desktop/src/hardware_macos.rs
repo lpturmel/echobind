@@ -265,11 +265,21 @@ fn run_hardware_pipeline(
             let seconds = elapsed.as_secs_f32();
             let _ = events.send(SessionEvent::Stats {
                 fps: stats_frames as f32 / seconds,
+                source_fps: stats_frames as f32 / seconds,
                 megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
                 capture_ms: super::average_milliseconds(stats_capture_us, stats_frames),
+                gpu_wait_ms: 0.0,
+                gpu_lock_ms: 0.0,
                 encode_ms: super::average_milliseconds(stats_encode_us, stats_frames),
                 send_ms: super::average_milliseconds(stats_send_us, stats_frames),
                 encode_queue_ms: super::average_milliseconds(stats_encode_queue_us, stats_frames),
+                dxgi_timeouts: 0,
+                dxgi_backlog: 0,
+                dxgi_backlog_max: 0,
+                pacing_skips: 0,
+                encoder_busy_skips: 0,
+                cursor_only_frames: 0,
+                stale_frames: 0,
             });
             stats_started = Instant::now();
             stats_frames = 0;

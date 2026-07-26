@@ -34,7 +34,7 @@ On the viewing machine:
 3. Wait for the server to accept the connection.
 
 The desktop app streams the primary display at native, 720p, or 1080p
-resolution and up to 120 FPS. Windows uses Windows Graphics Capture, a
+resolution and up to 120 FPS. Windows uses DXGI Desktop Duplication, a
 four-buffer asynchronous D3D11/NVENC pipeline, and GPU scaling. macOS uses
 ScreenCaptureKit and VideoToolbox for hardware encode, then VideoToolbox NV12
 decode and IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264
@@ -44,9 +44,11 @@ The low-latency path has no B-frame reordering, uses a one-frame NVENC VBV,
 generates IDRs only for startup or recovery, requests UI repaints directly from
 the decoder callback, and discards video that spends more than 25 ms in a host
 or decode queue. The UI reports capture, encode, send, reassembly, decode,
-presentation, RTT, jitter, drop, and loss measurements. Opus system audio is
-streamed independently and the viewer can select the default or a named output
-device.
+presentation, RTT, jitter, drop, and loss measurements. On Windows it also
+reports the DXGI source rate, accumulated desktop frames, timeouts, pacing and
+encoder-slot skips, GPU conversion wait, and D3D/NVENC mutex wait. Opus system
+audio is streamed independently and the viewer can select the default or a
+named output device.
 
 Standard mode uses 1400-byte UDP datagrams to avoid IP fragmentation. The host
 can explicitly enable **Jumbo MTU 9000**; it uses 8192-byte UDP datagrams only
