@@ -1,6 +1,6 @@
 use super::{SessionEvent, VIDEO_SEND_STALE_AGE};
 use echobind_core::{
-    protocol::{Packet, MAX_DATAGRAM_SIZE},
+    protocol::{CursorPosition, Packet, MAX_DATAGRAM_SIZE},
     video::fragment_video_frame_with_datagram_size,
 };
 use libloading::Library;
@@ -89,8 +89,10 @@ const ACCESS_LOST_MAX_RETRY_DELAY_MS: u64 = 200;
 const VIDEO_PACING_BATCH_DATAGRAMS: usize = 16;
 const VIDEO_PACING_RATE_MULTIPLIER: u64 = 4;
 const VIDEO_PACING_SLEEP_GUARD: Duration = Duration::from_micros(500);
+const CURSOR_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 struct CaptureFlags {
+    socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     force_keyframe: Arc<AtomicBool>,
@@ -109,6 +111,10 @@ struct HardwareCapture {
     debug_info_queue: Option<ID3D11InfoQueue>,
     gpu_completion_query: ID3D11Query,
     encoder: Arc<NvencEncoder>,
+    cursor_position: Option<CursorPosition>,
+    cursor_peer: Option<SocketAddr>,
+    cursor_sent_at: Option<Instant>,
+    cursor_packet: Vec<u8>,
     scalers: Vec<Option<D3dScaler>>,
     free_slots_tx: mpsc::SyncSender<usize>,
     free_slots: mpsc::Receiver<usize>,
@@ -258,7 +264,7 @@ fn run_dxgi_pipeline(
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
     let sender_running = Arc::new(AtomicBool::new(true));
     let sender_handle = spawn_hardware_sender(
-        socket,
+        socket.clone(),
         running.clone(),
         sender_running.clone(),
         active_peer.clone(),
@@ -275,6 +281,7 @@ fn run_dxgi_pipeline(
         }
         let progress_before = hardware_progress.load(Ordering::Acquire);
         let session = run_dxgi_capture_session(
+            socket.clone(),
             running.clone(),
             active_peer.clone(),
             force_keyframe.clone(),
@@ -340,6 +347,7 @@ fn run_dxgi_pipeline(
 
 #[allow(clippy::too_many_arguments)]
 fn run_dxgi_capture_session(
+    socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     force_keyframe: Arc<AtomicBool>,
@@ -365,6 +373,7 @@ fn run_dxgi_capture_session(
         &device,
         device_context,
         CaptureFlags {
+            socket,
             running: running.clone(),
             active_peer,
             force_keyframe,
@@ -631,6 +640,7 @@ fn acquire_dxgi_frame(
                 description.Format
             ));
         }
+        capture.send_cursor_update(&info, description.Width, description.Height);
         capture.process_texture(&texture, description.Width, description.Height)
     })();
     let release_result = unsafe { duplication.ReleaseFrame() }.map_err(|error| {
@@ -722,6 +732,10 @@ impl HardwareCapture {
             debug_info_queue: device.cast().ok(),
             gpu_completion_query,
             encoder,
+            cursor_position: None,
+            cursor_peer: None,
+            cursor_sent_at: None,
+            cursor_packet: Vec::with_capacity(14),
             scalers: std::iter::repeat_with(|| None)
                 .take(NVENC_BUFFER_COUNT)
                 .collect(),
@@ -737,6 +751,56 @@ impl HardwareCapture {
             next_frame_at: Instant::now(),
             frame_id: 0,
         })
+    }
+
+    fn send_cursor_update(
+        &mut self,
+        frame_info: &DXGI_OUTDUPL_FRAME_INFO,
+        source_width: u32,
+        source_height: u32,
+    ) {
+        let pointer_updated = frame_info.LastMouseUpdateTime != 0;
+        if pointer_updated {
+            let pointer = frame_info.PointerPosition;
+            let visible = pointer.Visible.as_bool();
+            self.cursor_position = Some(CursorPosition {
+                x: if visible {
+                    scale_cursor_coordinate(pointer.Position.x, self.flags.width, source_width)
+                } else {
+                    0
+                },
+                y: if visible {
+                    scale_cursor_coordinate(pointer.Position.y, self.flags.height, source_height)
+                } else {
+                    0
+                },
+                visible,
+            });
+        }
+
+        let peer = *self.flags.active_peer.lock().unwrap();
+        let peer_changed = peer != self.cursor_peer;
+        self.cursor_peer = peer;
+        let Some(peer) = peer else {
+            self.cursor_sent_at = None;
+            return;
+        };
+        let refresh_due = self
+            .cursor_sent_at
+            .is_none_or(|sent| sent.elapsed() >= CURSOR_REFRESH_INTERVAL);
+        if !pointer_updated && !peer_changed && !refresh_due {
+            return;
+        }
+        let Some(position) = self.cursor_position else {
+            return;
+        };
+
+        Packet::CursorPosition(position).encode(&mut self.cursor_packet);
+        if let Err(error) = self.flags.socket.send_to(&self.cursor_packet, peer) {
+            warn!("Cursor position send to {peer} failed: {error}");
+        } else {
+            self.cursor_sent_at = Some(Instant::now());
+        }
     }
 
     fn process_texture(
@@ -1278,6 +1342,14 @@ fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
     } else {
         total_us as f32 / samples as f32 / 1_000.0
     }
+}
+
+fn scale_cursor_coordinate(value: i32, output_size: u32, source_size: u32) -> i32 {
+    if source_size == 0 {
+        return value;
+    }
+    let scaled = i64::from(value).saturating_mul(i64::from(output_size)) / i64::from(source_size);
+    scaled.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 fn raise_current_thread_priority(role: &str) {

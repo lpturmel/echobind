@@ -1,4 +1,5 @@
 use crate::session::{DesktopSession, DisplayFrameData, SessionEvent, VideoResolution};
+use echobind_core::protocol::CursorPosition;
 use eframe::egui;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -44,6 +45,7 @@ pub struct EchobindApp {
     shutdown: Option<SessionShutdown>,
     texture: Option<GpuVideoTexture>,
     nv12_ready: bool,
+    remote_cursor: Option<CursorPosition>,
     render_state: eframe::egui_wgpu::RenderState,
     stream_fps: f32,
     received_fps: f32,
@@ -117,6 +119,7 @@ impl EchobindApp {
             shutdown: None,
             texture: None,
             nv12_ready: false,
+            remote_cursor: None,
             render_state,
             stream_fps: 0.0,
             received_fps: 0.0,
@@ -212,6 +215,9 @@ impl EchobindApp {
                 }
                 SessionEvent::AudioBackend(backend) => {
                     self.audio_backend = backend;
+                }
+                SessionEvent::CursorPosition(position) => {
+                    self.remote_cursor = Some(position);
                 }
                 SessionEvent::Stats {
                     fps,
@@ -364,6 +370,7 @@ impl EchobindApp {
             });
         }
         self.pending_peer = None;
+        self.remote_cursor = None;
         self.clear_texture();
         self.stream_fps = 0.0;
         self.received_fps = 0.0;
@@ -724,19 +731,64 @@ impl EchobindApp {
             .min(available.y / source.y)
             .max(0.01);
         let display_size = source * scale;
-        ui.centered_and_justified(|ui| {
-            if self.nv12_ready {
-                let (_rect, _) = ui.allocate_exact_size(display_size, egui::Sense::hover());
-                #[cfg(target_os = "macos")]
-                ui.painter().add(egui::Shape::Callback(
-                    crate::video_renderer_macos::paint_callback(_rect),
-                ));
-            } else if let Some(texture) = &self.texture {
-                ui.add(
-                    egui::Image::from_texture((texture.id, source)).fit_to_exact_size(display_size),
-                );
-            }
-        });
+        let video_rect = ui
+            .centered_and_justified(|ui| {
+                if self.nv12_ready {
+                    let (rect, _) = ui.allocate_exact_size(display_size, egui::Sense::hover());
+                    #[cfg(target_os = "macos")]
+                    ui.painter().add(egui::Shape::Callback(
+                        crate::video_renderer_macos::paint_callback(rect),
+                    ));
+                    rect
+                } else if let Some(texture) = &self.texture {
+                    ui.add(
+                        egui::Image::from_texture((texture.id, source))
+                            .fit_to_exact_size(display_size),
+                    )
+                    .rect
+                } else {
+                    egui::Rect::NOTHING
+                }
+            })
+            .inner;
+        self.paint_remote_cursor(ui, video_rect);
+    }
+
+    fn paint_remote_cursor(&self, ui: &egui::Ui, video_rect: egui::Rect) {
+        let Some(cursor) = self.remote_cursor.filter(|cursor| cursor.visible) else {
+            return;
+        };
+        if self.mode != Mode::Connect
+            || self.stream_width == 0
+            || self.stream_height == 0
+            || !video_rect.is_positive()
+        {
+            return;
+        }
+
+        let x = cursor.x as f32 / self.stream_width as f32;
+        let y = cursor.y as f32 / self.stream_height as f32;
+        let origin = egui::pos2(
+            video_rect.left() + x * video_rect.width(),
+            video_rect.top() + y * video_rect.height(),
+        );
+        if !video_rect.expand(24.0).contains(origin) {
+            return;
+        }
+
+        // A small client-side arrow keeps cursor motion independent from the
+        // video codec. DXGI reports the top-left of the hardware pointer, so
+        // the arrow tip uses that exact streamed position.
+        let points = vec![
+            origin,
+            origin + egui::vec2(1.5, 22.0),
+            origin + egui::vec2(14.0, 14.0),
+        ];
+        ui.painter().add(egui::Shape::convex_polygon(
+            points,
+            egui::Color32::WHITE,
+            egui::Stroke::new(2.0, egui::Color32::BLACK),
+        ));
     }
 }
 

@@ -33,6 +33,7 @@ pub enum Packet<'a> {
     Audio(AudioFrame<'a>),
     Clipboard(ClipboardChunk<'a>),
     Video(VideoFragment<'a>),
+    CursorPosition(CursorPosition),
     VideoKeyframeRequest,
     ConnectionRejected(&'a [u8]),
 }
@@ -63,6 +64,13 @@ pub struct ClipboardChunk<'a> {
     pub payload: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPosition {
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
+}
+
 impl Packet<'_> {
     const HELLO: u8 = 1;
     const CONFIG: u8 = 2;
@@ -73,6 +81,7 @@ impl Packet<'_> {
     const VIDEO: u8 = 7;
     const VIDEO_KEYFRAME_REQUEST: u8 = 8;
     const CONNECTION_REJECTED: u8 = 9;
+    const CURSOR_POSITION: u8 = 10;
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
@@ -110,6 +119,12 @@ impl Packet<'_> {
                         | (u8::from(fragment.is_recovery) * VIDEO_FLAG_RECOVERY),
                 );
                 out.extend_from_slice(fragment.payload.as_ref());
+            }
+            Packet::CursorPosition(position) => {
+                Self::begin_packet(Self::CURSOR_POSITION, out);
+                out.extend_from_slice(&position.x.to_be_bytes());
+                out.extend_from_slice(&position.y.to_be_bytes());
+                out.push(u8::from(position.visible));
             }
             Packet::VideoKeyframeRequest => {
                 Self::encode_packet(Self::VIDEO_KEYFRAME_REQUEST, &[], out);
@@ -179,6 +194,7 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
             Packet::AUDIO => parse_audio_frame(payload).map(Packet::Audio),
             Packet::CLIPBOARD => parse_clipboard_chunk(payload).map(Packet::Clipboard),
             Packet::VIDEO => parse_video_fragment(payload).map(Packet::Video),
+            Packet::CURSOR_POSITION => parse_cursor_position(payload).map(Packet::CursorPosition),
             Packet::VIDEO_KEYFRAME_REQUEST if payload.is_empty() => {
                 Ok(Packet::VideoKeyframeRequest)
             }
@@ -186,6 +202,25 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
             _ => Err(PacketParseError::Invalid),
         }
     }
+}
+
+fn parse_cursor_position(payload: &[u8]) -> Result<CursorPosition, PacketParseError> {
+    if payload.len() != 9 || payload[8] > 1 {
+        return Err(PacketParseError::Invalid);
+    }
+    Ok(CursorPosition {
+        x: i32::from_be_bytes(
+            payload[..4]
+                .try_into()
+                .map_err(|_| PacketParseError::Invalid)?,
+        ),
+        y: i32::from_be_bytes(
+            payload[4..8]
+                .try_into()
+                .map_err(|_| PacketParseError::Invalid)?,
+        ),
+        visible: payload[8] != 0,
+    })
 }
 
 fn parse_u64(payload: &[u8]) -> Result<u64, PacketParseError> {
@@ -432,6 +467,20 @@ mod tests {
         assert_eq!(
             Packet::try_from(encoded.as_slice()),
             Ok(Packet::ConnectionRejected(b"busy"))
+        );
+    }
+
+    #[test]
+    fn encodes_and_parses_cursor_position() {
+        let position = CursorPosition {
+            x: 1234,
+            y: -7,
+            visible: true,
+        };
+        let encoded = round_trip(Packet::CursorPosition(position));
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Ok(Packet::CursorPosition(position))
         );
     }
 }

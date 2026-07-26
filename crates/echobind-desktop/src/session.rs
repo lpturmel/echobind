@@ -1,6 +1,8 @@
 use crate::video::I420Frame;
 use echobind_core::{
-    protocol::{Packet, JUMBO_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE, STANDARD_DATAGRAM_SIZE},
+    protocol::{
+        CursorPosition, Packet, JUMBO_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE, STANDARD_DATAGRAM_SIZE,
+    },
     video::{fragment_video_frame_with_datagram_size, VideoFrame, VideoReassembler},
     AudioConfig, FrameRate as SessionFrameRate, SessionConfig, VideoCodec, VideoConfig,
 };
@@ -260,6 +262,7 @@ pub enum SessionEvent {
     },
     VideoBackend(String),
     AudioBackend(String),
+    CursorPosition(CursorPosition),
     Stats {
         fps: f32,
         megabits_per_second: f32,
@@ -504,6 +507,7 @@ impl DesktopSession {
             metrics.clone(),
             decoder_needs_keyframe.clone(),
             event_tx.clone(),
+            frame_notifier.clone(),
             audio_output_device,
             audio_command_rx,
         );
@@ -834,6 +838,7 @@ fn spawn_host_network(
                         Packet::Clipboard(_)
                         | Packet::Audio(_)
                         | Packet::Video(_)
+                        | Packet::CursorPosition(_)
                         | Packet::Config(_)
                         | Packet::Pong(_)
                         | Packet::Ping(_)
@@ -1140,6 +1145,7 @@ fn spawn_client_network(
     metrics: Arc<ClientMetrics>,
     decoder_needs_keyframe: Arc<AtomicBool>,
     events: mpsc::Sender<SessionEvent>,
+    frame_notifier: FrameNotifier,
     mut audio_output_device: Option<String>,
     audio_commands: mpsc::Receiver<Option<String>>,
 ) -> JoinHandle<()> {
@@ -1501,10 +1507,15 @@ fn spawn_client_network(
                                 }
                             }
                         }
+                        Packet::CursorPosition(position) if accepted => {
+                            let _ = events.send(SessionEvent::CursorPosition(position));
+                            frame_notifier();
+                        }
                         Packet::Hello { .. }
                         | Packet::Clipboard(_)
                         | Packet::Audio(_)
                         | Packet::Video(_)
+                        | Packet::CursorPosition(_)
                         | Packet::VideoKeyframeRequest => {}
                     }
                 }
