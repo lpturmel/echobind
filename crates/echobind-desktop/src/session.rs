@@ -1401,9 +1401,17 @@ fn spawn_client_network(
                                     // UDP reorders datagrams. Hold a tiny reorder window instead of
                                     // treating that as packet loss immediately.
                                     if frame.is_keyframe && next_frame_id != Some(frame.frame_id) {
+                                        // A forced IDR with a discontinuous frame id marks a new
+                                        // encoder timeline (for example after DXGI is rebuilt by
+                                        // Alt-Tab). SPS/PPS can remain byte-identical, so explicitly
+                                        // advance the decoder generation instead of retaining stale
+                                        // VideoToolbox reference surfaces from the old timeline.
+                                        decode_queue.require_keyframe();
                                         completed_frames.clear();
                                         next_frame_id = Some(frame.frame_id);
                                         waiting_for_keyframe = false;
+                                        last_frame_arrival =
+                                            Some((completed_at, frame.timestamp_us));
                                     } else if waiting_for_keyframe {
                                         next_frame_id = Some(frame.frame_id);
                                         waiting_for_keyframe = false;

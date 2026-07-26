@@ -56,7 +56,9 @@ use windows::{
                 D3D11_VPOV_DIMENSION_TEXTURE2D,
             },
             Dxgi::{
-                Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC},
+                Common::{
+                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+                },
                 CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
                 IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
                 DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -105,9 +107,8 @@ struct HardwareCapture {
     device: ID3D11Device,
     device_context: ID3D11DeviceContext,
     debug_info_queue: Option<ID3D11InfoQueue>,
-    copy_completion_query: ID3D11Query,
+    gpu_completion_query: ID3D11Query,
     encoder: Arc<NvencEncoder>,
-    capture_textures: Vec<Option<CaptureTexture>>,
     scalers: Vec<Option<D3dScaler>>,
     free_slots_tx: mpsc::SyncSender<usize>,
     free_slots: mpsc::Receiver<usize>,
@@ -144,12 +145,6 @@ struct PendingNvencFrame {
 }
 
 unsafe impl Send for PendingNvencFrame {}
-
-struct CaptureTexture {
-    width: u32,
-    height: u32,
-    texture: ID3D11Texture2D,
-}
 
 struct D3dScaler {
     source_width: u32,
@@ -381,7 +376,7 @@ fn run_dxgi_capture_session(
             width,
             height,
         },
-        "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · D3D11 BGRA direct · 4-buffer async",
+        "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · D3D11 BGRA→NV12 · 4-buffer async",
     )
     .map_err(classify_dxgi_capture_error)?;
     let mut peer_became_active = None::<Instant>;
@@ -693,7 +688,7 @@ impl HardwareCapture {
             flags.frames_per_second,
             flags.bitrate_bps,
         )?);
-        let copy_completion_query = create_gpu_completion_query(device)?;
+        let gpu_completion_query = create_gpu_completion_query(device)?;
         let (free_slots_tx, free_slots) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
         for slot in 0..NVENC_BUFFER_COUNT {
             free_slots_tx
@@ -725,11 +720,8 @@ impl HardwareCapture {
             device: device.clone(),
             device_context,
             debug_info_queue: device.cast().ok(),
-            copy_completion_query,
+            gpu_completion_query,
             encoder,
-            capture_textures: std::iter::repeat_with(|| None)
-                .take(NVENC_BUFFER_COUNT)
-                .collect(),
             scalers: std::iter::repeat_with(|| None)
                 .take(NVENC_BUFFER_COUNT)
                 .collect(),
@@ -781,92 +773,48 @@ impl HardwareCapture {
         let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
         let capture_started = Instant::now();
         let output_texture = self.encoder.slots[slot].texture.clone();
-        let requires_scaling =
-            source_width != self.flags.width || source_height != self.flags.height;
-
-        if requires_scaling {
-            // DXGI owns its source texture and may recycle it after
-            // ReleaseFrame. Downscaling therefore starts with a per-slot GPU
-            // copy whose lifetime extends through the encode.
-            let capture_texture_needs_rebuild =
-                self.capture_textures[slot].as_ref().is_none_or(|texture| {
-                    texture.width != source_width || texture.height != source_height
-                });
-            if capture_texture_needs_rebuild {
-                match create_capture_texture(&self.device, source_width, source_height) {
-                    Ok(texture) => {
-                        self.capture_textures[slot] = Some(CaptureTexture {
-                            width: source_width,
-                            height: source_height,
-                            texture,
-                        });
-                    }
-                    Err(error) => {
-                        let _ = self.free_slots_tx.try_send(slot);
-                        return Err(error);
-                    }
+        // Convert every captured BGRA texture to NV12 with the fixed-function
+        // D3D11 video processor. Submitting BGRA to NVENC makes the driver run
+        // its RGB conversion on CUDA, which competes directly with a game and
+        // was the sustained 40-48 FPS bottleneck. The DXGI frame remains
+        // acquired until this completion query finishes, so the processor can
+        // safely consume the duplication texture without an intermediate copy.
+        let scaler_needs_rebuild = self.scalers[slot].as_ref().is_none_or(|scaler| {
+            scaler.source_width != source_width || scaler.source_height != source_height
+        });
+        if scaler_needs_rebuild {
+            match D3dScaler::new(
+                &self.device_context,
+                &output_texture,
+                source_width,
+                source_height,
+                self.flags.width,
+                self.flags.height,
+                self.flags.frames_per_second,
+            ) {
+                Ok(scaler) => self.scalers[slot] = Some(scaler),
+                Err(error) => {
+                    let _ = self.free_slots_tx.try_send(slot);
+                    return Err(error);
                 }
-            }
-            let capture_texture = self.capture_textures[slot]
-                .as_ref()
-                .expect("capture texture was initialized")
-                .texture
-                .clone();
-            unsafe {
-                self.device_context
-                    .CopyResource(&capture_texture, source_texture);
-            }
-            if let Err(error) = self.wait_for_capture_copy() {
-                let _ = self.free_slots_tx.try_send(slot);
-                return Err(error);
-            }
-
-            let scaler_needs_rebuild = self.scalers[slot].as_ref().is_none_or(|scaler| {
-                scaler.source_width != source_width || scaler.source_height != source_height
-            });
-            if scaler_needs_rebuild {
-                match D3dScaler::new(
-                    &self.device_context,
-                    &output_texture,
-                    source_width,
-                    source_height,
-                    self.flags.width,
-                    self.flags.height,
-                    self.flags.frames_per_second,
-                ) {
-                    Ok(scaler) => self.scalers[slot] = Some(scaler),
-                    Err(error) => {
-                        let _ = self.free_slots_tx.try_send(slot);
-                        return Err(error);
-                    }
-                }
-            }
-            if let Err(error) = self.scalers[slot]
-                .as_ref()
-                .expect("scaler was initialized")
-                .scale(&capture_texture)
-            {
-                let _ = self.free_slots_tx.try_send(slot);
-                return Err(error);
-            }
-            unsafe {
-                self.device_context.Flush();
-            }
-        } else {
-            // Native resolution follows NVIDIA's reference D3D11 path: copy
-            // straight into the registered BGRA render target, wait only until
-            // the capture-owned source is no longer needed, then let NVENC do
-            // its hardware RGB->YUV conversion.
-            unsafe {
-                self.device_context
-                    .CopyResource(&output_texture, source_texture);
-            }
-            if let Err(error) = self.wait_for_capture_copy() {
-                let _ = self.free_slots_tx.try_send(slot);
-                return Err(error);
             }
         }
+        if let Err(error) = self.scalers[slot]
+            .as_ref()
+            .expect("video processor was initialized")
+            .scale(source_texture)
+        {
+            let _ = self.free_slots_tx.try_send(slot);
+            return Err(error);
+        }
+        if let Err(error) = self.wait_for_gpu_completion("D3D11 BGRA-to-NV12 video processing") {
+            let _ = self.free_slots_tx.try_send(slot);
+            return Err(error);
+        }
 
+        // Loss and capture-timeline changes request an IDR explicitly. Avoid
+        // periodic ultrawide IDRs: their packet bursts can occupy several
+        // frame budgets and reduce sustained delivery FPS.
         let force_idr = self.flags.force_keyframe.swap(false, Ordering::Relaxed);
         let timestamp_us = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         let capture_us = capture_started
@@ -909,21 +857,21 @@ impl HardwareCapture {
         self.completion_failure.lock().unwrap().take()
     }
 
-    fn wait_for_capture_copy(&self) -> Result<(), String> {
+    fn wait_for_gpu_completion(&self, operation: &str) -> Result<(), String> {
         unsafe {
-            self.device_context.End(&self.copy_completion_query);
+            self.device_context.End(&self.gpu_completion_query);
             self.device_context.Flush();
         }
         let started = Instant::now();
         let mut spins = 0_u32;
         loop {
             if !self.flags.running.load(Ordering::Relaxed) {
-                return Err("D3D11 desktop copy cancelled while stopping".to_owned());
+                return Err(format!("{operation} cancelled while stopping"));
             }
             let mut complete = BOOL::default();
             let completion = unsafe {
                 self.device_context.GetData(
-                    &self.copy_completion_query,
+                    &self.gpu_completion_query,
                     Some((&mut complete as *mut BOOL).cast()),
                     std::mem::size_of::<BOOL>() as u32,
                     D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
@@ -935,7 +883,7 @@ impl HardwareCapture {
                 // of unregister/unmap calls into a removed driver context.
                 self.encoder.poison();
                 return Err(format!(
-                    "Unable to query D3D11 capture-copy completion: {error}; {}{}",
+                    "Unable to query {operation} completion: {error}; {}{}",
                     d3d11_device_removed_reason(&self.device_context),
                     self.d3d_debug_messages()
                 ));
@@ -946,7 +894,7 @@ impl HardwareCapture {
             if started.elapsed() >= GPU_COPY_COMPLETION_TIMEOUT {
                 self.encoder.poison();
                 return Err(format!(
-                    "D3D11 capture copy did not finish within {} ms{}",
+                    "{operation} did not finish within {} ms{}",
                     GPU_COPY_COMPLETION_TIMEOUT.as_millis(),
                     self.d3d_debug_messages()
                 ));
@@ -1340,37 +1288,6 @@ fn raise_current_thread_priority(role: &str) {
     }
 }
 
-fn create_capture_texture(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<ID3D11Texture2D, String> {
-    let description = D3D11_TEXTURE2D_DESC {
-        Width: width,
-        Height: height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        // Render-target resources are accepted as video-processor inputs by
-        // the NVIDIA D3D11 path and remain valid copy destinations.
-        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-        CPUAccessFlags: 0,
-        MiscFlags: 0,
-    };
-    let mut texture = None;
-    unsafe {
-        device
-            .CreateTexture2D(&description, None, Some(&mut texture))
-            .map_err(|error| format!("Unable to create capture-copy texture: {error}"))?;
-    }
-    texture.ok_or_else(|| "D3D11 returned no capture-copy texture".to_owned())
-}
-
 fn create_output_texture(
     device: &ID3D11Device,
     width: u32,
@@ -1381,16 +1298,16 @@ fn create_output_texture(
         Height: height,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: DXGI_FORMAT_NV12,
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        // NVIDIA's D3D11 NVENC path registers a normal render-target texture
-        // directly. D3D11_BIND_VIDEO_ENCODER is for the D3D11 video-encoder
-        // API, not NVENC, and combining it with the video-processor output has
-        // caused NVIDIA drivers to remove the device under sustained load.
+        // NV12 is written by the fixed-function D3D11 video processor and
+        // registered directly with NVENC. D3D11_BIND_VIDEO_ENCODER belongs to
+        // the separate D3D11 video-encoder API; combining it here previously
+        // caused NVIDIA driver device removals under sustained load.
         BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
         CPUAccessFlags: 0,
         MiscFlags: 0,
@@ -1457,15 +1374,15 @@ impl D3dScaler {
         if bgra_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0 {
             return Err("The D3D11 video processor cannot consume BGRA capture frames".to_owned());
         }
-        let bgra_output_support = unsafe {
+        let nv12_output_support = unsafe {
             enumerator
-                .CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM)
+                .CheckVideoProcessorFormat(DXGI_FORMAT_NV12)
                 .map_err(|error| {
-                    format!("Unable to query D3D11 BGRA video-processor output support: {error}")
+                    format!("Unable to query D3D11 NV12 video-processor output support: {error}")
                 })?
         };
-        if bgra_output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0 {
-            return Err("The D3D11 video processor cannot produce BGRA encoder frames".to_owned());
+        if nv12_output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0 {
+            return Err("The D3D11 video processor cannot produce NV12 encoder frames".to_owned());
         }
         let processor = unsafe {
             video_device
@@ -1505,9 +1422,13 @@ impl D3dScaler {
             bottom: output_height as i32,
         };
         unsafe {
+            // Input is full-range desktop RGB. Output is conventional limited-
+            // range BT.709 NV12, matching the H.264 VUI below. Bit 2 selects
+            // BT.709 and Nominal_Range=1 occupies bits 4-5.
             let rgb_full_range = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0 };
+            let nv12_bt709_limited = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0x14 };
             video_context.VideoProcessorSetStreamColorSpace(&processor, 0, &rgb_full_range);
-            video_context.VideoProcessorSetOutputColorSpace(&processor, &rgb_full_range);
+            video_context.VideoProcessorSetOutputColorSpace(&processor, &nv12_bt709_limited);
             video_context.VideoProcessorSetStreamSourceRect(
                 &processor,
                 0,
@@ -1745,7 +1666,7 @@ impl NvencEncoder {
             maxEncodeWidth: self.width,
             maxEncodeHeight: self.height,
             tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
             ..Default::default()
         };
         // NVIDIA documents this exact combination for applications that call
@@ -1779,7 +1700,7 @@ impl NvencEncoder {
             width: self.width,
             height: self.height,
             resourceToRegister: texture.as_raw(),
-            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
             bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
             ..Default::default()
         };
