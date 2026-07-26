@@ -74,7 +74,7 @@ pub struct EchobindApp {
     dxgi_backlog: u64,
     dxgi_backlog_max: u64,
     pacing_skips: u64,
-    encoder_busy_skips: u64,
+    slot_busy_skips: u64,
     cursor_only_frames: u64,
     stale_frames: u64,
     reassembly_ms: f32,
@@ -158,7 +158,7 @@ impl EchobindApp {
             dxgi_backlog: 0,
             dxgi_backlog_max: 0,
             pacing_skips: 0,
-            encoder_busy_skips: 0,
+            slot_busy_skips: 0,
             cursor_only_frames: 0,
             stale_frames: 0,
             reassembly_ms: 0.0,
@@ -253,7 +253,7 @@ impl EchobindApp {
                     dxgi_backlog,
                     dxgi_backlog_max,
                     pacing_skips,
-                    encoder_busy_skips,
+                    slot_busy_skips,
                     cursor_only_frames,
                     stale_frames,
                 } => {
@@ -271,7 +271,7 @@ impl EchobindApp {
                     self.dxgi_backlog = dxgi_backlog;
                     self.dxgi_backlog_max = dxgi_backlog_max;
                     self.pacing_skips = pacing_skips;
-                    self.encoder_busy_skips = encoder_busy_skips;
+                    self.slot_busy_skips = slot_busy_skips;
                     self.cursor_only_frames = cursor_only_frames;
                     self.stale_frames = stale_frames;
                 }
@@ -439,7 +439,7 @@ impl EchobindApp {
         self.dxgi_backlog = 0;
         self.dxgi_backlog_max = 0;
         self.pacing_skips = 0;
-        self.encoder_busy_skips = 0;
+        self.slot_busy_skips = 0;
         self.cursor_only_frames = 0;
         self.stale_frames = 0;
         self.transport = "standard MTU".to_owned();
@@ -744,13 +744,13 @@ impl EchobindApp {
                 ));
                 #[cfg(target_os = "windows")]
                 ui.label(format!(
-                    "capture: {:.1} source FPS · {} DXGI timeouts · {} accumulated (max {}) · skips pacing {} / encoder busy {} / cursor-only {} / stale {}",
+                    "capture: {:.1} source FPS · {} DXGI timeouts · {} accumulated (max {}) · skips pacing {} / slot busy {} / cursor-only {} / stale {}",
                     self.source_fps,
                     self.dxgi_timeouts,
                     self.dxgi_backlog,
                     self.dxgi_backlog_max,
                     self.pacing_skips,
-                    self.encoder_busy_skips,
+                    self.slot_busy_skips,
                     self.cursor_only_frames,
                     self.stale_frames,
                 ));

@@ -277,7 +277,7 @@ pub enum SessionEvent {
         dxgi_backlog: u64,
         dxgi_backlog_max: u64,
         pacing_skips: u64,
-        encoder_busy_skips: u64,
+        slot_busy_skips: u64,
         cursor_only_frames: u64,
         stale_frames: u64,
     },
@@ -1140,7 +1140,7 @@ fn spawn_encoder(
                     dxgi_backlog: 0,
                     dxgi_backlog_max: 0,
                     pacing_skips: 0,
-                    encoder_busy_skips: 0,
+                    slot_busy_skips: 0,
                     cursor_only_frames: 0,
                     stale_frames: 0,
                 });

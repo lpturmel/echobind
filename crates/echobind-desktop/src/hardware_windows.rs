@@ -127,7 +127,7 @@ struct WindowsCaptureMetrics {
     dxgi_backlog: AtomicU64,
     dxgi_backlog_max: AtomicU64,
     pacing_skips: AtomicU64,
-    encoder_busy_skips: AtomicU64,
+    slot_busy_skips: AtomicU64,
     cursor_only_frames: AtomicU64,
     stale_frames: AtomicU64,
 }
@@ -135,16 +135,18 @@ struct WindowsCaptureMetrics {
 struct HardwareCapture {
     device_context: ID3D11DeviceContext,
     debug_info_queue: Option<ID3D11InfoQueue>,
-    gpu_completion_query: ID3D11Query,
+    copy_completion_query: ID3D11Query,
     encoder: Arc<NvencEncoder>,
     cursor_position: Option<CursorPosition>,
     cursor_peer: Option<SocketAddr>,
     cursor_sent_at: Option<Instant>,
     cursor_packet: Vec<u8>,
-    scalers: Vec<Option<D3dScaler>>,
+    capture_textures: Vec<Option<CaptureTexture>>,
     free_slots_tx: mpsc::SyncSender<usize>,
     free_slots: mpsc::Receiver<usize>,
-    completion_tx: Option<mpsc::SyncSender<PendingNvencFrame>>,
+    prepared_tx: Option<mpsc::SyncSender<PreparedHardwareFrame>>,
+    submission_handle: Option<JoinHandle<()>>,
+    submission_done: mpsc::Receiver<()>,
     completion_handle: Option<JoinHandle<()>>,
     completion_done: mpsc::Receiver<()>,
     completion_failure: Arc<Mutex<Option<String>>>,
@@ -153,6 +155,24 @@ struct HardwareCapture {
     frame_interval: Duration,
     next_frame_at: Instant,
     frame_id: u64,
+}
+
+struct CaptureTexture {
+    width: u32,
+    height: u32,
+    texture: ID3D11Texture2D,
+}
+
+struct PreparedHardwareFrame {
+    slot: usize,
+    texture: ID3D11Texture2D,
+    source_width: u32,
+    source_height: u32,
+    frame_id: u64,
+    timestamp_us: u64,
+    gpu_wait_us: u64,
+    gpu_lock_us: u64,
+    captured_at: Instant,
 }
 
 struct EncodedHardwareFrame {
@@ -339,7 +359,7 @@ fn run_dxgi_pipeline(
                         "DXGI display mode changed · rebuilding capture and forcing IDR".to_owned(),
                     ));
                     warn!("DXGI capture session was invalidated: {error}");
-                } else if consecutive_access_losses % 20 == 0 {
+                } else if consecutive_access_losses.is_multiple_of(20) {
                     warn!(
                         "DXGI capture is still unavailable after {consecutive_access_losses} rebuild attempts: {error}"
                     );
@@ -410,7 +430,7 @@ fn run_dxgi_capture_session(
         "process GPU normal"
     };
     let backend = format!(
-        "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · D3D11 BGRA→NV12 · {process_priority_label} / device +7 · 4-buffer async"
+        "NVIDIA NVENC H.264 P1 · DXGI Desktop Duplication · staged D3D11 BGRA→NV12 · {process_priority_label} / device +7 · 4-slot async"
     );
     let mut capture = HardwareCapture::new_with_device(
         &device,
@@ -744,7 +764,7 @@ fn acquire_dxgi_frame(
 ) -> Result<bool, DxgiCaptureFailure> {
     if let Some(error) = capture.take_completion_failure() {
         return Err(DxgiCaptureFailure::Fatal(format!(
-            "NVENC completion pipeline stopped: {error}"
+            "D3D11/NVENC worker stopped: {error}"
         )));
     }
     let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -879,7 +899,9 @@ impl HardwareCapture {
             flags.frames_per_second,
             flags.bitrate_bps,
         )?);
-        let gpu_completion_query = create_gpu_completion_query(device)?;
+        let copy_completion_query = create_gpu_completion_query(device)?;
+        let submission_completion_query = create_gpu_completion_query(device)?;
+        let debug_info_queue: Option<ID3D11InfoQueue> = device.cast().ok();
         let (free_slots_tx, free_slots) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
         for slot in 0..NVENC_BUFFER_COUNT {
             free_slots_tx
@@ -901,6 +923,23 @@ impl HardwareCapture {
             flags.events.clone(),
             completion_done_tx,
         );
+        let (prepared_tx, prepared_rx) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
+        let (submission_done_tx, submission_done) = mpsc::channel();
+        let submission_handle = spawn_nvenc_submission(
+            device_context.clone(),
+            debug_info_queue.clone(),
+            submission_completion_query,
+            encoder.clone(),
+            prepared_rx,
+            completion_tx,
+            free_slots_tx.clone(),
+            flags.force_keyframe.clone(),
+            flags.running.clone(),
+            flags.metrics.clone(),
+            completion_failure.clone(),
+            flags.frames_per_second,
+            submission_done_tx,
+        );
         let _ = flags
             .events
             .send(SessionEvent::VideoBackend(backend.to_owned()));
@@ -909,19 +948,21 @@ impl HardwareCapture {
 
         Ok(Self {
             device_context,
-            debug_info_queue: device.cast().ok(),
-            gpu_completion_query,
+            debug_info_queue,
+            copy_completion_query,
             encoder,
             cursor_position: None,
             cursor_peer: None,
             cursor_sent_at: None,
             cursor_packet: Vec::with_capacity(14),
-            scalers: std::iter::repeat_with(|| None)
+            capture_textures: std::iter::repeat_with(|| None)
                 .take(NVENC_BUFFER_COUNT)
                 .collect(),
             free_slots_tx,
             free_slots,
-            completion_tx: Some(completion_tx),
+            prepared_tx: Some(prepared_tx),
+            submission_handle: Some(submission_handle),
+            submission_done,
             completion_handle: Some(completion_handle),
             completion_done,
             completion_failure,
@@ -990,7 +1031,7 @@ impl HardwareCapture {
         source_height: u32,
     ) -> Result<(), String> {
         if let Some(error) = self.take_completion_failure() {
-            return Err(format!("NVENC completion pipeline stopped: {error}"));
+            return Err(format!("D3D11/NVENC worker stopped: {error}"));
         }
         if self.flags.active_peer.lock().unwrap().is_none() {
             self.next_frame_at = Instant::now();
@@ -1013,65 +1054,52 @@ impl HardwareCapture {
             // acquisition; sampling a newer capture is lower latency.
             self.flags
                 .metrics
-                .encoder_busy_skips
+                .slot_busy_skips
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
-        // NvEncLockBitstream/NvEncUnlockBitstream can internally touch this
-        // same D3D11 device from the completion thread. Serialize those calls
-        // with capture copying/scaling and submission. GPU encoding remains
-        // asynchronous; this protects only the short CPU-side API sequences.
+        // Copy the DXGI-owned surface into a slot owned by this process. The
+        // expensive BGRA->NV12 conversion and NVENC submission happen on the
+        // submission worker after this function returns and ReleaseFrame has
+        // made the next desktop presentation available to DXGI.
         let capture_started = Instant::now();
-        let encoder = self.encoder.clone();
-        let gpu_lock_started = Instant::now();
-        let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
-        let mut gpu_lock_us = gpu_lock_started
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
-        let output_texture = self.encoder.slots[slot].texture.clone();
-        // Convert every captured BGRA texture to NV12 with the fixed-function
-        // D3D11 video processor. Submitting BGRA to NVENC makes the driver run
-        // its RGB conversion on CUDA, which competes directly with a game and
-        // was the sustained 40-48 FPS bottleneck. The DXGI frame remains
-        // acquired until this completion query finishes, so the processor can
-        // safely consume the duplication texture without an intermediate copy.
-        let scaler_needs_rebuild = self.scalers[slot].as_ref().is_none_or(|scaler| {
-            scaler.source_width != source_width || scaler.source_height != source_height
-        });
-        if scaler_needs_rebuild {
-            match D3dScaler::new(
-                &self.device_context,
-                &output_texture,
-                source_width,
-                source_height,
-                self.flags.width,
-                self.flags.height,
-                self.flags.frames_per_second,
-            ) {
-                Ok(scaler) => self.scalers[slot] = Some(scaler),
+        let texture_needs_rebuild = self.capture_textures[slot]
+            .as_ref()
+            .is_none_or(|texture| texture.width != source_width || texture.height != source_height);
+        if texture_needs_rebuild {
+            match create_capture_texture(&self.device_context, source_width, source_height) {
+                Ok(texture) => {
+                    self.capture_textures[slot] = Some(CaptureTexture {
+                        width: source_width,
+                        height: source_height,
+                        texture,
+                    });
+                }
                 Err(error) => {
                     let _ = self.free_slots_tx.try_send(slot);
                     return Err(error);
                 }
             }
         }
-        if let Err(error) = self.scalers[slot]
+        let capture_texture = self.capture_textures[slot]
             .as_ref()
-            .expect("video processor was initialized")
-            .scale(source_texture)
-        {
-            let _ = self.free_slots_tx.try_send(slot);
-            return Err(error);
+            .expect("capture texture was initialized")
+            .texture
+            .clone();
+        let gpu_lock_started = Instant::now();
+        let gpu_api_guard = self.encoder.gpu_api_lock.lock().unwrap();
+        let gpu_lock_us = gpu_lock_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        unsafe {
+            self.device_context
+                .CopyResource(&capture_texture, source_texture);
         }
-        // Put the completion marker into the immediate-context command stream
-        // while the API mutex is still held. The multithread-protected D3D11
-        // context can then be polled safely without preventing the completion
-        // worker from draining already-finished NVENC buffers.
-        self.begin_gpu_completion();
+        self.begin_copy_completion();
         drop(gpu_api_guard);
         let gpu_wait_started = Instant::now();
-        if let Err(error) = self.wait_for_gpu_completion("D3D11 BGRA-to-NV12 video processing") {
+        if let Err(error) = self.wait_for_copy_completion() {
             let _ = self.free_slots_tx.try_send(slot);
             return Err(error);
         }
@@ -1080,158 +1108,159 @@ impl HardwareCapture {
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
 
-        // Loss and capture-timeline changes request an IDR explicitly. Avoid
-        // periodic ultrawide IDRs: their packet bursts can occupy several
-        // frame budgets and reduce sustained delivery FPS.
-        let force_idr = self.flags.force_keyframe.swap(false, Ordering::Relaxed);
         let timestamp_us = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        let capture_us = capture_started
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
-        let encode_started = Instant::now();
-        let submit_lock_started = Instant::now();
-        let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
-        gpu_lock_us = gpu_lock_us.saturating_add(
-            submit_lock_started
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64,
-        );
-        let mapped_resource = match self.encoder.submit(slot, force_idr) {
-            Ok(mapped) => mapped,
-            Err(error) => {
-                let _ = self.free_slots_tx.try_send(slot);
-                return Err(error);
-            }
-        };
-        drop(gpu_api_guard);
-        let pending = PendingNvencFrame {
+        let prepared = PreparedHardwareFrame {
             slot,
-            mapped_resource,
+            texture: capture_texture,
+            source_width,
+            source_height,
             frame_id: self.frame_id,
             timestamp_us,
-            capture_us,
             gpu_wait_us,
             gpu_lock_us,
-            encode_started,
             captured_at: capture_started,
         };
         self.frame_id = self.frame_id.wrapping_add(1);
-        if self
-            .completion_tx
+        match self
+            .prepared_tx
             .as_ref()
-            .is_none_or(|sender| sender.send(pending).is_err())
+            .map(|sender| sender.try_send(prepared))
         {
-            self.flags.force_keyframe.store(true, Ordering::Release);
-            let _ = self.encoder.unmap(mapped_resource);
-            let _ = self.free_slots_tx.try_send(slot);
-            return Err("NVENC completion worker disconnected".to_owned());
+            Some(Ok(())) => Ok(()),
+            Some(Err(mpsc::TrySendError::Full(_))) => {
+                // This should be unreachable because every queued frame owns
+                // one of the same four slots. Keep the low-latency policy if a
+                // future channel-size change invalidates that invariant.
+                self.flags
+                    .metrics
+                    .slot_busy_skips
+                    .fetch_add(1, Ordering::Relaxed);
+                self.flags.force_keyframe.store(true, Ordering::Release);
+                let _ = self.free_slots_tx.try_send(slot);
+                Ok(())
+            }
+            Some(Err(mpsc::TrySendError::Disconnected(_))) | None => {
+                self.flags.force_keyframe.store(true, Ordering::Release);
+                let _ = self.free_slots_tx.try_send(slot);
+                Err("D3D11 conversion/NVENC submission worker disconnected".to_owned())
+            }
         }
-        Ok(())
     }
 
     fn take_completion_failure(&self) -> Option<String> {
         self.completion_failure.lock().unwrap().take()
     }
 
-    fn begin_gpu_completion(&self) {
+    fn begin_copy_completion(&self) {
         unsafe {
-            self.device_context.End(&self.gpu_completion_query);
+            self.device_context.End(&self.copy_completion_query);
             self.device_context.Flush();
         }
     }
 
-    fn wait_for_gpu_completion(&self, operation: &str) -> Result<(), String> {
-        let started = Instant::now();
-        let mut spins = 0_u32;
-        loop {
-            if !self.flags.running.load(Ordering::Relaxed) {
-                return Err(format!("{operation} cancelled while stopping"));
-            }
-            let mut complete = BOOL::default();
-            let completion = unsafe {
-                self.device_context.GetData(
-                    &self.gpu_completion_query,
-                    Some((&mut complete as *mut BOOL).cast()),
-                    std::mem::size_of::<BOOL>() as u32,
-                    D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
-                )
-            };
-            if let Err(error) = completion {
-                // The encoder owns resources on this same D3D device. Mark it
-                // unusable before teardown so Drop does not issue a sequence
-                // of unregister/unmap calls into a removed driver context.
-                self.encoder.poison();
-                return Err(format!(
-                    "Unable to query {operation} completion: {error}; {}{}",
-                    d3d11_device_removed_reason(&self.device_context),
-                    self.d3d_debug_messages()
-                ));
-            }
-            if complete.as_bool() {
-                return Ok(());
-            }
-            if started.elapsed() >= GPU_COPY_COMPLETION_TIMEOUT {
-                self.encoder.poison();
-                return Err(format!(
-                    "{operation} did not finish within {} ms{}",
-                    GPU_COPY_COMPLETION_TIMEOUT.as_millis(),
-                    self.d3d_debug_messages()
-                ));
-            }
-            if spins < 128 {
-                std::hint::spin_loop();
-                spins += 1;
-            } else {
-                thread::yield_now();
-            }
-        }
+    fn wait_for_copy_completion(&self) -> Result<(), String> {
+        wait_for_gpu_completion(
+            &self.device_context,
+            &self.copy_completion_query,
+            &self.flags.running,
+            &self.encoder,
+            self.debug_info_queue.as_ref(),
+            "D3D11 desktop copy",
+        )
     }
+}
 
-    fn d3d_debug_messages(&self) -> String {
-        let Some(queue) = &self.debug_info_queue else {
-            return String::new();
+fn wait_for_gpu_completion(
+    device_context: &ID3D11DeviceContext,
+    query: &ID3D11Query,
+    running: &AtomicBool,
+    encoder: &NvencEncoder,
+    debug_info_queue: Option<&ID3D11InfoQueue>,
+    operation: &str,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut spins = 0_u32;
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            return Err(format!("{operation} cancelled while stopping"));
+        }
+        let mut complete = BOOL::default();
+        let completion = unsafe {
+            device_context.GetData(
+                query,
+                Some((&mut complete as *mut BOOL).cast()),
+                std::mem::size_of::<BOOL>() as u32,
+                D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+            )
         };
-        let count = unsafe { queue.GetNumStoredMessages() };
-        let first = count.saturating_sub(16);
-        let mut messages = Vec::new();
-        for index in first..count {
-            let mut byte_length = 0_usize;
-            if unsafe { queue.GetMessage(index, None, &mut byte_length) }.is_err()
-                || byte_length < std::mem::size_of::<D3D11_MESSAGE>()
-            {
-                continue;
-            }
-            let word_count = byte_length.div_ceil(std::mem::size_of::<usize>());
-            let mut storage = vec![0_usize; word_count];
-            let message_ptr = storage.as_mut_ptr().cast::<D3D11_MESSAGE>();
-            if unsafe { queue.GetMessage(index, Some(message_ptr), &mut byte_length) }.is_err() {
-                continue;
-            }
-            let message = unsafe { &*message_ptr };
-            let description = if message.pDescription.is_null()
-                || message.DescriptionByteLength == 0
-            {
-                String::new()
-            } else {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength)
-                };
-                String::from_utf8_lossy(bytes)
-                    .trim_end_matches('\0')
-                    .to_owned()
-            };
-            messages.push(format!(
-                "{:?}/{:?}/{}: {}",
-                message.Category, message.Severity, message.ID.0, description
+        if let Err(error) = completion {
+            encoder.poison();
+            return Err(format!(
+                "Unable to query {operation} completion: {error}; {}{}",
+                d3d11_device_removed_reason(device_context),
+                d3d_debug_messages(debug_info_queue)
             ));
         }
-        if messages.is_empty() {
-            "; D3D11 debug queue was empty".to_owned()
-        } else {
-            format!("; D3D11 debug: {}", messages.join(" | "))
+        if complete.as_bool() {
+            return Ok(());
         }
+        if started.elapsed() >= GPU_COPY_COMPLETION_TIMEOUT {
+            encoder.poison();
+            return Err(format!(
+                "{operation} did not finish within {} ms{}",
+                GPU_COPY_COMPLETION_TIMEOUT.as_millis(),
+                d3d_debug_messages(debug_info_queue)
+            ));
+        }
+        if spins < 128 {
+            std::hint::spin_loop();
+            spins += 1;
+        } else {
+            thread::yield_now();
+        }
+    }
+}
+
+fn d3d_debug_messages(queue: Option<&ID3D11InfoQueue>) -> String {
+    let Some(queue) = queue else {
+        return String::new();
+    };
+    let count = unsafe { queue.GetNumStoredMessages() };
+    let first = count.saturating_sub(16);
+    let mut messages = Vec::new();
+    for index in first..count {
+        let mut byte_length = 0_usize;
+        if unsafe { queue.GetMessage(index, None, &mut byte_length) }.is_err()
+            || byte_length < std::mem::size_of::<D3D11_MESSAGE>()
+        {
+            continue;
+        }
+        let word_count = byte_length.div_ceil(std::mem::size_of::<usize>());
+        let mut storage = vec![0_usize; word_count];
+        let message_ptr = storage.as_mut_ptr().cast::<D3D11_MESSAGE>();
+        if unsafe { queue.GetMessage(index, Some(message_ptr), &mut byte_length) }.is_err() {
+            continue;
+        }
+        let message = unsafe { &*message_ptr };
+        let description = if message.pDescription.is_null() || message.DescriptionByteLength == 0 {
+            String::new()
+        } else {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength)
+            };
+            String::from_utf8_lossy(bytes)
+                .trim_end_matches('\0')
+                .to_owned()
+        };
+        messages.push(format!(
+            "{:?}/{:?}/{}: {}",
+            message.Category, message.Severity, message.ID.0, description
+        ));
+    }
+    if messages.is_empty() {
+        "; D3D11 debug queue was empty".to_owned()
+    } else {
+        format!("; D3D11 debug: {}", messages.join(" | "))
     }
 }
 
@@ -1262,7 +1291,21 @@ fn create_gpu_completion_query(device: &ID3D11Device) -> Result<ID3D11Query, Str
 
 impl Drop for HardwareCapture {
     fn drop(&mut self) {
-        self.completion_tx.take();
+        self.prepared_tx.take();
+        if let Some(handle) = self.submission_handle.take() {
+            match self.submission_done.recv_timeout(WORKER_SHUTDOWN_TIMEOUT) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = handle.join();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.encoder.poison();
+                    warn!(
+                        "D3D11 conversion/NVENC submission worker did not stop within {} ms; detaching the poisoned driver worker",
+                        WORKER_SHUTDOWN_TIMEOUT.as_millis()
+                    );
+                }
+            }
+        }
         if let Some(handle) = self.completion_handle.take() {
             match self.completion_done.recv_timeout(WORKER_SHUTDOWN_TIMEOUT) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1280,6 +1323,164 @@ impl Drop for HardwareCapture {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_nvenc_submission(
+    device_context: ID3D11DeviceContext,
+    debug_info_queue: Option<ID3D11InfoQueue>,
+    gpu_completion_query: ID3D11Query,
+    encoder: Arc<NvencEncoder>,
+    prepared_frames: mpsc::Receiver<PreparedHardwareFrame>,
+    completion_tx: mpsc::SyncSender<PendingNvencFrame>,
+    free_slots: mpsc::SyncSender<usize>,
+    force_keyframe: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    metrics: Arc<WindowsCaptureMetrics>,
+    completion_failure: Arc<Mutex<Option<String>>>,
+    frames_per_second: u32,
+    submission_done: mpsc::Sender<()>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        raise_current_thread_priority("D3D11/NVENC submission", THREAD_PRIORITY_HIGHEST);
+        let mut scalers: Vec<Option<D3dScaler>> = std::iter::repeat_with(|| None)
+            .take(NVENC_BUFFER_COUNT)
+            .collect();
+
+        while let Ok(prepared) = prepared_frames.recv() {
+            if !running.load(Ordering::Relaxed) {
+                let _ = free_slots.try_send(prepared.slot);
+                continue;
+            }
+            if prepared.captured_at.elapsed() > VIDEO_SEND_STALE_AGE {
+                metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
+                force_keyframe.store(true, Ordering::Release);
+                let _ = free_slots.try_send(prepared.slot);
+                continue;
+            }
+
+            let result = (|| {
+                let output_texture = encoder
+                    .slots
+                    .get(prepared.slot)
+                    .ok_or_else(|| format!("Invalid NVENC slot {}", prepared.slot))?
+                    .texture
+                    .clone();
+                let gpu_lock_started = Instant::now();
+                let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
+                let mut gpu_lock_us = prepared.gpu_lock_us.saturating_add(
+                    gpu_lock_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+                let scaler_needs_rebuild = scalers[prepared.slot].as_ref().is_none_or(|scaler| {
+                    scaler.source_width != prepared.source_width
+                        || scaler.source_height != prepared.source_height
+                });
+                if scaler_needs_rebuild {
+                    scalers[prepared.slot] = Some(D3dScaler::new(
+                        &device_context,
+                        &output_texture,
+                        prepared.source_width,
+                        prepared.source_height,
+                        encoder.width,
+                        encoder.height,
+                        frames_per_second,
+                    )?);
+                }
+                scalers[prepared.slot]
+                    .as_ref()
+                    .expect("video processor was initialized")
+                    .scale(&prepared.texture)?;
+                unsafe {
+                    device_context.End(&gpu_completion_query);
+                    device_context.Flush();
+                }
+                drop(gpu_api_guard);
+
+                let gpu_wait_started = Instant::now();
+                wait_for_gpu_completion(
+                    &device_context,
+                    &gpu_completion_query,
+                    &running,
+                    &encoder,
+                    debug_info_queue.as_ref(),
+                    "D3D11 BGRA-to-NV12 video processing",
+                )?;
+                let gpu_wait_us = prepared.gpu_wait_us.saturating_add(
+                    gpu_wait_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+                if prepared.captured_at.elapsed() > VIDEO_SEND_STALE_AGE {
+                    return Ok(None);
+                }
+
+                // Loss and capture-timeline changes request an IDR explicitly.
+                // Avoid periodic ultrawide IDRs, whose packet bursts occupy
+                // several frame budgets.
+                let force_idr = force_keyframe.swap(false, Ordering::Relaxed);
+                let capture_us = prepared
+                    .captured_at
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                let encode_started = Instant::now();
+                let submit_lock_started = Instant::now();
+                let gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
+                gpu_lock_us = gpu_lock_us.saturating_add(
+                    submit_lock_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+                let mapped_resource = encoder.submit(prepared.slot, force_idr)?;
+                drop(gpu_api_guard);
+
+                Ok(Some(PendingNvencFrame {
+                    slot: prepared.slot,
+                    mapped_resource,
+                    frame_id: prepared.frame_id,
+                    timestamp_us: prepared.timestamp_us,
+                    capture_us,
+                    gpu_wait_us,
+                    gpu_lock_us,
+                    encode_started,
+                    captured_at: prepared.captured_at,
+                }))
+            })();
+
+            match result {
+                Ok(Some(pending)) => {
+                    if let Err(error) = completion_tx.send(pending) {
+                        force_keyframe.store(true, Ordering::Release);
+                        let pending = error.0;
+                        let _gpu_api_guard = encoder.gpu_api_lock.lock().unwrap();
+                        let _ = encoder.unmap(pending.mapped_resource);
+                        let _ = free_slots.try_send(pending.slot);
+                        *completion_failure.lock().unwrap() =
+                            Some("NVENC completion worker disconnected".to_owned());
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
+                    force_keyframe.store(true, Ordering::Release);
+                    let _ = free_slots.try_send(prepared.slot);
+                }
+                Err(error) => {
+                    warn!("D3D11 conversion/NVENC submission failed: {error}");
+                    force_keyframe.store(true, Ordering::Release);
+                    *completion_failure.lock().unwrap() = Some(error);
+                    break;
+                }
+            }
+        }
+        let _ = submission_done.send(());
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_nvenc_completion(
     encoder: Arc<NvencEncoder>,
     pending_frames: mpsc::Receiver<PendingNvencFrame>,
@@ -1311,10 +1512,8 @@ fn spawn_nvenc_completion(
                             Err(mpsc::TrySendError::Disconnected(_)) => break false,
                         }
                     };
-                    if accepted {
-                        if hardware_progress.fetch_add(1, Ordering::AcqRel) == 0 {
-                            let _ = events.send(SessionEvent::CaptureReady);
-                        }
+                    if accepted && hardware_progress.fetch_add(1, Ordering::AcqRel) == 0 {
+                        let _ = events.send(SessionEvent::CaptureReady);
                     }
                 }
                 Err(error) => {
@@ -1533,6 +1732,7 @@ impl DatagramPacer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report_sender_stats(
     events: &mpsc::Sender<SessionEvent>,
     stats_started: &mut Instant,
@@ -1566,7 +1766,7 @@ fn report_sender_stats(
         dxgi_backlog: metrics.dxgi_backlog.swap(0, Ordering::Relaxed),
         dxgi_backlog_max: metrics.dxgi_backlog_max.swap(0, Ordering::Relaxed),
         pacing_skips: metrics.pacing_skips.swap(0, Ordering::Relaxed),
-        encoder_busy_skips: metrics.encoder_busy_skips.swap(0, Ordering::Relaxed),
+        slot_busy_skips: metrics.slot_busy_skips.swap(0, Ordering::Relaxed),
         cursor_only_frames: metrics.cursor_only_frames.swap(0, Ordering::Relaxed),
         stale_frames: metrics.stale_frames.swap(0, Ordering::Relaxed),
     });
@@ -1601,6 +1801,42 @@ fn raise_current_thread_priority(role: &str, priority: THREAD_PRIORITY) {
     if let Err(error) = unsafe { SetThreadPriority(GetCurrentThread(), priority) } {
         warn!("Unable to raise {role} thread priority: {error}");
     }
+}
+
+fn create_capture_texture(
+    device_context: &ID3D11DeviceContext,
+    width: u32,
+    height: u32,
+) -> Result<ID3D11Texture2D, String> {
+    let device = unsafe {
+        device_context
+            .GetDevice()
+            .map_err(|error| format!("D3D11 context returned no device: {error}"))?
+    };
+    let description = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        // The texture is a CopyResource destination on the acquisition thread
+        // and a video-processor input on the submission thread.
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    unsafe {
+        device
+            .CreateTexture2D(&description, None, Some(&mut texture))
+            .map_err(|error| format!("Unable to create BGRA capture-ring texture: {error}"))?;
+    }
+    texture.ok_or_else(|| "D3D11 returned no BGRA capture-ring texture".to_owned())
 }
 
 fn create_output_texture(
@@ -2060,7 +2296,7 @@ impl NvencEncoder {
         };
         let mut event = NV_ENC_EVENT_PARAMS {
             version: NV_ENC_EVENT_PARAMS_VER,
-            completionEvent: completion_event.0 as *mut c_void,
+            completionEvent: completion_event.0,
             ..Default::default()
         };
         if let Err(error) = nvenc_status(
@@ -2120,7 +2356,7 @@ impl NvencEncoder {
             encodePicFlags: flags,
             inputBuffer: mapped.mappedResource,
             outputBitstream: slot.bitstream,
-            completionEvent: slot.completion_event.0 as *mut c_void,
+            completionEvent: slot.completion_event.0,
             bufferFmt: mapped.mappedBufferFmt,
             pictureStruct: NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME,
             ..Default::default()
@@ -2267,7 +2503,7 @@ impl Drop for NvencEncoder {
                     if let Some(unregister_event) = self.api.functions.nvEncUnregisterAsyncEvent {
                         let mut event = NV_ENC_EVENT_PARAMS {
                             version: NV_ENC_EVENT_PARAMS_VER,
-                            completionEvent: slot.completion_event.0 as *mut c_void,
+                            completionEvent: slot.completion_event.0,
                             ..Default::default()
                         };
                         let _ = unregister_event(self.encoder, &mut event);

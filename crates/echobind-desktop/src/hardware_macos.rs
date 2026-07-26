@@ -277,7 +277,7 @@ fn run_hardware_pipeline(
                 dxgi_backlog: 0,
                 dxgi_backlog_max: 0,
                 pacing_skips: 0,
-                encoder_busy_skips: 0,
+                slot_busy_skips: 0,
                 cursor_only_frames: 0,
                 stale_frames: 0,
             });
