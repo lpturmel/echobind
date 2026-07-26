@@ -84,6 +84,9 @@ const CAPTURE_ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
 const CAPTURE_ACTIVITY_THRESHOLD: u64 = 3;
 const ACCESS_LOST_RETRY_DELAY_MS: u64 = 25;
 const ACCESS_LOST_MAX_RETRY_DELAY_MS: u64 = 200;
+const VIDEO_PACING_BATCH_DATAGRAMS: usize = 16;
+const VIDEO_PACING_RATE_MULTIPLIER: u64 = 4;
+const VIDEO_PACING_SLEEP_GUARD: Duration = Duration::from_micros(500);
 
 struct CaptureFlags {
     running: Arc<AtomicBool>,
@@ -268,6 +271,7 @@ fn run_dxgi_pipeline(
         events.clone(),
         encoded_rx,
         active_datagram_size,
+        bitrate_bps,
     );
     let mut consecutive_access_losses = 0_u32;
     let result = loop {
@@ -1088,7 +1092,10 @@ fn spawn_nvenc_completion(
                     warn!("Asynchronous NVENC completion failed: {error}");
                     force_keyframe.store(true, Ordering::Release);
                     *completion_failure.lock().unwrap() = Some(error);
-                    let _ = free_slots.try_send(pending.slot);
+                    // The failed resource may still be mapped or owned by the
+                    // driver. Do not return it to the capture ring, and do not
+                    // risk enqueueing the same slot twice while the pipeline
+                    // is being torn down.
                     break;
                 }
             }
@@ -1111,9 +1118,11 @@ fn spawn_hardware_sender(
     events: mpsc::Sender<SessionEvent>,
     encoded_frames: mpsc::Receiver<EncodedHardwareFrame>,
     active_datagram_size: Arc<AtomicUsize>,
+    bitrate_bps: u32,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         raise_current_thread_priority("video sender");
+        let mut pacer = DatagramPacer::new(bitrate_bps);
         let mut packet = Vec::with_capacity(MAX_DATAGRAM_SIZE);
         let mut stats_started = Instant::now();
         let mut stats_frames = 0_u64;
@@ -1186,7 +1195,11 @@ fn spawn_hardware_sender(
 
             let send_started = Instant::now();
             let mut frame_sent = true;
-            for fragment in fragments {
+            pacer.begin_frame();
+            for (fragment_index, fragment) in fragments.into_iter().enumerate() {
+                if fragment_index > 0 && fragment_index % VIDEO_PACING_BATCH_DATAGRAMS == 0 {
+                    pacer.wait();
+                }
                 Packet::Video(fragment).encode(&mut packet);
                 if let Err(error) = socket.send_to(&packet, peer) {
                     warn!("Video send to {peer} failed: {error}");
@@ -1194,6 +1207,7 @@ fn spawn_hardware_sender(
                     force_keyframe.store(true, Ordering::Release);
                     break;
                 }
+                pacer.account(packet.len());
                 stats_bytes = stats_bytes.saturating_add(packet.len() as u64);
             }
             if frame_sent {
@@ -1223,6 +1237,59 @@ fn spawn_hardware_sender(
             );
         }
     })
+}
+
+struct DatagramPacer {
+    bits_per_second: u64,
+    next_batch_at: Instant,
+}
+
+impl DatagramPacer {
+    fn new(bits_per_second: u32) -> Self {
+        Self {
+            // Smooth a frame over roughly one quarter of its configured
+            // frame budget. This prevents a 100+ packet microburst without
+            // adding a full frame of transport latency.
+            bits_per_second: u64::from(bits_per_second.max(1))
+                .saturating_mul(VIDEO_PACING_RATE_MULTIPLIER),
+            next_batch_at: Instant::now(),
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        let now = Instant::now();
+        if self.next_batch_at < now {
+            self.next_batch_at = now;
+        }
+    }
+
+    fn account(&mut self, bytes: usize) {
+        let transmission_nanos = (bytes as u128)
+            .saturating_mul(8)
+            .saturating_mul(1_000_000_000)
+            / u128::from(self.bits_per_second);
+        self.next_batch_at +=
+            Duration::from_nanos(transmission_nanos.min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn wait(&self) {
+        loop {
+            let now = Instant::now();
+            let Some(remaining) = self.next_batch_at.checked_duration_since(now) else {
+                return;
+            };
+            if remaining > VIDEO_PACING_SLEEP_GUARD {
+                thread::sleep(remaining - VIDEO_PACING_SLEEP_GUARD);
+            } else if remaining > Duration::from_micros(25) {
+                thread::yield_now();
+            } else {
+                while Instant::now() < self.next_batch_at {
+                    std::hint::spin_loop();
+                }
+                return;
+            }
+        }
+    }
 }
 
 fn report_sender_stats(

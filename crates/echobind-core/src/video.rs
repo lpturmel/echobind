@@ -168,7 +168,6 @@ impl VideoReassembler {
         &mut self,
         fragment: VideoFragment<'_>,
     ) -> Result<Option<VideoFrame>, VideoReassemblyError> {
-        self.expire_stale();
         self.validate_fragment(&fragment)?;
         let frame_id = fragment.frame_id;
         if self.completed.contains(&frame_id) {
@@ -454,6 +453,20 @@ mod tests {
         reassembler.push(first[0].clone()).unwrap();
         reassembler.push(second[0].clone()).unwrap();
         assert_eq!(reassembler.pending_frames(), 1);
+    }
+
+    #[test]
+    fn stale_frames_are_only_removed_by_explicit_expiration() {
+        let payload = vec![0; STANDARD_VIDEO_FRAGMENT_PAYLOAD + 1];
+        let first = fragment_video_frame(1, 0, false, &payload).unwrap();
+        let second = fragment_video_frame(2, 1, false, &payload).unwrap();
+        let mut reassembler = VideoReassembler::new(3, Duration::ZERO);
+
+        reassembler.push(first[0].clone()).unwrap();
+        reassembler.push(second[0].clone()).unwrap();
+
+        assert_eq!(reassembler.pending_frames(), 2);
+        assert_eq!(reassembler.expire_stale(), 2);
     }
 
     #[test]
