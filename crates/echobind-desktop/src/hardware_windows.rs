@@ -153,7 +153,6 @@ struct HardwareCapture {
     started: Instant,
     frame_interval: Duration,
     next_frame_at: Instant,
-    frame_id: u64,
 }
 
 struct CaptureTexture {
@@ -167,7 +166,6 @@ struct PreparedHardwareFrame {
     texture: ID3D11Texture2D,
     source_width: u32,
     source_height: u32,
-    frame_id: u64,
     timestamp_us: u64,
     captured_at: Instant,
 }
@@ -182,7 +180,6 @@ struct EncodedHardwareFrame {
     gpu_lock_us: u64,
     encode_us: u64,
     encoded_at: Instant,
-    captured_at: Instant,
 }
 
 struct PendingNvencFrame {
@@ -194,7 +191,6 @@ struct PendingNvencFrame {
     gpu_wait_us: u64,
     gpu_lock_us: u64,
     encode_started: Instant,
-    captured_at: Instant,
 }
 
 unsafe impl Send for PendingNvencFrame {}
@@ -992,7 +988,6 @@ impl HardwareCapture {
             started: Instant::now(),
             frame_interval,
             next_frame_at: Instant::now(),
-            frame_id: 0,
         })
     }
 
@@ -1139,11 +1134,9 @@ impl HardwareCapture {
             texture: capture_texture,
             source_width,
             source_height,
-            frame_id: self.frame_id,
             timestamp_us,
             captured_at: capture_started,
         };
-        self.frame_id = self.frame_id.wrapping_add(1);
         match self
             .prepared_tx
             .as_ref()
@@ -1227,6 +1220,10 @@ fn spawn_nvenc_submission(
         let mut scalers: Vec<Option<D3dScaler>> = std::iter::repeat_with(|| None)
             .take(NVENC_BUFFER_COUNT)
             .collect();
+        // This is the encoded-stream sequence, not the capture-attempt
+        // sequence. Frames discarded before NVENC must not create a false
+        // reference gap at the sender.
+        let mut next_frame_id = 0_u64;
 
         while let Ok(prepared) = prepared_frames.recv() {
             if !running.load(Ordering::Relaxed) || !workers_running.load(Ordering::Acquire) {
@@ -1287,17 +1284,18 @@ fn spawn_nvenc_submission(
                 let encode_started = Instant::now();
                 let mapped_resource = encoder.submit(prepared.slot, force_idr)?;
                 metrics.nvenc_submissions.fetch_add(1, Ordering::Relaxed);
+                let frame_id = next_frame_id;
+                next_frame_id = next_frame_id.wrapping_add(1);
 
                 Ok(Some(PendingNvencFrame {
                     slot: prepared.slot,
                     mapped_resource,
-                    frame_id: prepared.frame_id,
+                    frame_id,
                     timestamp_us: prepared.timestamp_us,
                     capture_us,
                     gpu_wait_us: 0,
                     gpu_lock_us: 0,
                     encode_started,
-                    captured_at: prepared.captured_at,
                 }))
             })();
 
@@ -1317,7 +1315,9 @@ fn spawn_nvenc_submission(
                 }
                 Ok(None) => {
                     metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
-                    force_keyframe.store(true, Ordering::Release);
+                    // This sample was never submitted to NVENC, so the next
+                    // encoded P-frame still references the last frame the
+                    // client received. No IDR is needed.
                     let _ = free_slots.try_send(prepared.slot);
                     preprocess_busy.store(false, Ordering::Release);
                 }
@@ -1452,12 +1452,11 @@ fn spawn_hardware_sender(
                 waiting_for_keyframe = true;
                 force_keyframe.store(true, Ordering::Release);
             }
-            if frame.captured_at.elapsed() > VIDEO_SEND_STALE_AGE {
-                metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
-                waiting_for_keyframe = true;
-                force_keyframe.store(true, Ordering::Release);
-                continue;
-            }
+            // Once NVENC has accepted a frame it participates in the H.264
+            // reference chain. Dropping it here makes every following P-frame
+            // undecodable and previously caused a self-sustaining IDR storm.
+            // The four-slot ring bounds this post-encode backlog; freshness
+            // decisions happen before encoder submission instead.
             if waiting_for_keyframe && !frame.is_keyframe {
                 force_keyframe.store(true, Ordering::Release);
                 continue;
@@ -2330,7 +2329,6 @@ impl NvencEncoder {
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64,
             encoded_at: Instant::now(),
-            captured_at: pending.captured_at,
         })
     }
 
