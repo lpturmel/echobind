@@ -70,11 +70,19 @@ pub struct EchobindApp {
     encode_ms: f32,
     send_ms: f32,
     encode_queue_ms: f32,
+    copy_wait_ms: f32,
+    convert_wait_ms: f32,
+    map_ms: f32,
+    submit_ms: f32,
+    completion_wait_ms: f32,
+    bitstream_ms: f32,
     dxgi_timeouts: u64,
     dxgi_backlog: u64,
     dxgi_backlog_max: u64,
     pacing_skips: u64,
     slot_busy_skips: u64,
+    preprocess_busy_skips: u64,
+    no_free_slot_skips: u64,
     cursor_only_frames: u64,
     stale_frames: u64,
     reassembly_ms: f32,
@@ -155,11 +163,19 @@ impl EchobindApp {
             encode_ms: 0.0,
             send_ms: 0.0,
             encode_queue_ms: 0.0,
+            copy_wait_ms: 0.0,
+            convert_wait_ms: 0.0,
+            map_ms: 0.0,
+            submit_ms: 0.0,
+            completion_wait_ms: 0.0,
+            bitstream_ms: 0.0,
             dxgi_timeouts: 0,
             dxgi_backlog: 0,
             dxgi_backlog_max: 0,
             pacing_skips: 0,
             slot_busy_skips: 0,
+            preprocess_busy_skips: 0,
+            no_free_slot_skips: 0,
             cursor_only_frames: 0,
             stale_frames: 0,
             reassembly_ms: 0.0,
@@ -254,11 +270,19 @@ impl EchobindApp {
                     self.encode_ms = stats.encode_ms;
                     self.send_ms = stats.send_ms;
                     self.encode_queue_ms = stats.encode_queue_ms;
+                    self.copy_wait_ms = stats.copy_wait_ms;
+                    self.convert_wait_ms = stats.convert_wait_ms;
+                    self.map_ms = stats.map_ms;
+                    self.submit_ms = stats.submit_ms;
+                    self.completion_wait_ms = stats.completion_wait_ms;
+                    self.bitstream_ms = stats.bitstream_ms;
                     self.dxgi_timeouts = stats.dxgi_timeouts;
                     self.dxgi_backlog = stats.dxgi_backlog;
                     self.dxgi_backlog_max = stats.dxgi_backlog_max;
                     self.pacing_skips = stats.pacing_skips;
                     self.slot_busy_skips = stats.slot_busy_skips;
+                    self.preprocess_busy_skips = stats.preprocess_busy_skips;
+                    self.no_free_slot_skips = stats.no_free_slot_skips;
                     self.cursor_only_frames = stats.cursor_only_frames;
                     self.stale_frames = stats.stale_frames;
                 }
@@ -421,6 +445,12 @@ impl EchobindApp {
         self.reassembly_ms = 0.0;
         self.decode_ms = 0.0;
         self.encode_queue_ms = 0.0;
+        self.copy_wait_ms = 0.0;
+        self.convert_wait_ms = 0.0;
+        self.map_ms = 0.0;
+        self.submit_ms = 0.0;
+        self.completion_wait_ms = 0.0;
+        self.bitstream_ms = 0.0;
         self.decode_queue_ms = 0.0;
         self.jitter_ms = 0.0;
         self.rtt_ms = 0.0;
@@ -431,6 +461,8 @@ impl EchobindApp {
         self.dxgi_backlog_max = 0;
         self.pacing_skips = 0;
         self.slot_busy_skips = 0;
+        self.preprocess_busy_skips = 0;
+        self.no_free_slot_skips = 0;
         self.cursor_only_frames = 0;
         self.stale_frames = 0;
         self.transport = "standard MTU".to_owned();
@@ -735,20 +767,31 @@ impl EchobindApp {
                 ));
                 #[cfg(target_os = "windows")]
                 ui.label(format!(
-                    "capture: {:.1} source FPS · {} DXGI timeouts · {} accumulated (max {}) · skips pacing {} / slot busy {} / cursor-only {} / stale {}",
+                    "stages: copy wait {:.2} ms · convert wait {:.2} ms · map {:.2} ms · submit {:.2} ms · completion {:.2} ms · bitstream {:.2} ms",
+                    self.copy_wait_ms,
+                    self.convert_wait_ms,
+                    self.map_ms,
+                    self.submit_ms,
+                    self.completion_wait_ms,
+                    self.bitstream_ms,
+                ));
+                #[cfg(target_os = "windows")]
+                ui.label(format!(
+                    "capture: {:.1} DXGI updates/s · {} timeouts · {} accumulated (max {}) · skips pacing {} / preprocess {} / no slot {} / cursor-only {} / stale {}",
                     self.source_fps,
                     self.dxgi_timeouts,
                     self.dxgi_backlog,
                     self.dxgi_backlog_max,
                     self.pacing_skips,
-                    self.slot_busy_skips,
+                    self.preprocess_busy_skips,
+                    self.no_free_slot_skips,
                     self.cursor_only_frames,
                     self.stale_frames,
                 ));
             } else {
                 if let Some(server) = self.server_stats {
                     ui.label(format!(
-                        "server: {:.1} source / {:.1} sent FPS · {:.2} Mbps · capture {:.2} ms · encode {:.2} ms · queue {:.2} ms · send {:.2} ms",
+                        "server: {:.1} source updates / {:.1} sent FPS · {:.2} Mbps · capture {:.2} ms · encode {:.2} ms · queue {:.2} ms · send {:.2} ms",
                         server.source_fps,
                         server.fps,
                         server.megabits_per_second,
@@ -756,6 +799,17 @@ impl EchobindApp {
                         server.encode_ms,
                         server.encode_queue_ms,
                         server.send_ms,
+                    ));
+                    ui.label(format!(
+                        "server stages: copy {:.2} · convert {:.2} · map {:.2} · submit {:.2} · completion {:.2} · bitstream {:.2} ms · skips preprocess {} / no slot {}",
+                        server.copy_wait_ms,
+                        server.convert_wait_ms,
+                        server.map_ms,
+                        server.submit_ms,
+                        server.completion_wait_ms,
+                        server.bitstream_ms,
+                        server.preprocess_busy_skips,
+                        server.no_free_slot_skips,
                     ));
                 }
                 ui.label(format!(
@@ -893,11 +947,22 @@ impl EchobindApp {
                                 "queue {:.2} ms  send {:.2} ms",
                                 server.encode_queue_ms, server.send_ms,
                             ));
+                            ui.label(format!(
+                                "copy {:.2}  convert {:.2}  map {:.2}  submit {:.2}  complete {:.2}  bits {:.2} ms",
+                                server.copy_wait_ms,
+                                server.convert_wait_ms,
+                                server.map_ms,
+                                server.submit_ms,
+                                server.completion_wait_ms,
+                                server.bitstream_ms,
+                            ));
                             if [
                                 server.dxgi_timeouts,
                                 server.dxgi_backlog,
                                 server.pacing_skips,
                                 server.slot_busy_skips,
+                                server.preprocess_busy_skips,
+                                server.no_free_slot_skips,
                                 server.cursor_only_frames,
                                 server.stale_frames,
                             ]
@@ -905,12 +970,13 @@ impl EchobindApp {
                             .any(|value| value > 0)
                             {
                                 ui.label(format!(
-                                    "DXGI timeout {}  backlog {} (max {})  skips {}/{}/{}/{}",
+                                    "DXGI timeout {}  backlog {} (max {})  skips pace/pre/no-slot/cursor/stale {}/{}/{}/{}/{}",
                                     server.dxgi_timeouts,
                                     server.dxgi_backlog,
                                     server.dxgi_backlog_max,
                                     server.pacing_skips,
-                                    server.slot_busy_skips,
+                                    server.preprocess_busy_skips,
+                                    server.no_free_slot_skips,
                                     server.cursor_only_frames,
                                     server.stale_frames,
                                 ));

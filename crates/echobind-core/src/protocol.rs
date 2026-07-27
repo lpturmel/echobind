@@ -7,7 +7,8 @@ const VIDEO_HEADER_LEN: usize = 21;
 const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
-const SERVER_STATS_LEN: usize = 9 * size_of::<f32>() + 7 * size_of::<u64>();
+const LEGACY_SERVER_STATS_LEN: usize = 9 * size_of::<f32>() + 7 * size_of::<u64>();
+const SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 9 * size_of::<u64>();
 pub const VIDEO_RECOVERY_HEADER_LEN: usize = 4;
 
 // The standard mode keeps the complete IPv6 packet below an Ethernet 1500-byte
@@ -85,6 +86,12 @@ pub struct ServerStats {
     pub encode_ms: f32,
     pub send_ms: f32,
     pub encode_queue_ms: f32,
+    pub copy_wait_ms: f32,
+    pub convert_wait_ms: f32,
+    pub map_ms: f32,
+    pub submit_ms: f32,
+    pub completion_wait_ms: f32,
+    pub bitstream_ms: f32,
     pub dxgi_timeouts: u64,
     pub dxgi_backlog: u64,
     pub dxgi_backlog_max: u64,
@@ -92,6 +99,8 @@ pub struct ServerStats {
     pub slot_busy_skips: u64,
     pub cursor_only_frames: u64,
     pub stale_frames: u64,
+    pub preprocess_busy_skips: u64,
+    pub no_free_slot_skips: u64,
 }
 
 impl Packet<'_> {
@@ -176,6 +185,19 @@ impl Packet<'_> {
                 ] {
                     out.extend_from_slice(&value.to_be_bytes());
                 }
+                for value in [
+                    stats.copy_wait_ms,
+                    stats.convert_wait_ms,
+                    stats.map_ms,
+                    stats.submit_ms,
+                    stats.completion_wait_ms,
+                    stats.bitstream_ms,
+                ] {
+                    out.extend_from_slice(&value.to_bits().to_be_bytes());
+                }
+                for value in [stats.preprocess_busy_skips, stats.no_free_slot_skips] {
+                    out.extend_from_slice(&value.to_be_bytes());
+                }
             }
             Packet::VideoKeyframeRequest => {
                 Self::encode_packet(Self::VIDEO_KEYFRAME_REQUEST, &[], out);
@@ -257,7 +279,7 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
 }
 
 fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
-    if payload.len() != SERVER_STATS_LEN {
+    if payload.len() != LEGACY_SERVER_STATS_LEN && payload.len() != SERVER_STATS_LEN {
         return Err(PacketParseError::Invalid);
     }
 
@@ -293,6 +315,29 @@ fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
         slot_busy_skips: u64_at(68)?,
         cursor_only_frames: u64_at(76)?,
         stale_frames: u64_at(84)?,
+        copy_wait_ms: 0.0,
+        convert_wait_ms: 0.0,
+        map_ms: 0.0,
+        submit_ms: 0.0,
+        completion_wait_ms: 0.0,
+        bitstream_ms: 0.0,
+        preprocess_busy_skips: 0,
+        no_free_slot_skips: 0,
+    };
+    let stats = if payload.len() == SERVER_STATS_LEN {
+        ServerStats {
+            copy_wait_ms: f32_at(92)?,
+            convert_wait_ms: f32_at(96)?,
+            map_ms: f32_at(100)?,
+            submit_ms: f32_at(104)?,
+            completion_wait_ms: f32_at(108)?,
+            bitstream_ms: f32_at(112)?,
+            preprocess_busy_skips: u64_at(116)?,
+            no_free_slot_skips: u64_at(124)?,
+            ..stats
+        }
+    } else {
+        stats
     };
     if [
         stats.fps,
@@ -304,6 +349,12 @@ fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
         stats.encode_ms,
         stats.send_ms,
         stats.encode_queue_ms,
+        stats.copy_wait_ms,
+        stats.convert_wait_ms,
+        stats.map_ms,
+        stats.submit_ms,
+        stats.completion_wait_ms,
+        stats.bitstream_ms,
     ]
     .into_iter()
     .any(|value| !value.is_finite())
@@ -605,6 +656,12 @@ mod tests {
             encode_ms: 2.4,
             send_ms: 0.8,
             encode_queue_ms: 0.2,
+            copy_wait_ms: 0.4,
+            convert_wait_ms: 0.5,
+            map_ms: 0.6,
+            submit_ms: 0.7,
+            completion_wait_ms: 0.8,
+            bitstream_ms: 0.9,
             dxgi_timeouts: 3,
             dxgi_backlog: 4,
             dxgi_backlog_max: 2,
@@ -612,12 +669,35 @@ mod tests {
             slot_busy_skips: 6,
             cursor_only_frames: 7,
             stale_frames: 8,
+            preprocess_busy_skips: 9,
+            no_free_slot_skips: 10,
         };
         let encoded = round_trip(Packet::ServerStats(stats));
         assert_eq!(
             Packet::try_from(encoded.as_slice()),
             Ok(Packet::ServerStats(stats))
         );
+    }
+
+    #[test]
+    fn parses_legacy_server_stats_without_stage_breakdown() {
+        let stats = ServerStats {
+            fps: 60.0,
+            source_fps: 90.0,
+            copy_wait_ms: 4.0,
+            preprocess_busy_skips: 12,
+            ..ServerStats::default()
+        };
+        let mut encoded = Vec::new();
+        Packet::ServerStats(stats).encode(&mut encoded);
+        encoded.truncate(HEADER_LEN + LEGACY_SERVER_STATS_LEN);
+        let Packet::ServerStats(parsed) = Packet::try_from(encoded.as_slice()).unwrap() else {
+            panic!("legacy server stats changed packet type");
+        };
+        assert_eq!(parsed.fps, stats.fps);
+        assert_eq!(parsed.source_fps, stats.source_fps);
+        assert_eq!(parsed.copy_wait_ms, 0.0);
+        assert_eq!(parsed.preprocess_busy_skips, 0);
     }
 
     #[test]

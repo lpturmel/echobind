@@ -1148,6 +1148,7 @@ fn spawn_encoder(
                         slot_busy_skips: 0,
                         cursor_only_frames: 0,
                         stale_frames: 0,
+                        ..ServerStats::default()
                     },
                 );
                 stats_started = Instant::now();

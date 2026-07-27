@@ -35,24 +35,28 @@ On the viewing machine:
 
 The desktop app streams the primary display at native, 720p, or 1080p
 resolution and up to 120 FPS. Windows uses DXGI Desktop Duplication, a
-four-slot asynchronous NVENC pipeline, and GPU scaling. Each acquired desktop
-surface is copied into an application-owned BGRA ring and released without a
-GPU fence wait. A single-frame preprocessing gate bounds queued copy/conversion
-work; color conversion and NVENC submission run on a separate worker, and GPU
-overload drops stale samples instead of blocking capture. macOS uses
+four-slot asynchronous NVENC pipeline, and GPU scaling. At native resolution,
+each acquired desktop surface is copied directly into a BGRA NVENC input slot;
+scaled streams use an application-owned BGRA staging ring and the D3D11 video
+processor to produce NV12. Per-slot GPU completion queries ensure neither path
+hands unfinished texture work to NVENC. A single-frame preprocessing gate
+bounds queued copy/conversion work while submission and completion run on
+separate workers; under GPU overload, capture samples newer desktop updates
+instead of building an unbounded queue. macOS uses
 ScreenCaptureKit and VideoToolbox for hardware encode, then VideoToolbox NV12
 decode and IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264
 is retained as a reported fallback.
 
 The low-latency path has no B-frame reordering, uses a one-frame NVENC VBV,
 generates IDRs only for startup or recovery, requests UI repaints directly from
-the decoder callback, and discards video that spends more than 25 ms in a host
-or decode queue. The UI reports capture, encode, send, reassembly, decode,
+the decoder callback, and bounds every host and decode queue. The UI reports
+capture, encode, send, reassembly, decode,
 presentation, RTT, jitter, drop, and loss measurements. The viewer receives
 the host's pipeline snapshot once per second and keeps both host and client
 health visible while the remote video is fullscreen. On Windows it also reports
-the DXGI source rate, accumulated desktop frames, timeouts, pacing and
-encoder-slot skips, GPU conversion wait, and D3D/NVENC mutex wait. Opus system
+the DXGI update rate, accumulated desktop frames, timeouts, pacing,
+preprocessing and encoder-slot skips, plus copy, conversion, mapping,
+submission, completion, and bitstream timing. Opus system
 audio is streamed independently and the viewer can select the default or a
 named output device.
 
