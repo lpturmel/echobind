@@ -767,7 +767,7 @@ impl EchobindApp {
                 ));
                 #[cfg(target_os = "windows")]
                 ui.label(format!(
-                    "stages: copy wait {:.2} ms · convert wait {:.2} ms · map {:.2} ms · submit {:.2} ms · completion {:.2} ms · bitstream {:.2} ms",
+                    "stages: copy issue {:.2} ms · convert issue {:.2} ms · sync/map {:.2} ms · submit {:.2} ms · completion {:.2} ms · bitstream {:.2} ms",
                     self.copy_wait_ms,
                     self.convert_wait_ms,
                     self.map_ms,
@@ -801,7 +801,7 @@ impl EchobindApp {
                         server.send_ms,
                     ));
                     ui.label(format!(
-                        "server stages: copy {:.2} · convert {:.2} · map {:.2} · submit {:.2} · completion {:.2} · bitstream {:.2} ms · skips preprocess {} / no slot {}",
+                        "server stages: copy issue {:.2} · convert issue {:.2} · sync/map {:.2} · submit {:.2} · completion {:.2} · bitstream {:.2} ms · skips preprocess {} / no slot {}",
                         server.copy_wait_ms,
                         server.convert_wait_ms,
                         server.map_ms,
@@ -948,7 +948,7 @@ impl EchobindApp {
                                 server.encode_queue_ms, server.send_ms,
                             ));
                             ui.label(format!(
-                                "copy {:.2}  convert {:.2}  map {:.2}  submit {:.2}  complete {:.2}  bits {:.2} ms",
+                                "copy-issue {:.2}  convert-issue {:.2}  sync/map {:.2}  submit {:.2}  complete {:.2}  bits {:.2} ms",
                                 server.copy_wait_ms,
                                 server.convert_wait_ms,
                                 server.map_ms,

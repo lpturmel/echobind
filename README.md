@@ -35,13 +35,12 @@ On the viewing machine:
 
 The desktop app streams the primary display at native, 720p, or 1080p
 resolution and up to 120 FPS. Windows uses DXGI Desktop Duplication, a
-four-slot asynchronous NVENC pipeline, and GPU scaling. At native resolution,
-each acquired desktop surface is copied directly into a BGRA NVENC input slot;
-scaled streams use an application-owned BGRA staging ring and the D3D11 video
-processor to produce NV12. Per-slot GPU completion queries ensure neither path
-hands unfinished texture work to NVENC. A single-frame preprocessing gate
-bounds queued copy/conversion work while submission and completion run on
-separate workers; under GPU overload, capture samples newer desktop updates
+four-slot asynchronous NVENC pipeline, and GPU scaling. Acquired desktop
+surfaces are copied into an application-owned BGRA ring and converted to NV12
+with the D3D11 video processor. NVENC resource mapping supplies the documented
+D3D11 completion synchronization, avoiding redundant CPU-side GPU query waits.
+At most two frames may be in preprocessing while submission and completion run
+on separate workers; under GPU overload, capture samples newer desktop updates
 instead of building an unbounded queue. macOS uses
 ScreenCaptureKit and VideoToolbox for hardware encode, then VideoToolbox NV12
 decode and IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264
