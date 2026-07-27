@@ -35,9 +35,11 @@ On the viewing machine:
 
 The desktop app streams the primary display at native, 720p, or 1080p
 resolution and up to 120 FPS. Windows uses DXGI Desktop Duplication, a
-four-slot staged D3D11/NVENC pipeline, and GPU scaling. Each acquired desktop
-surface is copied into an application-owned BGRA ring before DXGI releases it;
-color conversion and NVENC submission then run on a separate worker. macOS uses
+four-slot asynchronous NVENC pipeline, and GPU scaling. Each acquired desktop
+surface is copied into an application-owned BGRA ring and released without a
+GPU fence wait. A single-frame preprocessing gate bounds queued copy/conversion
+work; color conversion and NVENC submission run on a separate worker, and GPU
+overload drops stale samples instead of blocking capture. macOS uses
 ScreenCaptureKit and VideoToolbox for hardware encode, then VideoToolbox NV12
 decode and IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264
 is retained as a reported fallback.
