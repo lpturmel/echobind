@@ -171,6 +171,9 @@ fn run_once(
                         Ok(Packet::CursorPosition(_)) => {
                             *last_response.lock().unwrap() = Instant::now();
                         }
+                        Ok(Packet::ServerStats(_)) => {
+                            *last_response.lock().unwrap() = Instant::now();
+                        }
                         Ok(Packet::Hello { .. })
                         | Ok(Packet::Ping(_))
                         | Ok(Packet::VideoKeyframeRequest)
@@ -311,6 +314,7 @@ fn request_config(socket: &UdpSocket) -> Result<AudioConfig> {
                 | Ok(Packet::Clipboard(_))
                 | Ok(Packet::Video(_))
                 | Ok(Packet::CursorPosition(_))
+                | Ok(Packet::ServerStats(_))
                 | Ok(Packet::ConnectionRejected(_)) => {}
                 Ok(Packet::Hello { .. })
                 | Ok(Packet::Ping(_))

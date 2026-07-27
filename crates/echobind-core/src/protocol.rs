@@ -7,6 +7,7 @@ const VIDEO_HEADER_LEN: usize = 21;
 const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
+const SERVER_STATS_LEN: usize = 9 * size_of::<f32>() + 7 * size_of::<u64>();
 pub const VIDEO_RECOVERY_HEADER_LEN: usize = 4;
 
 // The standard mode keeps the complete IPv6 packet below an Ethernet 1500-byte
@@ -24,7 +25,7 @@ pub const MAX_VIDEO_FRAME_SIZE: usize = 8 * 1024 * 1024;
 pub const MAX_VIDEO_FRAGMENTS: usize =
     MAX_VIDEO_FRAME_SIZE.div_ceil(STANDARD_VIDEO_FRAGMENT_PAYLOAD - VIDEO_RECOVERY_HEADER_LEN);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Packet<'a> {
     Hello { max_datagram_size: u16 },
     Config(&'a [u8]),
@@ -34,6 +35,7 @@ pub enum Packet<'a> {
     Clipboard(ClipboardChunk<'a>),
     Video(VideoFragment<'a>),
     CursorPosition(CursorPosition),
+    ServerStats(ServerStats),
     VideoKeyframeRequest,
     ConnectionRejected(&'a [u8]),
 }
@@ -71,6 +73,27 @@ pub struct CursorPosition {
     pub visible: bool,
 }
 
+/// A one-second snapshot of the host's capture and encode pipeline.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ServerStats {
+    pub fps: f32,
+    pub source_fps: f32,
+    pub megabits_per_second: f32,
+    pub capture_ms: f32,
+    pub gpu_wait_ms: f32,
+    pub gpu_lock_ms: f32,
+    pub encode_ms: f32,
+    pub send_ms: f32,
+    pub encode_queue_ms: f32,
+    pub dxgi_timeouts: u64,
+    pub dxgi_backlog: u64,
+    pub dxgi_backlog_max: u64,
+    pub pacing_skips: u64,
+    pub slot_busy_skips: u64,
+    pub cursor_only_frames: u64,
+    pub stale_frames: u64,
+}
+
 impl Packet<'_> {
     const HELLO: u8 = 1;
     const CONFIG: u8 = 2;
@@ -82,6 +105,7 @@ impl Packet<'_> {
     const VIDEO_KEYFRAME_REQUEST: u8 = 8;
     const CONNECTION_REJECTED: u8 = 9;
     const CURSOR_POSITION: u8 = 10;
+    const SERVER_STATS: u8 = 11;
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
@@ -125,6 +149,33 @@ impl Packet<'_> {
                 out.extend_from_slice(&position.x.to_be_bytes());
                 out.extend_from_slice(&position.y.to_be_bytes());
                 out.push(u8::from(position.visible));
+            }
+            Packet::ServerStats(stats) => {
+                Self::begin_packet(Self::SERVER_STATS, out);
+                for value in [
+                    stats.fps,
+                    stats.source_fps,
+                    stats.megabits_per_second,
+                    stats.capture_ms,
+                    stats.gpu_wait_ms,
+                    stats.gpu_lock_ms,
+                    stats.encode_ms,
+                    stats.send_ms,
+                    stats.encode_queue_ms,
+                ] {
+                    out.extend_from_slice(&value.to_bits().to_be_bytes());
+                }
+                for value in [
+                    stats.dxgi_timeouts,
+                    stats.dxgi_backlog,
+                    stats.dxgi_backlog_max,
+                    stats.pacing_skips,
+                    stats.slot_busy_skips,
+                    stats.cursor_only_frames,
+                    stats.stale_frames,
+                ] {
+                    out.extend_from_slice(&value.to_be_bytes());
+                }
             }
             Packet::VideoKeyframeRequest => {
                 Self::encode_packet(Self::VIDEO_KEYFRAME_REQUEST, &[], out);
@@ -195,6 +246,7 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
             Packet::CLIPBOARD => parse_clipboard_chunk(payload).map(Packet::Clipboard),
             Packet::VIDEO => parse_video_fragment(payload).map(Packet::Video),
             Packet::CURSOR_POSITION => parse_cursor_position(payload).map(Packet::CursorPosition),
+            Packet::SERVER_STATS => parse_server_stats(payload).map(Packet::ServerStats),
             Packet::VIDEO_KEYFRAME_REQUEST if payload.is_empty() => {
                 Ok(Packet::VideoKeyframeRequest)
             }
@@ -202,6 +254,63 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
             _ => Err(PacketParseError::Invalid),
         }
     }
+}
+
+fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
+    if payload.len() != SERVER_STATS_LEN {
+        return Err(PacketParseError::Invalid);
+    }
+
+    let f32_at = |offset: usize| {
+        payload
+            .get(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_be_bytes)
+            .map(f32::from_bits)
+            .ok_or(PacketParseError::Invalid)
+    };
+    let u64_at = |offset: usize| {
+        payload
+            .get(offset..offset + 8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or(PacketParseError::Invalid)
+    };
+    let stats = ServerStats {
+        fps: f32_at(0)?,
+        source_fps: f32_at(4)?,
+        megabits_per_second: f32_at(8)?,
+        capture_ms: f32_at(12)?,
+        gpu_wait_ms: f32_at(16)?,
+        gpu_lock_ms: f32_at(20)?,
+        encode_ms: f32_at(24)?,
+        send_ms: f32_at(28)?,
+        encode_queue_ms: f32_at(32)?,
+        dxgi_timeouts: u64_at(36)?,
+        dxgi_backlog: u64_at(44)?,
+        dxgi_backlog_max: u64_at(52)?,
+        pacing_skips: u64_at(60)?,
+        slot_busy_skips: u64_at(68)?,
+        cursor_only_frames: u64_at(76)?,
+        stale_frames: u64_at(84)?,
+    };
+    if [
+        stats.fps,
+        stats.source_fps,
+        stats.megabits_per_second,
+        stats.capture_ms,
+        stats.gpu_wait_ms,
+        stats.gpu_lock_ms,
+        stats.encode_ms,
+        stats.send_ms,
+        stats.encode_queue_ms,
+    ]
+    .into_iter()
+    .any(|value| !value.is_finite())
+    {
+        return Err(PacketParseError::Invalid);
+    }
+    Ok(stats)
 }
 
 fn parse_cursor_position(payload: &[u8]) -> Result<CursorPosition, PacketParseError> {
@@ -481,6 +590,45 @@ mod tests {
         assert_eq!(
             Packet::try_from(encoded.as_slice()),
             Ok(Packet::CursorPosition(position))
+        );
+    }
+
+    #[test]
+    fn encodes_and_parses_server_stats() {
+        let stats = ServerStats {
+            fps: 119.5,
+            source_fps: 120.0,
+            megabits_per_second: 87.25,
+            capture_ms: 1.2,
+            gpu_wait_ms: 0.3,
+            gpu_lock_ms: 0.1,
+            encode_ms: 2.4,
+            send_ms: 0.8,
+            encode_queue_ms: 0.2,
+            dxgi_timeouts: 3,
+            dxgi_backlog: 4,
+            dxgi_backlog_max: 2,
+            pacing_skips: 5,
+            slot_busy_skips: 6,
+            cursor_only_frames: 7,
+            stale_frames: 8,
+        };
+        let encoded = round_trip(Packet::ServerStats(stats));
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Ok(Packet::ServerStats(stats))
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_server_stats() {
+        let encoded = round_trip(Packet::ServerStats(ServerStats {
+            fps: f32::NAN,
+            ..ServerStats::default()
+        }));
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Err(PacketParseError::Invalid)
         );
     }
 }

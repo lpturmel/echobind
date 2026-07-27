@@ -1,6 +1,6 @@
-use super::{SessionEvent, VIDEO_SEND_STALE_AGE};
+use super::{publish_server_stats, PendingServerStats, SessionEvent, VIDEO_SEND_STALE_AGE};
 use echobind_core::{
-    protocol::{CursorPosition, Packet, MAX_DATAGRAM_SIZE},
+    protocol::{CursorPosition, Packet, ServerStats, MAX_DATAGRAM_SIZE},
     video::fragment_video_frame_with_datagram_size,
 };
 use libloading::Library;
@@ -251,6 +251,7 @@ pub(super) fn spawn_hardware_pipeline(
     width: u32,
     height: u32,
     active_datagram_size: Arc<AtomicUsize>,
+    pending_server_stats: PendingServerStats,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let hardware_progress = Arc::new(AtomicU64::new(0));
@@ -266,6 +267,7 @@ pub(super) fn spawn_hardware_pipeline(
             height,
             active_datagram_size,
             hardware_progress,
+            pending_server_stats,
         );
         if let Err(error) = result {
             if running.load(Ordering::Relaxed) {
@@ -310,6 +312,7 @@ fn run_dxgi_pipeline(
     height: u32,
     active_datagram_size: Arc<AtomicUsize>,
     hardware_progress: Arc<AtomicU64>,
+    pending_server_stats: PendingServerStats,
 ) -> Result<(), String> {
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
     let metrics = Arc::new(WindowsCaptureMetrics::default());
@@ -325,6 +328,7 @@ fn run_dxgi_pipeline(
         active_datagram_size,
         bitrate_bps,
         metrics.clone(),
+        pending_server_stats,
     );
     let mut consecutive_access_losses = 0_u32;
     let result = loop {
@@ -1548,6 +1552,7 @@ fn spawn_hardware_sender(
     active_datagram_size: Arc<AtomicUsize>,
     bitrate_bps: u32,
     metrics: Arc<WindowsCaptureMetrics>,
+    pending_server_stats: PendingServerStats,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         raise_current_thread_priority("video sender", THREAD_PRIORITY_ABOVE_NORMAL);
@@ -1581,6 +1586,7 @@ fn spawn_hardware_sender(
                         &mut stats_send_us,
                         &mut stats_encode_queue_us,
                         &metrics,
+                        &pending_server_stats,
                     );
                     continue;
                 }
@@ -1674,6 +1680,7 @@ fn spawn_hardware_sender(
                 &mut stats_send_us,
                 &mut stats_encode_queue_us,
                 &metrics,
+                &pending_server_stats,
             );
         }
     })
@@ -1745,6 +1752,7 @@ fn report_sender_stats(
     stats_send_us: &mut u64,
     stats_encode_queue_us: &mut u64,
     metrics: &WindowsCaptureMetrics,
+    pending_server_stats: &PendingServerStats,
 ) {
     let elapsed = stats_started.elapsed();
     if elapsed < Duration::from_secs(1) {
@@ -1752,24 +1760,28 @@ fn report_sender_stats(
     }
     let seconds = elapsed.as_secs_f32();
     let source_frames = metrics.source_frames.swap(0, Ordering::Relaxed);
-    let _ = events.send(SessionEvent::Stats {
-        fps: *stats_frames as f32 / seconds,
-        source_fps: source_frames as f32 / seconds,
-        megabits_per_second: *stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
-        capture_ms: average_milliseconds(*stats_capture_us, *stats_frames),
-        gpu_wait_ms: average_milliseconds(*stats_gpu_wait_us, *stats_frames),
-        gpu_lock_ms: average_milliseconds(*stats_gpu_lock_us, *stats_frames),
-        encode_ms: average_milliseconds(*stats_encode_us, *stats_frames),
-        send_ms: average_milliseconds(*stats_send_us, *stats_frames),
-        encode_queue_ms: average_milliseconds(*stats_encode_queue_us, *stats_frames),
-        dxgi_timeouts: metrics.dxgi_timeouts.swap(0, Ordering::Relaxed),
-        dxgi_backlog: metrics.dxgi_backlog.swap(0, Ordering::Relaxed),
-        dxgi_backlog_max: metrics.dxgi_backlog_max.swap(0, Ordering::Relaxed),
-        pacing_skips: metrics.pacing_skips.swap(0, Ordering::Relaxed),
-        slot_busy_skips: metrics.slot_busy_skips.swap(0, Ordering::Relaxed),
-        cursor_only_frames: metrics.cursor_only_frames.swap(0, Ordering::Relaxed),
-        stale_frames: metrics.stale_frames.swap(0, Ordering::Relaxed),
-    });
+    publish_server_stats(
+        events,
+        pending_server_stats,
+        ServerStats {
+            fps: *stats_frames as f32 / seconds,
+            source_fps: source_frames as f32 / seconds,
+            megabits_per_second: *stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+            capture_ms: average_milliseconds(*stats_capture_us, *stats_frames),
+            gpu_wait_ms: average_milliseconds(*stats_gpu_wait_us, *stats_frames),
+            gpu_lock_ms: average_milliseconds(*stats_gpu_lock_us, *stats_frames),
+            encode_ms: average_milliseconds(*stats_encode_us, *stats_frames),
+            send_ms: average_milliseconds(*stats_send_us, *stats_frames),
+            encode_queue_ms: average_milliseconds(*stats_encode_queue_us, *stats_frames),
+            dxgi_timeouts: metrics.dxgi_timeouts.swap(0, Ordering::Relaxed),
+            dxgi_backlog: metrics.dxgi_backlog.swap(0, Ordering::Relaxed),
+            dxgi_backlog_max: metrics.dxgi_backlog_max.swap(0, Ordering::Relaxed),
+            pacing_skips: metrics.pacing_skips.swap(0, Ordering::Relaxed),
+            slot_busy_skips: metrics.slot_busy_skips.swap(0, Ordering::Relaxed),
+            cursor_only_frames: metrics.cursor_only_frames.swap(0, Ordering::Relaxed),
+            stale_frames: metrics.stale_frames.swap(0, Ordering::Relaxed),
+        },
+    );
     *stats_started = Instant::now();
     *stats_frames = 0;
     *stats_bytes = 0;

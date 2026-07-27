@@ -1,7 +1,8 @@
 use crate::video::I420Frame;
 use echobind_core::{
     protocol::{
-        CursorPosition, Packet, JUMBO_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE, STANDARD_DATAGRAM_SIZE,
+        CursorPosition, Packet, ServerStats, JUMBO_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE,
+        STANDARD_DATAGRAM_SIZE,
     },
     video::{fragment_video_frame_with_datagram_size, VideoFrame, VideoReassembler},
     AudioConfig, FrameRate as SessionFrameRate, SessionConfig, VideoCodec, VideoConfig,
@@ -133,6 +134,7 @@ struct CapturedSample {
 type CaptureSlot = Arc<(Mutex<Option<CapturedSample>>, Condvar)>;
 pub(super) type LatestFrame = Arc<Mutex<Option<DisplayFrame>>>;
 pub(super) type FrameNotifier = Arc<dyn Fn() + Send + Sync>;
+pub(super) type PendingServerStats = Arc<Mutex<Option<ServerStats>>>;
 
 #[derive(Clone, Debug)]
 pub(super) struct DisplayFrame {
@@ -263,24 +265,8 @@ pub enum SessionEvent {
     VideoBackend(String),
     AudioBackend(String),
     CursorPosition(CursorPosition),
-    Stats {
-        fps: f32,
-        source_fps: f32,
-        megabits_per_second: f32,
-        capture_ms: f32,
-        gpu_wait_ms: f32,
-        gpu_lock_ms: f32,
-        encode_ms: f32,
-        send_ms: f32,
-        encode_queue_ms: f32,
-        dxgi_timeouts: u64,
-        dxgi_backlog: u64,
-        dxgi_backlog_max: u64,
-        pacing_skips: u64,
-        slot_busy_skips: u64,
-        cursor_only_frames: u64,
-        stale_frames: u64,
-    },
+    Stats(ServerStats),
+    ServerStats(ServerStats),
     ClientStats {
         received_fps: f32,
         decoded_fps: f32,
@@ -356,6 +342,7 @@ impl DesktopSession {
         let latest_frame = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
+        let pending_server_stats = Arc::new(Mutex::new(None));
 
         let (width, height) = configured_video_dimensions(resolution)?;
         let session_config = SessionConfig {
@@ -392,6 +379,7 @@ impl DesktopSession {
             jumbo_config_json,
             jumbo_datagrams,
             active_datagram_size.clone(),
+            pending_server_stats.clone(),
         );
         if let Some(error) = audio_probe_error {
             let _ = event_tx.send(SessionEvent::AudioBackend(format!(
@@ -411,6 +399,7 @@ impl DesktopSession {
                 bitrate_bps,
                 resolution,
                 active_datagram_size.clone(),
+                pending_server_stats.clone(),
             );
             (None, vec![hardware_handle])
         };
@@ -428,6 +417,7 @@ impl DesktopSession {
                 width,
                 height,
                 active_datagram_size.clone(),
+                pending_server_stats.clone(),
             );
             (None, vec![hardware_handle])
         };
@@ -453,6 +443,7 @@ impl DesktopSession {
                 bitrate_bps,
                 resolution,
                 active_datagram_size.clone(),
+                pending_server_stats,
             );
             (Some(capture_slot), vec![capture_handle, encoder_handle])
         };
@@ -680,6 +671,7 @@ fn spawn_host_network(
     jumbo_config_json: Vec<u8>,
     jumbo_requested: bool,
     active_datagram_size: Arc<AtomicUsize>,
+    pending_server_stats: PendingServerStats,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut packet_buffer = [0_u8; MAX_DATAGRAM_SIZE];
@@ -849,6 +841,7 @@ fn spawn_host_network(
                         | Packet::Audio(_)
                         | Packet::Video(_)
                         | Packet::CursorPosition(_)
+                        | Packet::ServerStats(_)
                         | Packet::Config(_)
                         | Packet::Pong(_)
                         | Packet::Ping(_)
@@ -864,6 +857,14 @@ fn spawn_host_network(
                         "Server receive failed: {error}"
                     )));
                     break;
+                }
+            }
+
+            let latest_stats = pending_server_stats.lock().unwrap().take();
+            if let (Some(stats), Some(peer)) = (latest_stats, *active_peer.lock().unwrap()) {
+                Packet::ServerStats(stats).encode(&mut response);
+                if let Err(error) = socket.send_to(&response, peer) {
+                    warn!("Server stats send to {peer} failed: {error}");
                 }
             }
 
@@ -973,6 +974,7 @@ fn spawn_encoder(
     bitrate_bps: u32,
     resolution: VideoResolution,
     active_datagram_size: Arc<AtomicUsize>,
+    pending_server_stats: PendingServerStats,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let encoder_config = EncoderConfig::new()
@@ -1126,24 +1128,28 @@ fn spawn_encoder(
             let elapsed = stats_started.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 let seconds = elapsed.as_secs_f32();
-                let _ = events.send(SessionEvent::Stats {
-                    fps: stats_frames as f32 / seconds,
-                    source_fps: stats_frames as f32 / seconds,
-                    megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
-                    capture_ms: average_milliseconds(stats_capture_us, stats_frames),
-                    gpu_wait_ms: 0.0,
-                    gpu_lock_ms: 0.0,
-                    encode_ms: average_milliseconds(stats_encode_us, stats_frames),
-                    send_ms: average_milliseconds(stats_send_us, stats_frames),
-                    encode_queue_ms: average_milliseconds(stats_encode_queue_us, stats_frames),
-                    dxgi_timeouts: 0,
-                    dxgi_backlog: 0,
-                    dxgi_backlog_max: 0,
-                    pacing_skips: 0,
-                    slot_busy_skips: 0,
-                    cursor_only_frames: 0,
-                    stale_frames: 0,
-                });
+                publish_server_stats(
+                    &events,
+                    &pending_server_stats,
+                    ServerStats {
+                        fps: stats_frames as f32 / seconds,
+                        source_fps: stats_frames as f32 / seconds,
+                        megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+                        capture_ms: average_milliseconds(stats_capture_us, stats_frames),
+                        gpu_wait_ms: 0.0,
+                        gpu_lock_ms: 0.0,
+                        encode_ms: average_milliseconds(stats_encode_us, stats_frames),
+                        send_ms: average_milliseconds(stats_send_us, stats_frames),
+                        encode_queue_ms: average_milliseconds(stats_encode_queue_us, stats_frames),
+                        dxgi_timeouts: 0,
+                        dxgi_backlog: 0,
+                        dxgi_backlog_max: 0,
+                        pacing_skips: 0,
+                        slot_busy_skips: 0,
+                        cursor_only_frames: 0,
+                        stale_frames: 0,
+                    },
+                );
                 stats_started = Instant::now();
                 stats_frames = 0;
                 stats_bytes = 0;
@@ -1531,11 +1537,15 @@ fn spawn_client_network(
                             let _ = events.send(SessionEvent::CursorPosition(position));
                             frame_notifier();
                         }
+                        Packet::ServerStats(stats) if accepted => {
+                            let _ = events.send(SessionEvent::ServerStats(stats));
+                        }
                         Packet::Hello { .. }
                         | Packet::Clipboard(_)
                         | Packet::Audio(_)
                         | Packet::Video(_)
                         | Packet::CursorPosition(_)
+                        | Packet::ServerStats(_)
                         | Packet::VideoKeyframeRequest => {}
                     }
                 }
@@ -1720,6 +1730,15 @@ fn run_software_video_decoder(
 fn request_keyframe(socket: &UdpSocket, outgoing: &mut Vec<u8>) {
     Packet::VideoKeyframeRequest.encode(outgoing);
     let _ = socket.send(outgoing);
+}
+
+pub(super) fn publish_server_stats(
+    events: &mpsc::Sender<SessionEvent>,
+    pending: &PendingServerStats,
+    stats: ServerStats,
+) {
+    *pending.lock().unwrap() = Some(stats);
+    let _ = events.send(SessionEvent::Stats(stats));
 }
 
 fn average_milliseconds(total_us: u64, samples: u64) -> f32 {

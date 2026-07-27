@@ -1,9 +1,9 @@
 use super::{
-    ensure_software_capture_available, spawn_capture, spawn_encoder, CaptureSlot, SessionEvent,
-    VideoResolution, VIDEO_SEND_STALE_AGE,
+    ensure_software_capture_available, publish_server_stats, spawn_capture, spawn_encoder,
+    CaptureSlot, PendingServerStats, SessionEvent, VideoResolution, VIDEO_SEND_STALE_AGE,
 };
 use echobind_core::{
-    protocol::{Packet, MAX_DATAGRAM_SIZE},
+    protocol::{Packet, ServerStats, MAX_DATAGRAM_SIZE},
     video::fragment_video_frame_with_datagram_size,
 };
 use screencapturekit::prelude::*;
@@ -51,6 +51,7 @@ pub(super) fn spawn_hardware_pipeline(
     bitrate_bps: u32,
     resolution: VideoResolution,
     active_datagram_size: Arc<AtomicUsize>,
+    pending_server_stats: PendingServerStats,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let result = run_hardware_pipeline(
@@ -63,6 +64,7 @@ pub(super) fn spawn_hardware_pipeline(
             bitrate_bps,
             resolution,
             active_datagram_size.clone(),
+            pending_server_stats.clone(),
         );
         if let Err(error) = result {
             if !running.load(Ordering::Relaxed) {
@@ -82,6 +84,7 @@ pub(super) fn spawn_hardware_pipeline(
                 bitrate_bps,
                 resolution,
                 active_datagram_size,
+                pending_server_stats,
             ) {
                 let _ = events.send(SessionEvent::Error(format!(
                     "Hardware H.264 failed ({error}); software fallback failed: {fallback_error}"
@@ -102,6 +105,7 @@ fn run_hardware_pipeline(
     bitrate_bps: u32,
     resolution: VideoResolution,
     active_datagram_size: Arc<AtomicUsize>,
+    pending_server_stats: PendingServerStats,
 ) -> Result<(), String> {
     let content = SCShareableContent::get().map_err(|error| {
         format!(
@@ -263,24 +267,31 @@ fn run_hardware_pipeline(
         let elapsed = stats_started.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let seconds = elapsed.as_secs_f32();
-            let _ = events.send(SessionEvent::Stats {
-                fps: stats_frames as f32 / seconds,
-                source_fps: stats_frames as f32 / seconds,
-                megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
-                capture_ms: super::average_milliseconds(stats_capture_us, stats_frames),
-                gpu_wait_ms: 0.0,
-                gpu_lock_ms: 0.0,
-                encode_ms: super::average_milliseconds(stats_encode_us, stats_frames),
-                send_ms: super::average_milliseconds(stats_send_us, stats_frames),
-                encode_queue_ms: super::average_milliseconds(stats_encode_queue_us, stats_frames),
-                dxgi_timeouts: 0,
-                dxgi_backlog: 0,
-                dxgi_backlog_max: 0,
-                pacing_skips: 0,
-                slot_busy_skips: 0,
-                cursor_only_frames: 0,
-                stale_frames: 0,
-            });
+            publish_server_stats(
+                &events,
+                &pending_server_stats,
+                ServerStats {
+                    fps: stats_frames as f32 / seconds,
+                    source_fps: stats_frames as f32 / seconds,
+                    megabits_per_second: stats_bytes as f32 * 8.0 / seconds / 1_000_000.0,
+                    capture_ms: super::average_milliseconds(stats_capture_us, stats_frames),
+                    gpu_wait_ms: 0.0,
+                    gpu_lock_ms: 0.0,
+                    encode_ms: super::average_milliseconds(stats_encode_us, stats_frames),
+                    send_ms: super::average_milliseconds(stats_send_us, stats_frames),
+                    encode_queue_ms: super::average_milliseconds(
+                        stats_encode_queue_us,
+                        stats_frames,
+                    ),
+                    dxgi_timeouts: 0,
+                    dxgi_backlog: 0,
+                    dxgi_backlog_max: 0,
+                    pacing_skips: 0,
+                    slot_busy_skips: 0,
+                    cursor_only_frames: 0,
+                    stale_frames: 0,
+                },
+            );
             stats_started = Instant::now();
             stats_frames = 0;
             stats_bytes = 0;
@@ -737,6 +748,7 @@ fn start_software_fallback(
     bitrate_bps: u32,
     resolution: VideoResolution,
     active_datagram_size: Arc<AtomicUsize>,
+    pending_server_stats: PendingServerStats,
 ) -> Result<(), String> {
     ensure_software_capture_available()?;
     let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
@@ -758,6 +770,7 @@ fn start_software_fallback(
         bitrate_bps,
         resolution,
         active_datagram_size,
+        pending_server_stats,
     );
     let _ = capture_handle.join();
     let _ = encoder_handle.join();

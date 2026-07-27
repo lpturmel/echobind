@@ -1,5 +1,5 @@
 use crate::session::{DesktopSession, DisplayFrameData, SessionEvent, VideoResolution};
-use echobind_core::protocol::CursorPosition;
+use echobind_core::protocol::{CursorPosition, ServerStats};
 use eframe::egui;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -83,6 +83,7 @@ pub struct EchobindApp {
     jitter_ms: f32,
     rtt_ms: f32,
     lost_frames: u64,
+    server_stats: Option<ServerStats>,
 }
 
 impl EchobindApp {
@@ -167,6 +168,7 @@ impl EchobindApp {
             jitter_ms: 0.0,
             rtt_ms: 0.0,
             lost_frames: 0,
+            server_stats: None,
         }
     }
 
@@ -213,10 +215,12 @@ impl EchobindApp {
                 }
                 SessionEvent::ConnectionRejected(reason) => {
                     self.status = format!("Connection rejected: {reason}");
+                    self.server_stats = None;
                 }
                 SessionEvent::Disconnected(reason) => {
                     self.status = format!("Disconnected: {reason}");
                     self.pending_peer = None;
+                    self.server_stats = None;
                 }
                 SessionEvent::CaptureReady => {
                     if self.mode == Mode::Host
@@ -239,41 +243,27 @@ impl EchobindApp {
                 SessionEvent::CursorPosition(position) => {
                     self.remote_cursor = Some(position);
                 }
-                SessionEvent::Stats {
-                    fps,
-                    source_fps,
-                    megabits_per_second,
-                    capture_ms,
-                    gpu_wait_ms,
-                    gpu_lock_ms,
-                    encode_ms,
-                    send_ms,
-                    encode_queue_ms,
-                    dxgi_timeouts,
-                    dxgi_backlog,
-                    dxgi_backlog_max,
-                    pacing_skips,
-                    slot_busy_skips,
-                    cursor_only_frames,
-                    stale_frames,
-                } => {
-                    self.stream_fps = fps;
-                    self.received_fps = fps;
-                    self.stream_mbps = megabits_per_second;
-                    self.source_fps = source_fps;
-                    self.capture_ms = capture_ms;
-                    self.gpu_wait_ms = gpu_wait_ms;
-                    self.gpu_lock_ms = gpu_lock_ms;
-                    self.encode_ms = encode_ms;
-                    self.send_ms = send_ms;
-                    self.encode_queue_ms = encode_queue_ms;
-                    self.dxgi_timeouts = dxgi_timeouts;
-                    self.dxgi_backlog = dxgi_backlog;
-                    self.dxgi_backlog_max = dxgi_backlog_max;
-                    self.pacing_skips = pacing_skips;
-                    self.slot_busy_skips = slot_busy_skips;
-                    self.cursor_only_frames = cursor_only_frames;
-                    self.stale_frames = stale_frames;
+                SessionEvent::Stats(stats) => {
+                    self.stream_fps = stats.fps;
+                    self.received_fps = stats.fps;
+                    self.stream_mbps = stats.megabits_per_second;
+                    self.source_fps = stats.source_fps;
+                    self.capture_ms = stats.capture_ms;
+                    self.gpu_wait_ms = stats.gpu_wait_ms;
+                    self.gpu_lock_ms = stats.gpu_lock_ms;
+                    self.encode_ms = stats.encode_ms;
+                    self.send_ms = stats.send_ms;
+                    self.encode_queue_ms = stats.encode_queue_ms;
+                    self.dxgi_timeouts = stats.dxgi_timeouts;
+                    self.dxgi_backlog = stats.dxgi_backlog;
+                    self.dxgi_backlog_max = stats.dxgi_backlog_max;
+                    self.pacing_skips = stats.pacing_skips;
+                    self.slot_busy_skips = stats.slot_busy_skips;
+                    self.cursor_only_frames = stats.cursor_only_frames;
+                    self.stale_frames = stats.stale_frames;
+                }
+                SessionEvent::ServerStats(stats) => {
+                    self.server_stats = Some(stats);
                 }
                 SessionEvent::ClientStats {
                     received_fps,
@@ -435,6 +425,7 @@ impl EchobindApp {
         self.jitter_ms = 0.0;
         self.rtt_ms = 0.0;
         self.lost_frames = 0;
+        self.server_stats = None;
         self.dxgi_timeouts = 0;
         self.dxgi_backlog = 0;
         self.dxgi_backlog_max = 0;
@@ -755,8 +746,20 @@ impl EchobindApp {
                     self.stale_frames,
                 ));
             } else {
+                if let Some(server) = self.server_stats {
+                    ui.label(format!(
+                        "server: {:.1} source / {:.1} sent FPS · {:.2} Mbps · capture {:.2} ms · encode {:.2} ms · queue {:.2} ms · send {:.2} ms",
+                        server.source_fps,
+                        server.fps,
+                        server.megabits_per_second,
+                        server.capture_ms,
+                        server.encode_ms,
+                        server.encode_queue_ms,
+                        server.send_ms,
+                    ));
+                }
                 ui.label(format!(
-                    "{:.1} decoded · {:.1} received · {:.1} presented · {} dropped / {} lost · {:.2} Mbps · {resolution} H.264 · {} · {} · {}",
+                    "client: {:.1} decoded · {:.1} received · {:.1} presented · {} dropped / {} lost · {:.2} Mbps · {resolution} H.264 · {} · {} · {}",
                     self.stream_fps,
                     self.received_fps,
                     self.present_fps,
@@ -857,6 +860,80 @@ impl EchobindApp {
             egui::Stroke::new(2.0, egui::Color32::BLACK),
         ));
     }
+
+    fn show_fullscreen_stats(&self, context: &egui::Context) {
+        if self.mode != Mode::Connect {
+            return;
+        }
+
+        egui::Area::new("fullscreen-stats".into())
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+            .interactable(false)
+            .show(context, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(190))
+                    .corner_radius(6.0)
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
+                        ui.label(egui::RichText::new("ECHOBIND").strong());
+                        if let Some(server) = self.server_stats {
+                            ui.label(format!(
+                                "SERVER  {:.1} source  {:.1} sent  {:.1} Mbps",
+                                server.source_fps, server.fps, server.megabits_per_second,
+                            ));
+                            ui.label(format!(
+                                "capture {:.2} ms  GPU {:.2} / lock {:.2} ms  encode {:.2} ms",
+                                server.capture_ms,
+                                server.gpu_wait_ms,
+                                server.gpu_lock_ms,
+                                server.encode_ms,
+                            ));
+                            ui.label(format!(
+                                "queue {:.2} ms  send {:.2} ms",
+                                server.encode_queue_ms, server.send_ms,
+                            ));
+                            if [
+                                server.dxgi_timeouts,
+                                server.dxgi_backlog,
+                                server.pacing_skips,
+                                server.slot_busy_skips,
+                                server.cursor_only_frames,
+                                server.stale_frames,
+                            ]
+                            .into_iter()
+                            .any(|value| value > 0)
+                            {
+                                ui.label(format!(
+                                    "DXGI timeout {}  backlog {} (max {})  skips {}/{}/{}/{}",
+                                    server.dxgi_timeouts,
+                                    server.dxgi_backlog,
+                                    server.dxgi_backlog_max,
+                                    server.pacing_skips,
+                                    server.slot_busy_skips,
+                                    server.cursor_only_frames,
+                                    server.stale_frames,
+                                ));
+                            }
+                        } else {
+                            ui.label("SERVER  waiting for stats…");
+                        }
+                        ui.label(format!(
+                            "CLIENT  {:.1} recv  {:.1} decode  {:.1} present  {:.1} Mbps",
+                            self.received_fps, self.stream_fps, self.present_fps, self.stream_mbps,
+                        ));
+                        ui.label(format!(
+                            "decode {:.2} ms  RTT {:.2} ms  jitter {:.2} ms  drop {} / loss {}",
+                            self.decode_ms,
+                            self.rtt_ms,
+                            self.jitter_ms,
+                            self.dropped_frames,
+                            self.lost_frames,
+                        ));
+                        ui.label(egui::RichText::new("F11 or Esc to exit").small().weak());
+                    });
+            });
+    }
 }
 
 impl eframe::App for EchobindApp {
@@ -883,6 +960,9 @@ impl eframe::App for EchobindApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.show_video(ui);
         });
+        if self.fullscreen {
+            self.show_fullscreen_stats(&context);
+        }
     }
 }
 

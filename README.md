@@ -46,8 +46,10 @@ The low-latency path has no B-frame reordering, uses a one-frame NVENC VBV,
 generates IDRs only for startup or recovery, requests UI repaints directly from
 the decoder callback, and discards video that spends more than 25 ms in a host
 or decode queue. The UI reports capture, encode, send, reassembly, decode,
-presentation, RTT, jitter, drop, and loss measurements. On Windows it also
-reports the DXGI source rate, accumulated desktop frames, timeouts, pacing and
+presentation, RTT, jitter, drop, and loss measurements. The viewer receives
+the host's pipeline snapshot once per second and keeps both host and client
+health visible while the remote video is fullscreen. On Windows it also reports
+the DXGI source rate, accumulated desktop frames, timeouts, pacing and
 encoder-slot skips, GPU conversion wait, and D3D/NVENC mutex wait. Opus system
 audio is streamed independently and the viewer can select the default or a
 named output device.
