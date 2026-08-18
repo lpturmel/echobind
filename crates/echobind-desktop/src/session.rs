@@ -50,12 +50,12 @@ mod hardware_windows;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_GRACE: Duration = Duration::from_secs(30);
-const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
-const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(50);
+const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(100);
 const VIDEO_DECODE_QUEUE_CAPACITY: usize = 2;
 const VIDEO_REORDER_WINDOW: usize = 2;
-pub(super) const VIDEO_STALE_AGE: Duration = Duration::from_millis(25);
+pub(super) const VIDEO_STALE_AGE: Duration = Duration::from_millis(50);
 pub(super) const VIDEO_SEND_STALE_AGE: Duration = Duration::from_millis(50);
 const CLIENT_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const HOST_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;

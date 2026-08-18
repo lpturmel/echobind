@@ -83,6 +83,8 @@ pub struct EchobindApp {
     slot_busy_skips: u64,
     preprocess_busy_skips: u64,
     no_free_slot_skips: u64,
+    nvenc_submissions: u64,
+    nvenc_completions: u64,
     cursor_only_frames: u64,
     stale_frames: u64,
     reassembly_ms: f32,
@@ -176,6 +178,8 @@ impl EchobindApp {
             slot_busy_skips: 0,
             preprocess_busy_skips: 0,
             no_free_slot_skips: 0,
+            nvenc_submissions: 0,
+            nvenc_completions: 0,
             cursor_only_frames: 0,
             stale_frames: 0,
             reassembly_ms: 0.0,
@@ -283,6 +287,8 @@ impl EchobindApp {
                     self.slot_busy_skips = stats.slot_busy_skips;
                     self.preprocess_busy_skips = stats.preprocess_busy_skips;
                     self.no_free_slot_skips = stats.no_free_slot_skips;
+                    self.nvenc_submissions = stats.nvenc_submissions;
+                    self.nvenc_completions = stats.nvenc_completions;
                     self.cursor_only_frames = stats.cursor_only_frames;
                     self.stale_frames = stats.stale_frames;
                 }
@@ -463,6 +469,8 @@ impl EchobindApp {
         self.slot_busy_skips = 0;
         self.preprocess_busy_skips = 0;
         self.no_free_slot_skips = 0;
+        self.nvenc_submissions = 0;
+        self.nvenc_completions = 0;
         self.cursor_only_frames = 0;
         self.stale_frames = 0;
         self.transport = "standard MTU".to_owned();
@@ -777,8 +785,10 @@ impl EchobindApp {
                 ));
                 #[cfg(target_os = "windows")]
                 ui.label(format!(
-                    "capture: {:.1} DXGI updates/s · {} timeouts · {} accumulated (max {}) · skips pacing {} / preprocess {} / no slot {} / cursor-only {} / stale {}",
+                    "capture: {:.1} DXGI updates/s · NVENC submit/complete {}/{} · {} timeouts · {} accumulated (max {}) · skips pacing {} / preprocess {} / no slot {} / cursor-only {} / stale {}",
                     self.source_fps,
+                    self.nvenc_submissions,
+                    self.nvenc_completions,
                     self.dxgi_timeouts,
                     self.dxgi_backlog,
                     self.dxgi_backlog_max,
@@ -801,13 +811,15 @@ impl EchobindApp {
                         server.send_ms,
                     ));
                     ui.label(format!(
-                        "server stages: copy issue {:.2} · convert issue {:.2} · sync/map {:.2} · submit {:.2} · completion {:.2} · bitstream {:.2} ms · skips preprocess {} / no slot {}",
+                        "server stages: copy issue {:.2} · convert issue {:.2} · sync/map {:.2} · submit {:.2} · completion {:.2} · bitstream {:.2} ms · NVENC submit/complete {}/{} · skips preprocess {} / no slot {}",
                         server.copy_wait_ms,
                         server.convert_wait_ms,
                         server.map_ms,
                         server.submit_ms,
                         server.completion_wait_ms,
                         server.bitstream_ms,
+                        server.nvenc_submissions,
+                        server.nvenc_completions,
                         server.preprocess_busy_skips,
                         server.no_free_slot_skips,
                     ));
@@ -944,8 +956,11 @@ impl EchobindApp {
                                 server.encode_ms,
                             ));
                             ui.label(format!(
-                                "queue {:.2} ms  send {:.2} ms",
-                                server.encode_queue_ms, server.send_ms,
+                                "queue {:.2} ms  send {:.2} ms  NVENC {}/{}",
+                                server.encode_queue_ms,
+                                server.send_ms,
+                                server.nvenc_submissions,
+                                server.nvenc_completions,
                             ));
                             ui.label(format!(
                                 "copy-issue {:.2}  convert-issue {:.2}  sync/map {:.2}  submit {:.2}  complete {:.2}  bits {:.2} ms",

@@ -8,7 +8,8 @@ const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
 const LEGACY_SERVER_STATS_LEN: usize = 9 * size_of::<f32>() + 7 * size_of::<u64>();
-const SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 9 * size_of::<u64>();
+const STAGED_SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 9 * size_of::<u64>();
+const SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 11 * size_of::<u64>();
 pub const VIDEO_RECOVERY_HEADER_LEN: usize = 4;
 
 // The standard mode keeps the complete IPv6 packet below an Ethernet 1500-byte
@@ -101,6 +102,8 @@ pub struct ServerStats {
     pub stale_frames: u64,
     pub preprocess_busy_skips: u64,
     pub no_free_slot_skips: u64,
+    pub nvenc_submissions: u64,
+    pub nvenc_completions: u64,
 }
 
 impl Packet<'_> {
@@ -195,7 +198,12 @@ impl Packet<'_> {
                 ] {
                     out.extend_from_slice(&value.to_bits().to_be_bytes());
                 }
-                for value in [stats.preprocess_busy_skips, stats.no_free_slot_skips] {
+                for value in [
+                    stats.preprocess_busy_skips,
+                    stats.no_free_slot_skips,
+                    stats.nvenc_submissions,
+                    stats.nvenc_completions,
+                ] {
                     out.extend_from_slice(&value.to_be_bytes());
                 }
             }
@@ -279,7 +287,10 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
 }
 
 fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
-    if payload.len() != LEGACY_SERVER_STATS_LEN && payload.len() != SERVER_STATS_LEN {
+    if payload.len() != LEGACY_SERVER_STATS_LEN
+        && payload.len() != STAGED_SERVER_STATS_LEN
+        && payload.len() != SERVER_STATS_LEN
+    {
         return Err(PacketParseError::Invalid);
     }
 
@@ -323,8 +334,10 @@ fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
         bitstream_ms: 0.0,
         preprocess_busy_skips: 0,
         no_free_slot_skips: 0,
+        nvenc_submissions: 0,
+        nvenc_completions: 0,
     };
-    let stats = if payload.len() == SERVER_STATS_LEN {
+    let stats = if payload.len() >= STAGED_SERVER_STATS_LEN {
         ServerStats {
             copy_wait_ms: f32_at(92)?,
             convert_wait_ms: f32_at(96)?,
@@ -334,6 +347,15 @@ fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
             bitstream_ms: f32_at(112)?,
             preprocess_busy_skips: u64_at(116)?,
             no_free_slot_skips: u64_at(124)?,
+            ..stats
+        }
+    } else {
+        stats
+    };
+    let stats = if payload.len() == SERVER_STATS_LEN {
+        ServerStats {
+            nvenc_submissions: u64_at(132)?,
+            nvenc_completions: u64_at(140)?,
             ..stats
         }
     } else {
@@ -671,6 +693,8 @@ mod tests {
             stale_frames: 8,
             preprocess_busy_skips: 9,
             no_free_slot_skips: 10,
+            nvenc_submissions: 11,
+            nvenc_completions: 12,
         };
         let encoded = round_trip(Packet::ServerStats(stats));
         assert_eq!(
@@ -698,6 +722,30 @@ mod tests {
         assert_eq!(parsed.source_fps, stats.source_fps);
         assert_eq!(parsed.copy_wait_ms, 0.0);
         assert_eq!(parsed.preprocess_busy_skips, 0);
+        assert_eq!(parsed.nvenc_submissions, 0);
+    }
+
+    #[test]
+    fn parses_staged_server_stats_without_nvenc_counters() {
+        let stats = ServerStats {
+            fps: 60.0,
+            copy_wait_ms: 4.0,
+            preprocess_busy_skips: 12,
+            nvenc_submissions: 20,
+            nvenc_completions: 19,
+            ..ServerStats::default()
+        };
+        let mut encoded = Vec::new();
+        Packet::ServerStats(stats).encode(&mut encoded);
+        encoded.truncate(HEADER_LEN + STAGED_SERVER_STATS_LEN);
+        let Packet::ServerStats(parsed) = Packet::try_from(encoded.as_slice()).unwrap() else {
+            panic!("staged server stats changed packet type");
+        };
+        assert_eq!(parsed.fps, stats.fps);
+        assert_eq!(parsed.copy_wait_ms, stats.copy_wait_ms);
+        assert_eq!(parsed.preprocess_busy_skips, stats.preprocess_busy_skips);
+        assert_eq!(parsed.nvenc_submissions, 0);
+        assert_eq!(parsed.nvenc_completions, 0);
     }
 
     #[test]
