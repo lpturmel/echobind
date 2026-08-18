@@ -39,10 +39,10 @@ four-slot asynchronous NVENC pipeline, and GPU scaling. Acquired desktop
 surfaces are copied into an application-owned BGRA ring and converted to NV12
 with the D3D11 video processor. NVENC resource mapping supplies the documented
 D3D11 completion synchronization, avoiding redundant CPU-side GPU query waits.
-All NVENC calls for a session run on one ordered worker so driver-level
-submission and bitstream locks cannot contend with each other. The worker keeps
-up to four asynchronous frames in flight, drains completions in submission
-order, and rebuilds a stalled session with a bounded retry count. Prepared
+NVENC submission stays on a non-blocking producer thread while a dedicated
+output thread waits for events and copies completed bitstreams in submission
+order, keeping up to four frames in flight even when output retrieval stalls
+briefly. A stalled session is rebuilt with a bounded retry count. Prepared
 frames older than two target frame intervals are discarded before encoding so
 GPU overload cannot turn into a growing input-latency backlog. macOS uses
 ScreenCaptureKit and VideoToolbox for hardware encode, then VideoToolbox NV12

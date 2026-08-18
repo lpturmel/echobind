@@ -20,7 +20,6 @@ use moq_nvenc::sys::nvEncodeAPI::{
     NV_ENC_VUI_TRANSFER_CHARACTERISTIC, NV_ENC_VUI_VIDEO_FORMAT,
 };
 use std::{
-    collections::VecDeque,
     ffi::c_void,
     mem::ManuallyDrop,
     net::{SocketAddr, UdpSocket},
@@ -84,9 +83,9 @@ type NvencGetMaxVersion = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 type D3dKmtSetProcessSchedulingPriorityClass = unsafe extern "system" fn(HANDLE, i32) -> i32;
 
 const NVENC_BUFFER_COUNT: usize = 4;
-// Keep the complete NVENC ring available to the single-owner scheduler. Frames
-// that have not reached NVENC are still discarded after two presentation
-// budgets, so this bound cannot grow into an unbounded latency queue.
+// Keep the complete NVENC ring available to the split submit/output pipeline.
+// Frames that have not reached NVENC are still discarded after two
+// presentation budgets, so this bound cannot grow into a latency queue.
 const MAX_PREPROCESS_IN_FLIGHT: usize = NVENC_BUFFER_COUNT;
 const MAX_PREPARED_FRAME_AGE_INTERVALS: f64 = 2.0;
 const ENCODE_COMPLETION_POLL_MS: u32 = 2;
@@ -157,9 +156,11 @@ struct HardwareCapture {
     free_slots_tx: mpsc::SyncSender<usize>,
     free_slots: mpsc::Receiver<usize>,
     prepared_tx: Option<mpsc::SyncSender<PreparedHardwareFrame>>,
-    encoder_worker_handle: Option<JoinHandle<()>>,
-    encoder_worker_done: mpsc::Receiver<()>,
-    encoder_worker_failure: Arc<Mutex<Option<String>>>,
+    submission_handle: Option<JoinHandle<()>>,
+    submission_done: mpsc::Receiver<()>,
+    completion_handle: Option<JoinHandle<()>>,
+    completion_done: mpsc::Receiver<()>,
+    worker_failure: Arc<Mutex<Option<String>>>,
     workers_running: Arc<AtomicBool>,
     flags: CaptureFlags,
     started: Instant,
@@ -216,6 +217,11 @@ struct PendingNvencFrame {
     submit_us: u64,
 }
 
+// NVENC asynchronous mode explicitly hands submitted samples from the
+// submission thread to an output thread. The mapped resource is an opaque
+// driver handle whose lifetime remains owned by the encoder until completion.
+unsafe impl Send for PendingNvencFrame {}
+
 struct D3dScaler {
     source_width: u32,
     source_height: u32,
@@ -246,9 +252,9 @@ struct NvencSlot {
     completion_event: HANDLE,
 }
 
-// The encoder is moved to one worker thread for its entire active lifetime.
-// It remains behind Arc because HardwareCapture owns the final reference used
-// to poison a driver call that does not return during shutdown.
+// NVENC asynchronous mode uses a submission thread and a completion/output
+// thread. Calls are synchronized by the driver; D3D11 immediate-context access
+// is separately protected by ID3D11Multithread.
 unsafe impl Send for NvencEncoder {}
 unsafe impl Sync for NvencEncoder {}
 
@@ -831,7 +837,7 @@ fn acquire_dxgi_frame(
     duplication: &IDXGIOutputDuplication,
     capture: &mut HardwareCapture,
 ) -> Result<bool, DxgiCaptureFailure> {
-    if let Some(error) = capture.take_encoder_worker_failure() {
+    if let Some(error) = capture.take_worker_failure() {
         let message = format!("D3D11/NVENC worker stopped: {error}");
         return Err(if is_d3d_device_lost_error(&message) {
             DxgiCaptureFailure::DeviceLost(message)
@@ -982,15 +988,15 @@ impl HardwareCapture {
                 .send(slot)
                 .map_err(|_| "Unable to initialize the NVENC buffer ring".to_owned())?;
         }
-        let encoder_worker_failure = Arc::new(Mutex::new(None));
+        let worker_failure = Arc::new(Mutex::new(None));
         let workers_running = Arc::new(AtomicBool::new(true));
         let (prepared_tx, prepared_rx) = mpsc::sync_channel(MAX_PREPROCESS_IN_FLIGHT);
         let preprocess_in_flight = Arc::new(AtomicUsize::new(0));
-        let (encoder_worker_done_tx, encoder_worker_done) = mpsc::channel();
-        let encoder_worker_handle = spawn_nvenc_worker(
-            device_context.clone(),
+        let (completion_tx, completion_rx) = mpsc::sync_channel(NVENC_BUFFER_COUNT);
+        let (completion_done_tx, completion_done) = mpsc::channel();
+        let completion_handle = spawn_nvenc_completion(
             encoder.clone(),
-            prepared_rx,
+            completion_rx,
             free_slots_tx.clone(),
             flags.encoded_frames.clone(),
             flags.force_keyframe.clone(),
@@ -998,14 +1004,29 @@ impl HardwareCapture {
             workers_running.clone(),
             preprocess_in_flight.clone(),
             flags.metrics.clone(),
-            encoder_worker_failure.clone(),
+            worker_failure.clone(),
             flags.hardware_progress.clone(),
             flags.events.clone(),
+            completion_done_tx,
+        );
+        let (submission_done_tx, submission_done) = mpsc::channel();
+        let submission_handle = spawn_nvenc_submission(
+            device_context.clone(),
+            encoder.clone(),
+            prepared_rx,
+            completion_tx,
+            free_slots_tx.clone(),
+            flags.force_keyframe.clone(),
+            flags.running.clone(),
+            workers_running.clone(),
+            preprocess_in_flight.clone(),
+            flags.metrics.clone(),
+            worker_failure.clone(),
             flags.frames_per_second,
-            encoder_worker_done_tx,
+            submission_done_tx,
         );
         let _ = flags.events.send(SessionEvent::VideoBackend(format!(
-            "{backend} · D3D11 BGRA→NV12 · single-owner NVENC API"
+            "{backend} · D3D11 BGRA→NV12 · split submit/output NVENC"
         )));
         let frame_interval =
             Duration::from_secs_f64(1.0 / f64::from(flags.frames_per_second.max(1)));
@@ -1024,9 +1045,11 @@ impl HardwareCapture {
             free_slots_tx,
             free_slots,
             prepared_tx: Some(prepared_tx),
-            encoder_worker_handle: Some(encoder_worker_handle),
-            encoder_worker_done,
-            encoder_worker_failure,
+            submission_handle: Some(submission_handle),
+            submission_done,
+            completion_handle: Some(completion_handle),
+            completion_done,
+            worker_failure,
             workers_running,
             flags,
             started: Instant::now(),
@@ -1091,7 +1114,7 @@ impl HardwareCapture {
         source_width: u32,
         source_height: u32,
     ) -> Result<(), String> {
-        if let Some(error) = self.take_encoder_worker_failure() {
+        if let Some(error) = self.take_worker_failure() {
             return Err(format!("D3D11/NVENC worker stopped: {error}"));
         }
         if self.flags.active_peer.lock().unwrap().is_none() {
@@ -1215,8 +1238,8 @@ impl HardwareCapture {
         }
     }
 
-    fn take_encoder_worker_failure(&self) -> Option<String> {
-        self.encoder_worker_failure.lock().unwrap().take()
+    fn take_worker_failure(&self) -> Option<String> {
+        self.worker_failure.lock().unwrap().take()
     }
 }
 
@@ -1224,18 +1247,29 @@ impl Drop for HardwareCapture {
     fn drop(&mut self) {
         self.workers_running.store(false, Ordering::Release);
         self.prepared_tx.take();
-        if let Some(handle) = self.encoder_worker_handle.take() {
-            match self
-                .encoder_worker_done
-                .recv_timeout(WORKER_SHUTDOWN_TIMEOUT)
-            {
+        if let Some(handle) = self.submission_handle.take() {
+            match self.submission_done.recv_timeout(WORKER_SHUTDOWN_TIMEOUT) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     let _ = handle.join();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.encoder.poison();
                     warn!(
-                        "D3D11/NVENC worker did not stop within {} ms; detaching the poisoned driver worker so session shutdown can continue",
+                        "D3D11/NVENC submission worker did not stop within {} ms; detaching the poisoned driver worker",
+                        WORKER_SHUTDOWN_TIMEOUT.as_millis()
+                    );
+                }
+            }
+        }
+        if let Some(handle) = self.completion_handle.take() {
+            match self.completion_done.recv_timeout(WORKER_SHUTDOWN_TIMEOUT) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = handle.join();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.encoder.poison();
+                    warn!(
+                        "NVENC completion worker did not stop within {} ms; detaching the poisoned driver worker so session shutdown can continue",
                         WORKER_SHUTDOWN_TIMEOUT.as_millis()
                     );
                 }
@@ -1245,25 +1279,23 @@ impl Drop for HardwareCapture {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_nvenc_worker(
+fn spawn_nvenc_submission(
     device_context: ID3D11DeviceContext,
     encoder: Arc<NvencEncoder>,
     prepared_frames: mpsc::Receiver<PreparedHardwareFrame>,
+    completion_tx: mpsc::SyncSender<PendingNvencFrame>,
     free_slots: mpsc::SyncSender<usize>,
-    encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
     force_keyframe: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     workers_running: Arc<AtomicBool>,
     preprocess_in_flight: Arc<AtomicUsize>,
     metrics: Arc<WindowsCaptureMetrics>,
     worker_failure: Arc<Mutex<Option<String>>>,
-    hardware_progress: Arc<AtomicU64>,
-    events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
-    worker_done: mpsc::Sender<()>,
+    submission_done: mpsc::Sender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        raise_current_thread_priority("D3D11/NVENC", THREAD_PRIORITY_HIGHEST);
+        raise_current_thread_priority("D3D11/NVENC submission", THREAD_PRIORITY_HIGHEST);
         let mut scalers: Vec<Option<D3dScaler>> = std::iter::repeat_with(|| None)
             .take(NVENC_BUFFER_COUNT)
             .collect();
@@ -1274,160 +1306,165 @@ fn spawn_nvenc_worker(
         let max_prepared_frame_age = Duration::from_secs_f64(
             MAX_PREPARED_FRAME_AGE_INTERVALS / f64::from(frames_per_second.max(1)),
         );
-        let mut pending = VecDeque::<PendingNvencFrame>::with_capacity(NVENC_BUFFER_COUNT);
-        let mut next_prepared = None::<PreparedHardwareFrame>;
-        let mut input_connected = true;
 
         loop {
             if !running.load(Ordering::Relaxed) || !workers_running.load(Ordering::Acquire) {
-                // Submitted resources remain driver-owned until their events
-                // fire. Do not unmap or unregister them during cancellation.
-                if !pending.is_empty() {
-                    encoder.poison();
+                break;
+            }
+            let prepared = match prepared_frames.recv_timeout(Duration::from_millis(10)) {
+                Ok(prepared) => prepared,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let slot = prepared.slot;
+            if !running.load(Ordering::Relaxed) || !workers_running.load(Ordering::Acquire) {
+                let _ = free_slots.try_send(slot);
+                preprocess_in_flight.fetch_sub(1, Ordering::AcqRel);
+                break;
+            }
+            if prepared.captured_at.elapsed() > max_prepared_frame_age {
+                // This frame has not entered the H.264 reference chain, so
+                // discarding it cannot create a decoder gap.
+                metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
+                let _ = free_slots.try_send(slot);
+                preprocess_in_flight.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            let pending = match submit_prepared_frame(
+                &device_context,
+                &encoder,
+                &mut scalers,
+                prepared,
+                &force_keyframe,
+                &metrics,
+                frames_per_second,
+                &mut next_frame_id,
+            ) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    let _ = free_slots.try_send(slot);
+                    preprocess_in_flight.fetch_sub(1, Ordering::AcqRel);
+                    if running.load(Ordering::Relaxed) && workers_running.load(Ordering::Acquire) {
+                        warn!("D3D11 conversion/NVENC submission failed: {error}");
+                        force_keyframe.store(true, Ordering::Release);
+                        *worker_failure.lock().unwrap() = Some(error);
+                        workers_running.store(false, Ordering::Release);
+                    }
+                    break;
+                }
+            };
+            if completion_tx.send(pending).is_err() {
+                // A submitted resource remains driver-owned until completion;
+                // do not unmap or recycle its slot after the output worker dies.
+                encoder.poison();
+                if running.load(Ordering::Relaxed) && workers_running.swap(false, Ordering::AcqRel)
+                {
+                    force_keyframe.store(true, Ordering::Release);
+                    *worker_failure.lock().unwrap() =
+                        Some("NVENC completion worker disconnected".to_owned());
                 }
                 break;
             }
+        }
+        let _ = submission_done.send(());
+    })
+}
 
-            let prepared = if pending.len() < NVENC_BUFFER_COUNT && input_connected {
-                next_prepared
-                    .take()
-                    .or_else(|| match prepared_frames.try_recv() {
-                        Ok(prepared) => Some(prepared),
-                        Err(mpsc::TryRecvError::Empty) => None,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            input_connected = false;
-                            None
-                        }
-                    })
-            } else {
-                None
+#[allow(clippy::too_many_arguments)]
+fn spawn_nvenc_completion(
+    encoder: Arc<NvencEncoder>,
+    pending_frames: mpsc::Receiver<PendingNvencFrame>,
+    free_slots: mpsc::SyncSender<usize>,
+    encoded_frames: mpsc::SyncSender<EncodedHardwareFrame>,
+    force_keyframe: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    workers_running: Arc<AtomicBool>,
+    preprocess_in_flight: Arc<AtomicUsize>,
+    metrics: Arc<WindowsCaptureMetrics>,
+    worker_failure: Arc<Mutex<Option<String>>>,
+    hardware_progress: Arc<AtomicU64>,
+    events: mpsc::Sender<SessionEvent>,
+    completion_done: mpsc::Sender<()>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        raise_current_thread_priority("NVENC completion", THREAD_PRIORITY_HIGHEST);
+        'worker: loop {
+            let pending = match pending_frames.recv_timeout(Duration::from_millis(10)) {
+                Ok(pending) => pending,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            let submitted = if let Some(prepared) = prepared {
-                if prepared.captured_at.elapsed() > max_prepared_frame_age {
-                    // This frame has not entered the H.264 reference chain, so
-                    // discarding it cannot create a decoder gap.
-                    metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
-                    let _ = free_slots.try_send(prepared.slot);
-                    preprocess_in_flight.fetch_sub(1, Ordering::AcqRel);
-                    false
-                } else {
-                    match submit_prepared_frame(
-                        &device_context,
-                        &encoder,
-                        &mut scalers,
-                        prepared,
-                        &force_keyframe,
-                        &metrics,
-                        frames_per_second,
-                        &mut next_frame_id,
-                    ) {
-                        Ok(frame) => {
-                            pending.push_back(frame);
-                            true
-                        }
-                        Err(error) => {
-                            encoder.poison();
-                            if running.load(Ordering::Relaxed)
-                                && workers_running.load(Ordering::Acquire)
-                            {
-                                warn!("D3D11 conversion/NVENC submission failed: {error}");
-                                force_keyframe.store(true, Ordering::Release);
-                                *worker_failure.lock().unwrap() = Some(error);
-                            }
-                            break;
-                        }
-                    }
-                }
-            } else {
-                false
-            };
-
-            if let Some(oldest) = pending.front() {
-                let wait_ms = if submitted {
-                    0
-                } else {
-                    ENCODE_COMPLETION_POLL_MS
-                };
-                let oldest_frame_id = oldest.frame_id;
-                let oldest_age = oldest.encode_started.elapsed();
-                let completion = encoder.try_complete(oldest, wait_ms);
-                match completion {
-                    Ok(Some(mut frame)) => {
-                        let completed = pending
-                            .pop_front()
-                            .expect("the completed NVENC frame was pending");
-                        metrics.nvenc_completions.fetch_add(1, Ordering::Relaxed);
-                        let accepted = loop {
-                            match encoded_frames.try_send(frame) {
-                                Ok(()) => break true,
-                                Err(mpsc::TrySendError::Full(returned)) => {
-                                    if !running.load(Ordering::Relaxed)
-                                        || !workers_running.load(Ordering::Acquire)
-                                    {
-                                        break false;
-                                    }
-                                    frame = returned;
-                                    thread::sleep(Duration::from_millis(1));
-                                }
-                                Err(mpsc::TrySendError::Disconnected(_)) => break false,
-                            }
-                        };
-                        let _ = free_slots.try_send(completed.slot);
-                        preprocess_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        if accepted {
-                            if hardware_progress.fetch_add(1, Ordering::AcqRel) == 0 {
-                                let _ = events.send(SessionEvent::CaptureReady);
-                            }
-                        } else {
-                            if !pending.is_empty() {
-                                encoder.poison();
-                            }
-                            if running.load(Ordering::Relaxed)
-                                && workers_running.load(Ordering::Acquire)
-                            {
-                                force_keyframe.store(true, Ordering::Release);
-                                *worker_failure.lock().unwrap() =
-                                    Some("video sender disconnected".to_owned());
-                            }
-                            break;
-                        }
-                    }
+            let mut frame = loop {
+                // Drain every submitted sample even during normal shutdown.
+                // NVENC owns the mapped resource until its event fires, so
+                // abandoning queued samples would make clean destruction unsafe.
+                match encoder.try_complete(&pending, ENCODE_COMPLETION_POLL_MS) {
+                    Ok(Some(frame)) => break frame,
+                    Ok(None)
+                        if pending.encode_started.elapsed() < NVENC_COMPLETION_STALL_TIMEOUT => {}
                     Ok(None) => {
-                        if oldest_age >= NVENC_COMPLETION_STALL_TIMEOUT {
-                            encoder.poison();
-                            force_keyframe.store(true, Ordering::Release);
-                            *worker_failure.lock().unwrap() = Some(format!(
-                                "NVENC frame {oldest_frame_id} did not complete within {} ms",
-                                NVENC_COMPLETION_STALL_TIMEOUT.as_millis()
-                            ));
-                            break;
-                        }
+                        let error = format!(
+                            "NVENC frame {} did not complete within {} ms",
+                            pending.frame_id,
+                            NVENC_COMPLETION_STALL_TIMEOUT.as_millis()
+                        );
+                        encoder.poison();
+                        force_keyframe.store(true, Ordering::Release);
+                        *worker_failure.lock().unwrap() = Some(error);
+                        workers_running.store(false, Ordering::Release);
+                        break 'worker;
                     }
                     Err(error) => {
                         encoder.poison();
                         if running.load(Ordering::Relaxed)
-                            && workers_running.load(Ordering::Acquire)
+                            && workers_running.swap(false, Ordering::AcqRel)
                         {
                             warn!("Asynchronous NVENC completion failed: {error}");
                             force_keyframe.store(true, Ordering::Release);
                             *worker_failure.lock().unwrap() = Some(error);
                         }
-                        break;
+                        break 'worker;
                     }
                 }
-            } else if !submitted && input_connected {
-                match prepared_frames.recv_timeout(Duration::from_millis(10)) {
-                    Ok(prepared) => next_prepared = Some(prepared),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => input_connected = false,
+            };
+            metrics.nvenc_completions.fetch_add(1, Ordering::Relaxed);
+            let accepted =
+                if running.load(Ordering::Relaxed) && workers_running.load(Ordering::Acquire) {
+                    loop {
+                        match encoded_frames.try_send(frame) {
+                            Ok(()) => break true,
+                            Err(mpsc::TrySendError::Full(returned)) => {
+                                if !running.load(Ordering::Relaxed)
+                                    || !workers_running.load(Ordering::Acquire)
+                                {
+                                    break false;
+                                }
+                                frame = returned;
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => break false,
+                        }
+                    }
+                } else {
+                    false
+                };
+            // Completion has made the input safe to reuse even when shutdown
+            // prevents the encoded frame from reaching the sender.
+            let _ = free_slots.try_send(pending.slot);
+            preprocess_in_flight.fetch_sub(1, Ordering::AcqRel);
+            if accepted {
+                if hardware_progress.fetch_add(1, Ordering::AcqRel) == 0 {
+                    let _ = events.send(SessionEvent::CaptureReady);
+                }
+            } else {
+                if running.load(Ordering::Relaxed) && workers_running.swap(false, Ordering::AcqRel)
+                {
+                    force_keyframe.store(true, Ordering::Release);
+                    *worker_failure.lock().unwrap() = Some("video sender disconnected".to_owned());
                 }
             }
-
-            if !input_connected && pending.is_empty() && next_prepared.is_none() {
-                break;
-            }
         }
-        let _ = worker_done.send(());
+        let _ = completion_done.send(());
     })
 }
 
@@ -2205,7 +2242,8 @@ impl NvencEncoder {
         };
         // Keep bitstream output in system memory for asynchronous DirectX
         // encoding. The driver may use the application's DirectX device from
-        // NvEncLockBitstream, which is why all NVENC calls share one worker.
+        // the output thread, so ID3D11Multithread protects it against capture
+        // and submission context access.
         initialize.set_enableOutputInVidmem(0);
         let initialize_encoder = required(
             self.api.functions.nvEncInitializeEncoder,
