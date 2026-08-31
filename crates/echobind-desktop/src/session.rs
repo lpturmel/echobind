@@ -78,7 +78,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const VIDEO_PACING_RATE_MULTIPLIER: u64 = 4;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(super) const VIDEO_PACING_BATCH_DATAGRAMS: usize = 16;
+const VIDEO_PACING_BATCH_BYTES: usize = 16 * STANDARD_DATAGRAM_SIZE;
 #[cfg(target_os = "macos")]
 const VIDEO_PACING_SLEEP_GUARD: Duration = Duration::from_micros(500);
 #[cfg(target_os = "windows")]
@@ -92,6 +92,11 @@ pub(super) struct DatagramPacer {
     next_batch_at: Instant,
     #[cfg(target_os = "windows")]
     waiter: PreciseSleeper,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(super) fn video_pacing_batch_datagrams(datagram_size: usize) -> usize {
+    (VIDEO_PACING_BATCH_BYTES / datagram_size.max(1)).max(1)
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -175,7 +180,22 @@ impl PreciseSleeper {
     }
 
     pub(super) fn sleep(&self, duration: Duration) {
-        self.wait_until(Instant::now() + duration);
+        if duration.is_zero() {
+            return;
+        }
+        // NVENC uses this path only for transient BUSY backoff. Do not reuse
+        // the pacer's spin-tail policy here: when high-resolution timers are
+        // unavailable, its 2 ms guard would busy-spin every 1 ms retry on a
+        // highest-priority submission thread for the entire overload window.
+        if let Some(timer) = self.timer {
+            let ticks = duration.as_nanos().div_ceil(100).min(i64::MAX as u128) as i64;
+            let due_time = -ticks.max(1);
+            let armed = unsafe { SetWaitableTimer(timer, &due_time, 0, None, None, false).is_ok() };
+            if armed && unsafe { WaitForSingleObject(timer, INFINITE) } == WAIT_OBJECT_0 {
+                return;
+            }
+        }
+        thread::sleep(duration);
     }
 
     fn wait_until(&self, deadline: Instant) {
@@ -499,6 +519,7 @@ impl DesktopSession {
 
         let running = Arc::new(AtomicBool::new(true));
         let active_peer = Arc::new(Mutex::new(None::<SocketAddr>));
+        let peer_epoch = Arc::new(AtomicU64::new(0));
         let force_keyframe = Arc::new(AtomicBool::new(true));
         let active_datagram_size = Arc::new(AtomicUsize::new(STANDARD_DATAGRAM_SIZE));
         let latest_frame = Arc::new(Mutex::new(None));
@@ -534,6 +555,7 @@ impl DesktopSession {
             socket.clone(),
             running.clone(),
             active_peer.clone(),
+            peer_epoch.clone(),
             force_keyframe.clone(),
             command_rx,
             event_tx.clone(),
@@ -572,6 +594,7 @@ impl DesktopSession {
                 socket.clone(),
                 running.clone(),
                 active_peer.clone(),
+                peer_epoch,
                 force_keyframe.clone(),
                 event_tx.clone(),
                 frames_per_second,
@@ -821,11 +844,25 @@ impl Drop for DesktopSession {
     }
 }
 
+fn replace_active_peer(
+    active_peer: &Mutex<Option<SocketAddr>>,
+    peer_epoch: &AtomicU64,
+    replacement: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    let previous = std::mem::replace(&mut *active_peer.lock().unwrap(), replacement);
+    // The address can be reused after a disconnect, so SocketAddr alone is
+    // not a session identity. Every transition advances an ABA-resistant
+    // epoch consumed by the Windows capture and sender pipelines.
+    peer_epoch.fetch_add(1, Ordering::AcqRel);
+    previous
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_host_network(
     socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
+    peer_epoch: Arc<AtomicU64>,
     force_keyframe: Arc<AtomicBool>,
     commands: mpsc::Receiver<HostCommand>,
     events: mpsc::Sender<SessionEvent>,
@@ -857,7 +894,7 @@ fn spawn_host_network(
                             STANDARD_DATAGRAM_SIZE
                         };
                         active_datagram_size.store(datagram_size, Ordering::Release);
-                        *active_peer.lock().unwrap() = Some(peer);
+                        replace_active_peer(&active_peer, &peer_epoch, Some(peer));
                         pending_peer = None;
                         reconnect_peer = None;
                         last_seen = Some(Instant::now());
@@ -872,7 +909,7 @@ fn spawn_host_network(
                             let _ = events.send(SessionEvent::Error(format!(
                                 "Unable to accept {peer}: {error}"
                             )));
-                            *active_peer.lock().unwrap() = None;
+                            replace_active_peer(&active_peer, &peer_epoch, None);
                         } else {
                             let _ = events.send(SessionEvent::Connected(peer));
                             let _ =
@@ -932,7 +969,7 @@ fn spawn_host_network(
                                     STANDARD_DATAGRAM_SIZE
                                 };
                             active_datagram_size.store(datagram_size, Ordering::Release);
-                            *active_peer.lock().unwrap() = Some(peer);
+                            replace_active_peer(&active_peer, &peer_epoch, Some(peer));
                             last_seen = Some(Instant::now());
                             reconnect_peer = None;
                             force_keyframe.store(true, Ordering::Release);
@@ -956,7 +993,7 @@ fn spawn_host_network(
                                 .take()
                                 .expect("the reconnect peer was just matched");
                             active_datagram_size.store(datagram_size, Ordering::Release);
-                            *active_peer.lock().unwrap() = Some(peer);
+                            replace_active_peer(&active_peer, &peer_epoch, Some(peer));
                             last_seen = Some(Instant::now());
                             force_keyframe.store(true, Ordering::Release);
                             let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
@@ -966,7 +1003,7 @@ fn spawn_host_network(
                             };
                             Packet::Config(config_json).encode(&mut response);
                             if let Err(error) = socket.send_to(&response, peer) {
-                                *active_peer.lock().unwrap() = None;
+                                replace_active_peer(&active_peer, &peer_epoch, None);
                                 reconnect_peer = Some((peer, datagram_size, Instant::now()));
                                 last_seen = None;
                                 let _ = events.send(SessionEvent::Error(format!(
@@ -1031,7 +1068,7 @@ fn spawn_host_network(
             }
 
             if last_seen.is_some_and(|seen| seen.elapsed() >= CONNECTION_TIMEOUT) {
-                if let Some(peer) = active_peer.lock().unwrap().take() {
+                if let Some(peer) = replace_active_peer(&active_peer, &peer_epoch, None) {
                     reconnect_peer = Some((
                         peer,
                         active_datagram_size.load(Ordering::Acquire),
@@ -1173,6 +1210,7 @@ fn spawn_encoder(
         let mut stats_capture_us = 0_u64;
         let mut stats_encode_us = 0_u64;
         let mut stats_send_us = 0_u64;
+        let mut stats_send_failures = 0_u64;
         let mut stats_encode_queue_us = 0_u64;
         let mut frame = I420Frame::default();
 
@@ -1271,6 +1309,7 @@ fn spawn_encoder(
                 Packet::Video(fragment).encode(&mut packet);
                 if let Err(error) = socket.send_to(&packet, peer) {
                     warn!("Video send to {peer} failed: {error}");
+                    stats_send_failures = stats_send_failures.saturating_add(1);
                     frame_sent = false;
                     break;
                 }
@@ -1303,6 +1342,7 @@ fn spawn_encoder(
                         encode_ms: average_milliseconds(stats_encode_us, stats_frames),
                         send_ms: average_milliseconds(stats_send_us, stats_frames),
                         encode_queue_ms: average_milliseconds(stats_encode_queue_us, stats_frames),
+                        video_send_failures: stats_send_failures,
                         dxgi_timeouts: 0,
                         dxgi_backlog: 0,
                         dxgi_backlog_max: 0,
@@ -1319,6 +1359,7 @@ fn spawn_encoder(
                 stats_capture_us = 0;
                 stats_encode_us = 0;
                 stats_send_us = 0;
+                stats_send_failures = 0;
                 stats_encode_queue_us = 0;
             }
         }
@@ -1916,6 +1957,21 @@ fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn peer_epoch_distinguishes_a_reused_socket_address() {
+        let peer = "127.0.0.1:3013".parse().unwrap();
+        let active_peer = Mutex::new(None);
+        let epoch = AtomicU64::new(0);
+
+        assert_eq!(replace_active_peer(&active_peer, &epoch, Some(peer)), None);
+        assert_eq!(epoch.load(Ordering::Acquire), 1);
+        assert_eq!(
+            replace_active_peer(&active_peer, &epoch, Some(peer)),
+            Some(peer)
+        );
+        assert_eq!(epoch.load(Ordering::Acquire), 2);
+    }
+
     fn received(frame_id: u64, is_keyframe: bool, age: Duration) -> ReceivedVideoFrame {
         ReceivedVideoFrame {
             frame: VideoFrame {
@@ -1925,6 +1981,18 @@ mod tests {
                 payload: vec![1],
             },
             received_at: Instant::now() - age,
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn pacing_batches_are_bounded_by_bytes_for_standard_and_jumbo_datagrams() {
+        assert_eq!(video_pacing_batch_datagrams(STANDARD_DATAGRAM_SIZE), 16);
+        assert_eq!(video_pacing_batch_datagrams(JUMBO_DATAGRAM_SIZE), 2);
+        for datagram_size in [STANDARD_DATAGRAM_SIZE, JUMBO_DATAGRAM_SIZE] {
+            let batch = video_pacing_batch_datagrams(datagram_size);
+            assert!(batch * datagram_size <= VIDEO_PACING_BATCH_BYTES);
+            assert!((batch + 1) * datagram_size > VIDEO_PACING_BATCH_BYTES);
         }
     }
 

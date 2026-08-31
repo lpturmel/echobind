@@ -35,33 +35,55 @@ On the viewing machine:
 
 The desktop app streams the primary display at native, 720p, or 1080p
 resolution and up to 120 FPS. Windows uses DXGI Desktop Duplication, a
-four-slot asynchronous NVENC pipeline, and GPU scaling. Acquired desktop
-surfaces are copied into an application-owned BGRA ring and converted to NV12
-with the D3D11 video processor. NVENC resource mapping supplies the documented
-D3D11 completion synchronization, avoiding redundant CPU-side GPU query waits.
-NVENC submission stays on a non-blocking producer thread while a dedicated
-output thread waits for events and copies completed bitstreams in submission
-order, keeping up to four frames in flight even when output retrieval stalls
-briefly. A transient `NV_ENC_ERR_ENCODER_BUSY` response is retried only within
-the frame's latency budget instead of tearing down the stream; a genuinely
-stalled session is rebuilt with a bounded retry count. Prepared
-frames older than two target frame intervals are discarded before encoding so
-GPU overload cannot turn into a growing input-latency backlog. macOS uses
-ScreenCaptureKit and a four-frame asynchronous VideoToolbox pipeline for
-hardware encode. `VTCompressionSessionCompleteFrames` is used only for final
-drain rather than serializing every frame. The client uses VideoToolbox NV12
-decode and IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264
-is retained as a reported fallback.
+rate-sized four-to-twelve-slot asynchronous NVENC pipeline, and GPU scaling.
+Capture textures and video-processor views are allocated before pacing and
+stall detection begin. Acquired desktop surfaces are copied into the
+application-owned BGRA ring and converted to NV12 with the D3D11 video
+processor. Automatic video enhancements are disabled for desktop frames.
+NVENC resource mapping supplies the documented D3D11 completion
+synchronization, avoiding redundant GPU query waits and per-frame context
+flushes. NVENC submission stays on a non-blocking producer thread while a
+dedicated output thread waits for events and copies completed bitstreams in
+submission order.
 
-The low-latency path has no B-frame reordering, uses a one-frame NVENC VBV,
-generates IDRs only for startup or recovery, requests UI repaints directly from
-the decoder callback, and bounds every host and decode queue. The UI reports
+Only two frames may remain in the copy/convert/submit stages, while the deeper
+ring retains frames already accepted by NVENC. Prepared and converted frames
+older than two target frame intervals are discarded, queued desktop samples
+are coalesced before conversion, and conversion is limited to one frame of
+work-ahead. GPU overload therefore cannot flood the graphics queue with stale
+full-screen copies or scaler work. A transient `NV_ENC_ERR_ENCODER_BUSY`
+response is retried only within the frame's latency budget instead of tearing
+down the stream; a genuinely stalled session is rebuilt with a bounded retry
+count. Capture waits for an active viewer before creating its duplication
+session and recreates it after reconnect, so a static desktop always supplies a
+bootstrap surface. Every acquired desktop update carries a session-local
+generation through post-NVENC completion; if the final update is discarded
+before the desktop becomes static, the host refreshes the current surface with
+non-fatal bounded backoff. A pending decoder keyframe request or failed video
+send uses the same refresh path when an unchanged desktop has no new bitmap to
+encode. Cursor-only acquisition can provide the initial desktop surface, while
+pointer traffic itself is coalesced off the highest-priority capture thread.
+Device-removal status from D3D11 or NVENC triggers a fresh device/session retry.
+macOS uses ScreenCaptureKit and a four-frame
+asynchronous VideoToolbox pipeline for hardware encode.
+`VTCompressionSessionCompleteFrames` is used only for final drain rather than
+serializing every frame. The client uses VideoToolbox NV12 decode and
+IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264 is retained
+as a reported fallback.
+
+The low-latency path has no B-frame reordering, uses one H.264 slice per picture
+and a one-frame NVENC VBV, generates IDRs only for startup or recovery, requests
+UI repaints directly from the decoder callback, and bounds every host and
+decode queue. The UI reports
 capture, encode, send, reassembly, decode,
-presentation, RTT, jitter, drop, and loss measurements. Encoded datagrams are
-paced in small batches on both hardware backends to avoid burst loss at high
-frame rates. The viewer receives
+presentation, RTT, jitter, drop, loss, and host send-failure measurements.
+Encoded datagrams are paced in byte-bounded batches on both hardware backends
+to avoid burst loss at high frame rates. The viewer receives
 the host's pipeline snapshot once per second and keeps both host and client
-health visible while the remote video is fullscreen. On Windows it also reports
+health visible while the remote video is fullscreen. If those snapshots stop
+for three seconds, the viewer marks the retained server values as stale so an
+exited or stalled host video pipeline cannot continue to look healthy. On
+Windows it also reports
 the DXGI update rate, accumulated desktop frames, timeouts, pacing,
 preprocessing and encoder-slot skips, plus copy, conversion, mapping,
 submission, completion, and bitstream timing. Opus system
@@ -72,7 +94,9 @@ Standard mode uses 1400-byte UDP datagrams to avoid IP fragmentation. The host
 can explicitly enable **Jumbo MTU 9000**; it uses 8192-byte UDP datagrams only
 when the desktop client advertises support. Enable it only when every LAN hop,
 including both network adapters and switches, is configured for a 9000-byte
-MTU.
+MTU. The bitrate control describes encoded video before recovery and network
+overhead; use 80 Mbps or less on a physical 100-Mbps path. A 100-Mbps encoded
+stream requires roughly 108–110 Mbps on the wire at 90–120 FPS.
 
 # Build
 

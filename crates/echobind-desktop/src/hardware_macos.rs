@@ -1,7 +1,7 @@
 use super::{
     ensure_software_capture_available, publish_server_stats, spawn_capture, spawn_encoder,
-    CaptureSlot, DatagramPacer, PendingServerStats, SessionEvent, VideoResolution,
-    VIDEO_PACING_BATCH_DATAGRAMS, VIDEO_SEND_STALE_AGE,
+    video_pacing_batch_datagrams, CaptureSlot, DatagramPacer, PendingServerStats, SessionEvent,
+    VideoResolution, VIDEO_SEND_STALE_AGE,
 };
 use echobind_core::{
     protocol::{Packet, ServerStats, MAX_DATAGRAM_SIZE},
@@ -280,6 +280,7 @@ struct HardwareOutputState {
     encode_us: u64,
     packetize_us: u64,
     send_us: u64,
+    send_failures: u64,
 }
 
 impl HardwareOutputState {
@@ -299,6 +300,7 @@ impl HardwareOutputState {
             encode_us: 0,
             packetize_us: 0,
             send_us: 0,
+            send_failures: 0,
         }
     }
 
@@ -339,13 +341,14 @@ impl HardwareOutputState {
             .saturating_duration_since(self.started)
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
+        let datagram_size = active_datagram_size.load(Ordering::Acquire);
         let packetize_started = Instant::now();
         let fragments = fragment_video_frame_with_datagram_size(
             self.frame_id,
             timestamp_us,
             is_keyframe,
             &annex_b,
-            active_datagram_size.load(Ordering::Acquire),
+            datagram_size,
         )
         .map_err(|error| format!("Hardware frame cannot be packetized: {error}"))?;
         let packetize_us = packetize_started
@@ -355,14 +358,16 @@ impl HardwareOutputState {
 
         let send_started = Instant::now();
         let mut frame_sent = true;
+        let pacing_batch_datagrams = video_pacing_batch_datagrams(datagram_size);
         self.pacer.begin_frame();
         for (fragment_index, fragment) in fragments.into_iter().enumerate() {
-            if fragment_index > 0 && fragment_index % VIDEO_PACING_BATCH_DATAGRAMS == 0 {
+            if fragment_index > 0 && fragment_index % pacing_batch_datagrams == 0 {
                 self.pacer.wait();
             }
             Packet::Video(fragment).encode(&mut self.packet);
             if let Err(error) = socket.send_to(&self.packet, peer) {
                 warn!("Hardware video send to {peer} failed: {error}");
+                self.send_failures = self.send_failures.saturating_add(1);
                 frame_sent = false;
                 force_keyframe.store(true, Ordering::Release);
                 break;
@@ -414,6 +419,7 @@ impl HardwareOutputState {
                 send_ms: super::average_milliseconds(self.send_us, self.frames),
                 encode_queue_ms: super::average_milliseconds(self.packetize_us, self.frames),
                 stale_frames: self.stale_frames,
+                video_send_failures: self.send_failures,
                 ..ServerStats::default()
             },
         );
@@ -426,6 +432,7 @@ impl HardwareOutputState {
         self.encode_us = 0;
         self.packetize_us = 0;
         self.send_us = 0;
+        self.send_failures = 0;
     }
 }
 

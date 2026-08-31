@@ -8,8 +8,10 @@ use std::{
         mpsc, Arc,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
+
+const SERVER_STATS_STALE_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -74,8 +76,15 @@ pub struct EchobindApp {
     convert_wait_ms: f32,
     map_ms: f32,
     submit_ms: f32,
+    submit_api_ms: f32,
+    submit_busy_wait_ms: f32,
+    submit_busy_retries: u64,
     completion_wait_ms: f32,
     bitstream_ms: f32,
+    bitstream_lock_ms: f32,
+    bitstream_copy_ms: f32,
+    bitstream_unlock_ms: f32,
+    unmap_ms: f32,
     dxgi_timeouts: u64,
     dxgi_backlog: u64,
     dxgi_backlog_max: u64,
@@ -85,6 +94,7 @@ pub struct EchobindApp {
     no_free_slot_skips: u64,
     nvenc_submissions: u64,
     nvenc_completions: u64,
+    video_send_failures: u64,
     cursor_only_frames: u64,
     stale_frames: u64,
     reassembly_ms: f32,
@@ -94,6 +104,7 @@ pub struct EchobindApp {
     rtt_ms: f32,
     lost_frames: u64,
     server_stats: Option<ServerStats>,
+    server_stats_received_at: Option<Instant>,
 }
 
 impl EchobindApp {
@@ -169,8 +180,15 @@ impl EchobindApp {
             convert_wait_ms: 0.0,
             map_ms: 0.0,
             submit_ms: 0.0,
+            submit_api_ms: 0.0,
+            submit_busy_wait_ms: 0.0,
+            submit_busy_retries: 0,
             completion_wait_ms: 0.0,
             bitstream_ms: 0.0,
+            bitstream_lock_ms: 0.0,
+            bitstream_copy_ms: 0.0,
+            bitstream_unlock_ms: 0.0,
+            unmap_ms: 0.0,
             dxgi_timeouts: 0,
             dxgi_backlog: 0,
             dxgi_backlog_max: 0,
@@ -180,6 +198,7 @@ impl EchobindApp {
             no_free_slot_skips: 0,
             nvenc_submissions: 0,
             nvenc_completions: 0,
+            video_send_failures: 0,
             cursor_only_frames: 0,
             stale_frames: 0,
             reassembly_ms: 0.0,
@@ -189,6 +208,7 @@ impl EchobindApp {
             rtt_ms: 0.0,
             lost_frames: 0,
             server_stats: None,
+            server_stats_received_at: None,
         }
     }
 
@@ -236,11 +256,13 @@ impl EchobindApp {
                 SessionEvent::ConnectionRejected(reason) => {
                     self.status = format!("Connection rejected: {reason}");
                     self.server_stats = None;
+                    self.server_stats_received_at = None;
                 }
                 SessionEvent::Disconnected(reason) => {
                     self.status = format!("Disconnected: {reason}");
                     self.pending_peer = None;
                     self.server_stats = None;
+                    self.server_stats_received_at = None;
                 }
                 SessionEvent::CaptureReady => {
                     if self.mode == Mode::Host
@@ -278,8 +300,15 @@ impl EchobindApp {
                     self.convert_wait_ms = stats.convert_wait_ms;
                     self.map_ms = stats.map_ms;
                     self.submit_ms = stats.submit_ms;
+                    self.submit_api_ms = stats.submit_api_ms;
+                    self.submit_busy_wait_ms = stats.submit_busy_wait_ms;
+                    self.submit_busy_retries = stats.submit_busy_retries;
                     self.completion_wait_ms = stats.completion_wait_ms;
                     self.bitstream_ms = stats.bitstream_ms;
+                    self.bitstream_lock_ms = stats.bitstream_lock_ms;
+                    self.bitstream_copy_ms = stats.bitstream_copy_ms;
+                    self.bitstream_unlock_ms = stats.bitstream_unlock_ms;
+                    self.unmap_ms = stats.unmap_ms;
                     self.dxgi_timeouts = stats.dxgi_timeouts;
                     self.dxgi_backlog = stats.dxgi_backlog;
                     self.dxgi_backlog_max = stats.dxgi_backlog_max;
@@ -289,11 +318,13 @@ impl EchobindApp {
                     self.no_free_slot_skips = stats.no_free_slot_skips;
                     self.nvenc_submissions = stats.nvenc_submissions;
                     self.nvenc_completions = stats.nvenc_completions;
+                    self.video_send_failures = stats.video_send_failures;
                     self.cursor_only_frames = stats.cursor_only_frames;
                     self.stale_frames = stats.stale_frames;
                 }
                 SessionEvent::ServerStats(stats) => {
                     self.server_stats = Some(stats);
+                    self.server_stats_received_at = Some(Instant::now());
                 }
                 SessionEvent::ClientStats {
                     received_fps,
@@ -455,13 +486,21 @@ impl EchobindApp {
         self.convert_wait_ms = 0.0;
         self.map_ms = 0.0;
         self.submit_ms = 0.0;
+        self.submit_api_ms = 0.0;
+        self.submit_busy_wait_ms = 0.0;
+        self.submit_busy_retries = 0;
         self.completion_wait_ms = 0.0;
         self.bitstream_ms = 0.0;
+        self.bitstream_lock_ms = 0.0;
+        self.bitstream_copy_ms = 0.0;
+        self.bitstream_unlock_ms = 0.0;
+        self.unmap_ms = 0.0;
         self.decode_queue_ms = 0.0;
         self.jitter_ms = 0.0;
         self.rtt_ms = 0.0;
         self.lost_frames = 0;
         self.server_stats = None;
+        self.server_stats_received_at = None;
         self.dxgi_timeouts = 0;
         self.dxgi_backlog = 0;
         self.dxgi_backlog_max = 0;
@@ -471,6 +510,7 @@ impl EchobindApp {
         self.no_free_slot_skips = 0;
         self.nvenc_submissions = 0;
         self.nvenc_completions = 0;
+        self.video_send_failures = 0;
         self.cursor_only_frames = 0;
         self.stale_frames = 0;
         self.transport = "standard MTU".to_owned();
@@ -656,7 +696,16 @@ impl EchobindApp {
                 ui.label("FPS");
                 ui.add(egui::DragValue::new(&mut self.frames_per_second).range(15..=120));
                 ui.label("Mbps");
-                ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=200));
+                ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=200))
+                    .on_hover_text(
+                        "This is encoded-video payload before recovery, UDP/IP, and Ethernet overhead. Use 80 Mbps or less on a physical 100-Mbps path.",
+                    );
+                if self.bitrate_mbps > 85 {
+                    ui.label(egui::RichText::new("fast LAN").small().weak())
+                        .on_hover_text(
+                            "100 Mbps of encoded video needs roughly 108–110 Mbps on the wire at 90–120 FPS. Use a gigabit path or lower this to 80 Mbps.",
+                        );
+                }
                 ui.checkbox(&mut self.jumbo_datagrams, "Jumbo MTU 9000")
                     .on_hover_text(
                         "Only enable when every LAN hop supports a 9000-byte MTU; negotiation falls back to standard MTU for older clients.",
@@ -748,7 +797,14 @@ impl EchobindApp {
             });
         }
 
-        if self.stream_fps > 0.0 || self.stream_mbps > 0.0 {
+        let has_pipeline_stats = self.stream_fps > 0.0
+            || self.stream_mbps > 0.0
+            || self.server_stats.is_some()
+            || self.source_fps > 0.0
+            || self.video_send_failures > 0
+            || self.dxgi_timeouts > 0
+            || self.slot_busy_skips > 0;
+        if has_pipeline_stats {
             ui.add_space(6.0);
             let resolution = if self.stream_width > 0 && self.stream_height > 0 {
                 format!("{}×{}", self.stream_width, self.stream_height)
@@ -775,17 +831,28 @@ impl EchobindApp {
                 ));
                 #[cfg(target_os = "windows")]
                 ui.label(format!(
-                    "stages: copy issue {:.2} ms · convert issue {:.2} ms · sync/map {:.2} ms · submit {:.2} ms · completion {:.2} ms · bitstream {:.2} ms",
+                    "stages: copy issue {:.2} ms · convert issue {:.2} ms · sync/map {:.2} ms · submit {:.2} ms (API {:.2} · busy {:.2} / {} retries)",
                     self.copy_wait_ms,
                     self.convert_wait_ms,
                     self.map_ms,
                     self.submit_ms,
-                    self.completion_wait_ms,
-                    self.bitstream_ms,
+                    self.submit_api_ms,
+                    self.submit_busy_wait_ms,
+                    self.submit_busy_retries,
                 ));
                 #[cfg(target_os = "windows")]
                 ui.label(format!(
-                    "capture: {:.1} DXGI updates/s · NVENC submit/complete {}/{} · {} timeouts · {} accumulated (max {}) · skips pacing {} / preprocess {} / no slot {} / NVENC busy {} / cursor-only {} / stale {}",
+                    "completion: wait {:.2} ms · bitstream {:.2} ms (lock {:.2} · copy {:.2} · unlock {:.2} · unmap {:.2})",
+                    self.completion_wait_ms,
+                    self.bitstream_ms,
+                    self.bitstream_lock_ms,
+                    self.bitstream_copy_ms,
+                    self.bitstream_unlock_ms,
+                    self.unmap_ms,
+                ));
+                #[cfg(target_os = "windows")]
+                ui.label(format!(
+                    "capture: {:.1} DXGI updates/s · NVENC submit/complete {}/{} · {} timeouts · {} accumulated (max {}) · skips pacing {} / preprocess {} / no slot {} / NVENC busy {} / cursor-only {} / stale {} · send failures {}",
                     self.source_fps,
                     self.nvenc_submissions,
                     self.nvenc_completions,
@@ -802,8 +869,14 @@ impl EchobindApp {
                     ),
                     self.cursor_only_frames,
                     self.stale_frames,
+                    self.video_send_failures,
                 ));
             } else {
+                if let Some(age) =
+                    stale_server_stats_age(self.server_stats_received_at, Instant::now())
+                {
+                    show_stale_server_stats_warning(ui, age);
+                }
                 if let Some(server) = self.server_stats {
                     ui.label(format!(
                         "server: {:.1} source updates / {:.1} sent FPS · {:.2} Mbps · capture {:.2} ms · encode {:.2} ms · queue {:.2} ms · send {:.2} ms",
@@ -816,13 +889,25 @@ impl EchobindApp {
                         server.send_ms,
                     ));
                     ui.label(format!(
-                        "server stages: copy issue {:.2} · convert issue {:.2} · sync/map {:.2} · submit {:.2} · completion {:.2} · bitstream {:.2} ms · NVENC submit/complete {}/{} · skips preprocess {} / no slot {} / NVENC busy {}",
+                        "server stages: copy issue {:.2} · convert issue {:.2} · sync/map {:.2} · submit {:.2} ms (API {:.2} · busy {:.2} / {} retries)",
                         server.copy_wait_ms,
                         server.convert_wait_ms,
                         server.map_ms,
                         server.submit_ms,
+                        server.submit_api_ms,
+                        server.submit_busy_wait_ms,
+                        server.submit_busy_retries,
+                    ));
+                    ui.label(format!(
+                        "server completion: wait {:.2} · bitstream {:.2} ms (lock {:.2} · copy {:.2} · unlock {:.2} · unmap {:.2}) · GPU {} / {} · NVENC submit/complete {}/{} · skips preprocess {} / no slot {} / NVENC busy {} · send failures {}",
                         server.completion_wait_ms,
                         server.bitstream_ms,
+                        server.bitstream_lock_ms,
+                        server.bitstream_copy_ms,
+                        server.bitstream_unlock_ms,
+                        server.unmap_ms,
+                        gpu_priority_label(server.gpu_priority_class),
+                        nvenc_slot_label(server.nvenc_buffer_count),
                         server.nvenc_submissions,
                         server.nvenc_completions,
                         server.preprocess_busy_skips,
@@ -832,6 +917,7 @@ impl EchobindApp {
                             server.preprocess_busy_skips,
                             server.no_free_slot_skips,
                         ),
+                        server.video_send_failures,
                     ));
                 }
                 ui.label(format!(
@@ -953,6 +1039,12 @@ impl EchobindApp {
                     .show(ui, |ui| {
                         ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
                         ui.label(egui::RichText::new("ECHOBIND").strong());
+                        if let Some(age) = stale_server_stats_age(
+                            self.server_stats_received_at,
+                            Instant::now(),
+                        ) {
+                            show_stale_server_stats_warning(ui, age);
+                        }
                         if let Some(server) = self.server_stats {
                             ui.label(format!(
                                 "SERVER  {:.1} source  {:.1} sent  {:.1} Mbps",
@@ -966,20 +1058,32 @@ impl EchobindApp {
                                 server.encode_ms,
                             ));
                             ui.label(format!(
-                                "queue {:.2} ms  send {:.2} ms  NVENC {}/{}",
+                                "queue {:.2} ms  send {:.2} ms  GPU {} / {}  NVENC {}/{}",
                                 server.encode_queue_ms,
                                 server.send_ms,
+                                gpu_priority_label(server.gpu_priority_class),
+                                nvenc_slot_label(server.nvenc_buffer_count),
                                 server.nvenc_submissions,
                                 server.nvenc_completions,
                             ));
                             ui.label(format!(
-                                "copy-issue {:.2}  convert-issue {:.2}  sync/map {:.2}  submit {:.2}  complete {:.2}  bits {:.2} ms",
+                                "copy {:.2}  convert {:.2}  map {:.2}  submit {:.2} ms (API {:.2}  busy {:.2}/{}x)",
                                 server.copy_wait_ms,
                                 server.convert_wait_ms,
                                 server.map_ms,
                                 server.submit_ms,
+                                server.submit_api_ms,
+                                server.submit_busy_wait_ms,
+                                server.submit_busy_retries,
+                            ));
+                            ui.label(format!(
+                                "complete {:.2}  bits {:.2} ms (lock {:.2}  copy {:.2}  unlock {:.2}  unmap {:.2})",
                                 server.completion_wait_ms,
                                 server.bitstream_ms,
+                                server.bitstream_lock_ms,
+                                server.bitstream_copy_ms,
+                                server.bitstream_unlock_ms,
+                                server.unmap_ms,
                             ));
                             if [
                                 server.dxgi_timeouts,
@@ -990,12 +1094,13 @@ impl EchobindApp {
                                 server.no_free_slot_skips,
                                 server.cursor_only_frames,
                                 server.stale_frames,
+                                server.video_send_failures,
                             ]
                             .into_iter()
                             .any(|value| value > 0)
                             {
                                 ui.label(format!(
-                                    "DXGI timeout {}  backlog {} (max {})  skips pace/pre/no-slot/NVENC-busy/cursor/stale {}/{}/{}/{}/{}/{}",
+                                    "DXGI timeout {}  backlog {} (max {})  skips pace/pre/no-slot/NVENC-busy/cursor/stale {}/{}/{}/{}/{}/{}  send failures {}",
                                     server.dxgi_timeouts,
                                     server.dxgi_backlog,
                                     server.dxgi_backlog_max,
@@ -1009,6 +1114,7 @@ impl EchobindApp {
                                     ),
                                     server.cursor_only_frames,
                                     server.stale_frames,
+                                    server.video_send_failures,
                                 ));
                             }
                         } else {
@@ -1087,6 +1193,42 @@ fn nvenc_busy_skips(total: u64, preprocess_full: u64, no_free_slot: u64) -> u64 
     total.saturating_sub(preprocess_full.saturating_add(no_free_slot))
 }
 
+fn gpu_priority_label(class: u64) -> &'static str {
+    match class {
+        4 => "high",
+        3 => "above-normal",
+        2 => "normal",
+        _ => "unknown",
+    }
+}
+
+fn nvenc_slot_label(count: u64) -> String {
+    if count == 0 {
+        "unknown slots".to_owned()
+    } else {
+        format!("{count} slots")
+    }
+}
+
+fn stale_server_stats_age(received_at: Option<Instant>, now: Instant) -> Option<Duration> {
+    let age = now.saturating_duration_since(received_at?);
+    (age >= SERVER_STATS_STALE_AFTER).then_some(age)
+}
+
+fn show_stale_server_stats_warning(ui: &mut egui::Ui, age: Duration) {
+    ui.label(
+        egui::RichText::new(format!(
+            "SERVER TELEMETRY STALE ({:.1} s) · values below are not live",
+            age.as_secs_f32(),
+        ))
+        .strong()
+        .color(egui::Color32::YELLOW),
+    )
+    .on_hover_text(
+        "The viewer is still connected, but the host has stopped publishing its once-per-second video-pipeline snapshot. The host pipeline may have exited or stalled.",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,5 +1249,23 @@ mod tests {
     fn isolates_nvenc_busy_skips_from_ring_saturation() {
         assert_eq!(nvenc_busy_skips(17, 5, 3), 9);
         assert_eq!(nvenc_busy_skips(2, 5, 3), 0);
+    }
+
+    #[test]
+    fn server_stats_become_stale_only_after_the_snapshot_deadline() {
+        let now = Instant::now();
+
+        assert_eq!(stale_server_stats_age(None, now), None);
+        assert_eq!(
+            stale_server_stats_age(Some(now - SERVER_STATS_STALE_AFTER), now),
+            Some(SERVER_STATS_STALE_AFTER),
+        );
+        assert_eq!(
+            stale_server_stats_age(
+                Some(now - SERVER_STATS_STALE_AFTER + Duration::from_millis(1)),
+                now,
+            ),
+            None,
+        );
     }
 }

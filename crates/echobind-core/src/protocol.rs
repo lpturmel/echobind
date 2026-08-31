@@ -9,7 +9,8 @@ const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
 const LEGACY_SERVER_STATS_LEN: usize = 9 * size_of::<f32>() + 7 * size_of::<u64>();
 const STAGED_SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 9 * size_of::<u64>();
-const SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 11 * size_of::<u64>();
+const NVENC_COUNTER_SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 11 * size_of::<u64>();
+const SERVER_STATS_LEN: usize = 21 * size_of::<f32>() + 15 * size_of::<u64>();
 pub const VIDEO_RECOVERY_HEADER_LEN: usize = 4;
 
 // The standard mode keeps the complete IPv6 packet below an Ethernet 1500-byte
@@ -104,6 +105,17 @@ pub struct ServerStats {
     pub no_free_slot_skips: u64,
     pub nvenc_submissions: u64,
     pub nvenc_completions: u64,
+    pub submit_api_ms: f32,
+    pub submit_busy_wait_ms: f32,
+    pub submit_busy_retries: u64,
+    pub bitstream_lock_ms: f32,
+    pub bitstream_copy_ms: f32,
+    pub bitstream_unlock_ms: f32,
+    pub unmap_ms: f32,
+    /// Windows D3DKMT process scheduling class (2 normal, 3 above-normal, 4 high).
+    pub gpu_priority_class: u64,
+    pub nvenc_buffer_count: u64,
+    pub video_send_failures: u64,
 }
 
 impl Packet<'_> {
@@ -206,6 +218,20 @@ impl Packet<'_> {
                 ] {
                     out.extend_from_slice(&value.to_be_bytes());
                 }
+                for value in [
+                    stats.submit_api_ms,
+                    stats.submit_busy_wait_ms,
+                    stats.bitstream_lock_ms,
+                    stats.bitstream_copy_ms,
+                    stats.bitstream_unlock_ms,
+                    stats.unmap_ms,
+                ] {
+                    out.extend_from_slice(&value.to_bits().to_be_bytes());
+                }
+                out.extend_from_slice(&stats.submit_busy_retries.to_be_bytes());
+                out.extend_from_slice(&stats.gpu_priority_class.to_be_bytes());
+                out.extend_from_slice(&stats.nvenc_buffer_count.to_be_bytes());
+                out.extend_from_slice(&stats.video_send_failures.to_be_bytes());
             }
             Packet::VideoKeyframeRequest => {
                 Self::encode_packet(Self::VIDEO_KEYFRAME_REQUEST, &[], out);
@@ -289,6 +315,7 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
 fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
     if payload.len() != LEGACY_SERVER_STATS_LEN
         && payload.len() != STAGED_SERVER_STATS_LEN
+        && payload.len() != NVENC_COUNTER_SERVER_STATS_LEN
         && payload.len() != SERVER_STATS_LEN
     {
         return Err(PacketParseError::Invalid);
@@ -336,6 +363,16 @@ fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
         no_free_slot_skips: 0,
         nvenc_submissions: 0,
         nvenc_completions: 0,
+        submit_api_ms: 0.0,
+        submit_busy_wait_ms: 0.0,
+        submit_busy_retries: 0,
+        bitstream_lock_ms: 0.0,
+        bitstream_copy_ms: 0.0,
+        bitstream_unlock_ms: 0.0,
+        unmap_ms: 0.0,
+        gpu_priority_class: 0,
+        nvenc_buffer_count: 0,
+        video_send_failures: 0,
     };
     let stats = if payload.len() >= STAGED_SERVER_STATS_LEN {
         ServerStats {
@@ -352,10 +389,27 @@ fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
     } else {
         stats
     };
-    let stats = if payload.len() == SERVER_STATS_LEN {
+    let stats = if payload.len() >= NVENC_COUNTER_SERVER_STATS_LEN {
         ServerStats {
             nvenc_submissions: u64_at(132)?,
             nvenc_completions: u64_at(140)?,
+            ..stats
+        }
+    } else {
+        stats
+    };
+    let stats = if payload.len() == SERVER_STATS_LEN {
+        ServerStats {
+            submit_api_ms: f32_at(148)?,
+            submit_busy_wait_ms: f32_at(152)?,
+            bitstream_lock_ms: f32_at(156)?,
+            bitstream_copy_ms: f32_at(160)?,
+            bitstream_unlock_ms: f32_at(164)?,
+            unmap_ms: f32_at(168)?,
+            submit_busy_retries: u64_at(172)?,
+            gpu_priority_class: u64_at(180)?,
+            nvenc_buffer_count: u64_at(188)?,
+            video_send_failures: u64_at(196)?,
             ..stats
         }
     } else {
@@ -377,6 +431,12 @@ fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
         stats.submit_ms,
         stats.completion_wait_ms,
         stats.bitstream_ms,
+        stats.submit_api_ms,
+        stats.submit_busy_wait_ms,
+        stats.bitstream_lock_ms,
+        stats.bitstream_copy_ms,
+        stats.bitstream_unlock_ms,
+        stats.unmap_ms,
     ]
     .into_iter()
     .any(|value| !value.is_finite())
@@ -695,6 +755,16 @@ mod tests {
             no_free_slot_skips: 10,
             nvenc_submissions: 11,
             nvenc_completions: 12,
+            submit_api_ms: 1.0,
+            submit_busy_wait_ms: 1.1,
+            submit_busy_retries: 13,
+            bitstream_lock_ms: 1.2,
+            bitstream_copy_ms: 1.3,
+            bitstream_unlock_ms: 1.4,
+            unmap_ms: 1.5,
+            gpu_priority_class: 4,
+            nvenc_buffer_count: 12,
+            video_send_failures: 14,
         };
         let encoded = round_trip(Packet::ServerStats(stats));
         assert_eq!(
@@ -723,6 +793,11 @@ mod tests {
         assert_eq!(parsed.copy_wait_ms, 0.0);
         assert_eq!(parsed.preprocess_busy_skips, 0);
         assert_eq!(parsed.nvenc_submissions, 0);
+        assert_eq!(parsed.submit_api_ms, 0.0);
+        assert_eq!(parsed.submit_busy_retries, 0);
+        assert_eq!(parsed.gpu_priority_class, 0);
+        assert_eq!(parsed.nvenc_buffer_count, 0);
+        assert_eq!(parsed.video_send_failures, 0);
     }
 
     #[test]
@@ -746,12 +821,65 @@ mod tests {
         assert_eq!(parsed.preprocess_busy_skips, stats.preprocess_busy_skips);
         assert_eq!(parsed.nvenc_submissions, 0);
         assert_eq!(parsed.nvenc_completions, 0);
+        assert_eq!(parsed.submit_api_ms, 0.0);
+        assert_eq!(parsed.submit_busy_retries, 0);
+        assert_eq!(parsed.gpu_priority_class, 0);
+        assert_eq!(parsed.nvenc_buffer_count, 0);
+        assert_eq!(parsed.video_send_failures, 0);
+    }
+
+    #[test]
+    fn parses_nvenc_counter_server_stats_without_timing_breakdown() {
+        let stats = ServerStats {
+            fps: 60.0,
+            nvenc_submissions: 20,
+            nvenc_completions: 19,
+            submit_api_ms: 2.0,
+            submit_busy_wait_ms: 3.0,
+            submit_busy_retries: 21,
+            bitstream_lock_ms: 4.0,
+            bitstream_copy_ms: 5.0,
+            bitstream_unlock_ms: 6.0,
+            unmap_ms: 7.0,
+            ..ServerStats::default()
+        };
+        let mut encoded = Vec::new();
+        Packet::ServerStats(stats).encode(&mut encoded);
+        encoded.truncate(HEADER_LEN + NVENC_COUNTER_SERVER_STATS_LEN);
+        let Packet::ServerStats(parsed) = Packet::try_from(encoded.as_slice()).unwrap() else {
+            panic!("NVENC counter server stats changed packet type");
+        };
+        assert_eq!(parsed.fps, stats.fps);
+        assert_eq!(parsed.nvenc_submissions, stats.nvenc_submissions);
+        assert_eq!(parsed.nvenc_completions, stats.nvenc_completions);
+        assert_eq!(parsed.submit_api_ms, 0.0);
+        assert_eq!(parsed.submit_busy_wait_ms, 0.0);
+        assert_eq!(parsed.submit_busy_retries, 0);
+        assert_eq!(parsed.bitstream_lock_ms, 0.0);
+        assert_eq!(parsed.bitstream_copy_ms, 0.0);
+        assert_eq!(parsed.bitstream_unlock_ms, 0.0);
+        assert_eq!(parsed.unmap_ms, 0.0);
+        assert_eq!(parsed.gpu_priority_class, 0);
+        assert_eq!(parsed.nvenc_buffer_count, 0);
+        assert_eq!(parsed.video_send_failures, 0);
     }
 
     #[test]
     fn rejects_non_finite_server_stats() {
         let encoded = round_trip(Packet::ServerStats(ServerStats {
             fps: f32::NAN,
+            ..ServerStats::default()
+        }));
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Err(PacketParseError::Invalid)
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_nvenc_timing_breakdown() {
+        let encoded = round_trip(Packet::ServerStats(ServerStats {
+            submit_busy_wait_ms: f32::INFINITY,
             ..ServerStats::default()
         }));
         assert_eq!(
