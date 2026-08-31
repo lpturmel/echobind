@@ -106,6 +106,13 @@ const NVENC_COMPLETION_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 // extra margin covers the worker's bounded polling and channel handoff.
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(2_250);
 const DXGI_CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+// AcquireNextFrame participates in D3D11's multithread protection. Waiting in
+// that call can retain the device's unfair internal lock for the entire
+// timeout and starve conversion/NVENC workers even while the GPU is idle.
+// Poll without blocking, then yield outside D3D11 when no desktop frame is
+// ready. A 1 ms poll interval remains comfortably below a 120 Hz frame period.
+const DXGI_ACQUIRE_TIMEOUT_MS: u32 = 0;
+const DXGI_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const ACTIVE_ENCODE_STALL_WARNING: Duration = Duration::from_millis(250);
 const ACTIVE_ENCODE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const NVENC_SUSTAINED_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -874,6 +881,7 @@ fn run_dxgi_capture_session(
     // lag in warnings.
     let mut required_progress_at = Some(active_since);
     let mut encode_stall_reported = false;
+    let capture_poll_sleeper = PreciseSleeper::new();
 
     while running.load(Ordering::Relaxed) {
         // Do not consume the duplication object's current desktop image while
@@ -889,6 +897,12 @@ fn run_dxgi_capture_session(
         }
         match acquire_dxgi_frame(&duplication, &mut capture) {
             Ok(acquired) => {
+                if !acquired {
+                    // Sleep only after AcquireNextFrame has returned so the
+                    // protected D3D11 device is available to the conversion,
+                    // submission, and completion threads while we wait.
+                    capture_poll_sleeper.sleep(DXGI_IDLE_POLL_INTERVAL);
+                }
                 let now = Instant::now();
                 // AcquireNextFrame timeouts are the normal steady state for a
                 // static desktop. Retry a coalesced cursor position here so a
@@ -1410,7 +1424,8 @@ fn acquire_dxgi_frame(
     }
     let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
     let mut resource: Option<IDXGIResource> = None;
-    match unsafe { duplication.AcquireNextFrame(8, &mut info, &mut resource) } {
+    match unsafe { duplication.AcquireNextFrame(DXGI_ACQUIRE_TIMEOUT_MS, &mut info, &mut resource) }
+    {
         Ok(()) => {}
         Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
             capture
