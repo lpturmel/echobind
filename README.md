@@ -42,10 +42,14 @@ D3D11 completion synchronization, avoiding redundant CPU-side GPU query waits.
 NVENC submission stays on a non-blocking producer thread while a dedicated
 output thread waits for events and copies completed bitstreams in submission
 order, keeping up to four frames in flight even when output retrieval stalls
-briefly. A stalled session is rebuilt with a bounded retry count. Prepared
+briefly. A transient `NV_ENC_ERR_ENCODER_BUSY` response is retried only within
+the frame's latency budget instead of tearing down the stream; a genuinely
+stalled session is rebuilt with a bounded retry count. Prepared
 frames older than two target frame intervals are discarded before encoding so
 GPU overload cannot turn into a growing input-latency backlog. macOS uses
-ScreenCaptureKit and VideoToolbox for hardware encode, then VideoToolbox NV12
+ScreenCaptureKit and a four-frame asynchronous VideoToolbox pipeline for
+hardware encode. `VTCompressionSessionCompleteFrames` is used only for final
+drain rather than serializing every frame. The client uses VideoToolbox NV12
 decode and IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264
 is retained as a reported fallback.
 
@@ -53,7 +57,9 @@ The low-latency path has no B-frame reordering, uses a one-frame NVENC VBV,
 generates IDRs only for startup or recovery, requests UI repaints directly from
 the decoder callback, and bounds every host and decode queue. The UI reports
 capture, encode, send, reassembly, decode,
-presentation, RTT, jitter, drop, and loss measurements. The viewer receives
+presentation, RTT, jitter, drop, and loss measurements. Encoded datagrams are
+paced in small batches on both hardware backends to avoid burst loss at high
+frame rates. The viewer receives
 the host's pipeline snapshot once per second and keeps both host and client
 health visible while the remote video is fullscreen. On Windows it also reports
 the DXGI update rate, accumulated desktop frames, timeouts, pacing,

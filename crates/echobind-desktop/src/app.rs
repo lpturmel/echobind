@@ -785,7 +785,7 @@ impl EchobindApp {
                 ));
                 #[cfg(target_os = "windows")]
                 ui.label(format!(
-                    "capture: {:.1} DXGI updates/s · NVENC submit/complete {}/{} · {} timeouts · {} accumulated (max {}) · skips pacing {} / preprocess {} / no slot {} / cursor-only {} / stale {}",
+                    "capture: {:.1} DXGI updates/s · NVENC submit/complete {}/{} · {} timeouts · {} accumulated (max {}) · skips pacing {} / preprocess {} / no slot {} / NVENC busy {} / cursor-only {} / stale {}",
                     self.source_fps,
                     self.nvenc_submissions,
                     self.nvenc_completions,
@@ -795,6 +795,11 @@ impl EchobindApp {
                     self.pacing_skips,
                     self.preprocess_busy_skips,
                     self.no_free_slot_skips,
+                    nvenc_busy_skips(
+                        self.slot_busy_skips,
+                        self.preprocess_busy_skips,
+                        self.no_free_slot_skips,
+                    ),
                     self.cursor_only_frames,
                     self.stale_frames,
                 ));
@@ -811,7 +816,7 @@ impl EchobindApp {
                         server.send_ms,
                     ));
                     ui.label(format!(
-                        "server stages: copy issue {:.2} · convert issue {:.2} · sync/map {:.2} · submit {:.2} · completion {:.2} · bitstream {:.2} ms · NVENC submit/complete {}/{} · skips preprocess {} / no slot {}",
+                        "server stages: copy issue {:.2} · convert issue {:.2} · sync/map {:.2} · submit {:.2} · completion {:.2} · bitstream {:.2} ms · NVENC submit/complete {}/{} · skips preprocess {} / no slot {} / NVENC busy {}",
                         server.copy_wait_ms,
                         server.convert_wait_ms,
                         server.map_ms,
@@ -822,6 +827,11 @@ impl EchobindApp {
                         server.nvenc_completions,
                         server.preprocess_busy_skips,
                         server.no_free_slot_skips,
+                        nvenc_busy_skips(
+                            server.slot_busy_skips,
+                            server.preprocess_busy_skips,
+                            server.no_free_slot_skips,
+                        ),
                     ));
                 }
                 ui.label(format!(
@@ -985,13 +995,18 @@ impl EchobindApp {
                             .any(|value| value > 0)
                             {
                                 ui.label(format!(
-                                    "DXGI timeout {}  backlog {} (max {})  skips pace/pre/no-slot/cursor/stale {}/{}/{}/{}/{}",
+                                    "DXGI timeout {}  backlog {} (max {})  skips pace/pre/no-slot/NVENC-busy/cursor/stale {}/{}/{}/{}/{}/{}",
                                     server.dxgi_timeouts,
                                     server.dxgi_backlog,
                                     server.dxgi_backlog_max,
                                     server.pacing_skips,
                                     server.preprocess_busy_skips,
                                     server.no_free_slot_skips,
+                                    nvenc_busy_skips(
+                                        server.slot_busy_skips,
+                                        server.preprocess_busy_skips,
+                                        server.no_free_slot_skips,
+                                    ),
                                     server.cursor_only_frames,
                                     server.stale_frames,
                                 ));
@@ -1068,6 +1083,10 @@ fn parse_address(ip: &str, port: u16) -> Result<SocketAddr, String> {
     Ok(SocketAddr::new(ip, port))
 }
 
+fn nvenc_busy_skips(total: u64, preprocess_full: u64, no_free_slot: u64) -> u64 {
+    total.saturating_sub(preprocess_full.saturating_add(no_free_slot))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,5 +1101,11 @@ mod tests {
             parse_address("::1", 3013).unwrap(),
             "[::1]:3013".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn isolates_nvenc_busy_skips_from_ring_saturation() {
+        assert_eq!(nvenc_busy_skips(17, 5, 3), 9);
+        assert_eq!(nvenc_busy_skips(2, 5, 3), 0);
     }
 }

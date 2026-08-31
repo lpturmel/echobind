@@ -33,6 +33,19 @@ use std::{
 };
 use tracing::{debug, warn};
 
+#[cfg(target_os = "windows")]
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
+        System::Threading::{
+            CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, SYNCHRONIZATION_SYNCHRONIZE,
+            TIMER_MODIFY_STATE,
+        },
+    },
+};
+
 #[path = "audio.rs"]
 mod audio;
 
@@ -52,6 +65,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_GRACE: Duration = Duration::from_secs(30);
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
+const VIDEO_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(5);
 const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(100);
 const VIDEO_DECODE_QUEUE_CAPACITY: usize = 2;
 const VIDEO_REORDER_WINDOW: usize = 2;
@@ -61,6 +75,148 @@ const CLIENT_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const HOST_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const HELLO_INTERVAL: Duration = Duration::from_millis(400);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const VIDEO_PACING_RATE_MULTIPLIER: u64 = 4;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(super) const VIDEO_PACING_BATCH_DATAGRAMS: usize = 16;
+#[cfg(target_os = "macos")]
+const VIDEO_PACING_SLEEP_GUARD: Duration = Duration::from_micros(500);
+#[cfg(target_os = "windows")]
+const VIDEO_PACING_SLEEP_GUARD: Duration = Duration::from_millis(2);
+#[cfg(target_os = "windows")]
+const VIDEO_PACING_TIMER_SPIN_GUARD: Duration = Duration::from_micros(50);
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(super) struct DatagramPacer {
+    bits_per_second: u64,
+    next_batch_at: Instant,
+    #[cfg(target_os = "windows")]
+    waiter: PreciseSleeper,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl DatagramPacer {
+    pub(super) fn new(bits_per_second: u32) -> Self {
+        Self {
+            // Smooth a frame over roughly one quarter of its configured frame
+            // budget. This avoids UDP microbursts without adding a full frame
+            // of transport latency.
+            bits_per_second: u64::from(bits_per_second.max(1))
+                .saturating_mul(VIDEO_PACING_RATE_MULTIPLIER),
+            next_batch_at: Instant::now(),
+            #[cfg(target_os = "windows")]
+            waiter: PreciseSleeper::new(),
+        }
+    }
+
+    pub(super) fn begin_frame(&mut self) {
+        let now = Instant::now();
+        if self.next_batch_at < now {
+            self.next_batch_at = now;
+        }
+    }
+
+    pub(super) fn account(&mut self, bytes: usize) {
+        let transmission_nanos = (bytes as u128)
+            .saturating_mul(8)
+            .saturating_mul(1_000_000_000)
+            / u128::from(self.bits_per_second);
+        self.next_batch_at +=
+            Duration::from_nanos(transmission_nanos.min(u128::from(u64::MAX)) as u64);
+    }
+
+    pub(super) fn wait(&self) {
+        #[cfg(target_os = "windows")]
+        self.waiter.wait_until(self.next_batch_at);
+
+        #[cfg(target_os = "macos")]
+        loop {
+            let Some(remaining) = self.next_batch_at.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            if remaining > VIDEO_PACING_SLEEP_GUARD {
+                thread::sleep(remaining - VIDEO_PACING_SLEEP_GUARD);
+            } else {
+                while Instant::now() < self.next_batch_at {
+                    std::hint::spin_loop();
+                }
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(super) struct PreciseSleeper {
+    timer: Option<HANDLE>,
+    spin_guard: Duration,
+}
+
+#[cfg(target_os = "windows")]
+impl PreciseSleeper {
+    pub(super) fn new() -> Self {
+        let access = TIMER_MODIFY_STATE.0 | SYNCHRONIZATION_SYNCHRONIZE.0;
+        let high_resolution = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                access,
+            )
+        };
+        let (timer, spin_guard) = match high_resolution {
+            Ok(timer) => (Some(timer), VIDEO_PACING_TIMER_SPIN_GUARD),
+            Err(_) => (
+                unsafe { CreateWaitableTimerExW(None, PCWSTR::null(), 0, access).ok() },
+                VIDEO_PACING_SLEEP_GUARD,
+            ),
+        };
+        Self { timer, spin_guard }
+    }
+
+    pub(super) fn sleep(&self, duration: Duration) {
+        self.wait_until(Instant::now() + duration);
+    }
+
+    fn wait_until(&self, deadline: Instant) {
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            if let Some(timer) = self.timer {
+                if remaining > self.spin_guard {
+                    let timer_wait = remaining - self.spin_guard;
+                    let ticks = timer_wait.as_nanos().div_ceil(100).min(i64::MAX as u128) as i64;
+                    let due_time = -ticks.max(1);
+                    let armed =
+                        unsafe { SetWaitableTimer(timer, &due_time, 0, None, None, false).is_ok() };
+                    if armed && unsafe { WaitForSingleObject(timer, INFINITE) } == WAIT_OBJECT_0 {
+                        continue;
+                    }
+                }
+            } else if remaining > VIDEO_PACING_SLEEP_GUARD {
+                thread::sleep(remaining - VIDEO_PACING_SLEEP_GUARD);
+                continue;
+            }
+
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            return;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PreciseSleeper {
+    fn drop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            unsafe {
+                let _ = CloseHandle(timer);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoResolution {
@@ -331,6 +487,12 @@ impl DesktopSession {
         socket
             .set_read_timeout(Some(SOCKET_TIMEOUT))
             .map_err(|error| format!("Unable to configure server socket: {error}"))?;
+        // Video, audio, and control share this socket. A full kernel send
+        // buffer must drop a frame promptly instead of freezing the sender,
+        // filling the NVENC ring, and being misdiagnosed as an encoder stall.
+        socket
+            .set_write_timeout(Some(VIDEO_SOCKET_WRITE_TIMEOUT))
+            .map_err(|error| format!("Unable to bound server socket writes: {error}"))?;
         let local_addr = socket
             .local_addr()
             .map_err(|error| format!("Unable to read server address: {error}"))?;
