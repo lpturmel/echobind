@@ -175,6 +175,7 @@ struct CaptureFlags {
     nvenc_activity: Arc<Mutex<NvencActivityState>>,
     hardware_progress: Arc<AtomicU64>,
     next_frame_id: Arc<AtomicU64>,
+    idr_in_flight: Arc<IdrInFlight>,
     stream_started: Instant,
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
@@ -249,6 +250,83 @@ struct WindowsCaptureMetrics {
     process_gpu_priority: AtomicU64,
     nvenc_buffer_count: AtomicU64,
     video_send_failures: AtomicU64,
+    idr_requests_covered: AtomicU64,
+}
+
+/// The forced IDR that NVENC has accepted but the sender has not finished
+/// with. Frames reach the sender in submission order, so every IDR request
+/// raised before that frame is handled (a viewer loss report, a send failure,
+/// a discarded P-frame, a new peer or the stall watchdog) concerns an earlier
+/// frame and is resolved by it. Forcing another IDR for such a request only
+/// adds a second large, low-quality frame to the recovery.
+struct IdrInFlight {
+    frame_id: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdrDecision {
+    NotRequested,
+    Force,
+    CoveredByInFlight,
+}
+
+impl IdrInFlight {
+    const NONE: u64 = u64::MAX;
+
+    fn new() -> Self {
+        Self {
+            frame_id: AtomicU64::new(Self::NONE),
+        }
+    }
+
+    fn clear(&self) {
+        self.frame_id.store(Self::NONE, Ordering::Release);
+    }
+
+    fn is_pending(&self) -> bool {
+        self.frame_id.load(Ordering::Acquire) != Self::NONE
+    }
+
+    /// Called by the submission thread before the frame is handed to the
+    /// completion worker, so the sender can never observe it first.
+    fn record_submitted(&self, frame_id: u64) {
+        self.frame_id.store(frame_id, Ordering::Release);
+    }
+
+    /// Called by the sender once it has sent or discarded a frame. A later
+    /// frame also clears the gate: the IDR was then lost in a session
+    /// teardown and can no longer satisfy anyone.
+    fn record_handled(&self, frame_id: u64) {
+        let pending = self.frame_id.load(Ordering::Acquire);
+        if pending != Self::NONE && frame_id >= pending {
+            let _ = self.frame_id.compare_exchange(
+                pending,
+                Self::NONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+fn take_idr_request(force_keyframe: &AtomicBool, idr_in_flight: &IdrInFlight) -> IdrDecision {
+    if !force_keyframe.swap(false, Ordering::AcqRel) {
+        IdrDecision::NotRequested
+    } else if idr_in_flight.is_pending() {
+        IdrDecision::CoveredByInFlight
+    } else {
+        IdrDecision::Force
+    }
+}
+
+/// The sender's recovery request. While an IDR is still on its way to the
+/// sender it will repair this loss too; re-arming the shared flag for each
+/// discarded P-frame would otherwise survive until just after that IDR is
+/// sent and force a second one.
+fn request_recovery_idr(force_keyframe: &AtomicBool, idr_in_flight: &IdrInFlight) {
+    if !idr_in_flight.is_pending() {
+        force_keyframe.store(true, Ordering::Release);
+    }
 }
 
 struct HardwareCapture {
@@ -613,6 +691,7 @@ fn run_dxgi_pipeline(
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
     let (cursor_tx, cursor_rx) = mpsc::sync_channel(1);
     let metrics = Arc::new(WindowsCaptureMetrics::default());
+    let idr_in_flight = Arc::new(IdrInFlight::new());
     let sender_running = Arc::new(AtomicBool::new(true));
     let sender_handle = spawn_hardware_sender(
         socket.clone(),
@@ -621,6 +700,7 @@ fn run_dxgi_pipeline(
         active_peer.clone(),
         peer_epoch.clone(),
         force_keyframe.clone(),
+        idr_in_flight.clone(),
         events.clone(),
         encoded_rx,
         cursor_rx,
@@ -665,6 +745,7 @@ fn run_dxgi_pipeline(
             metrics.clone(),
             hardware_progress.clone(),
             next_frame_id.clone(),
+            idr_in_flight.clone(),
             stream_started,
         );
         if hardware_progress.load(Ordering::Acquire) > progress_before {
@@ -813,6 +894,7 @@ fn run_dxgi_capture_session(
     metrics: Arc<WindowsCaptureMetrics>,
     hardware_progress: Arc<AtomicU64>,
     next_frame_id: Arc<AtomicU64>,
+    idr_in_flight: Arc<IdrInFlight>,
     stream_started: Instant,
 ) -> Result<(), DxgiCaptureFailure> {
     let session_peer = active_peer
@@ -866,6 +948,7 @@ fn run_dxgi_capture_session(
             nvenc_activity,
             hardware_progress: hardware_progress.clone(),
             next_frame_id,
+            idr_in_flight,
             stream_started,
             events: events.clone(),
             frames_per_second,
@@ -1613,6 +1696,9 @@ impl HardwareCapture {
             .metrics
             .nvenc_buffer_count
             .store(buffer_count as u64, Ordering::Release);
+        // An IDR accepted by the previous session may have been dropped in its
+        // teardown. This session's first frame must be free to force one.
+        flags.idr_in_flight.clear();
         // Feed NVENC NV12 rather than RGB. RGB input is supported, but the
         // driver performs additional preprocessing before the dedicated
         // encoder. On Ampere at ultrawide resolutions that work serialized
@@ -1716,6 +1802,7 @@ impl HardwareCapture {
             flags.nvenc_activity.clone(),
             worker_failure.clone(),
             flags.next_frame_id.clone(),
+            flags.idr_in_flight.clone(),
             flags.frames_per_second,
             conversion_permit_tx,
             submission_done_tx,
@@ -2191,6 +2278,7 @@ fn spawn_nvenc_submission(
     nvenc_activity: Arc<Mutex<NvencActivityState>>,
     worker_failure: Arc<Mutex<Option<String>>>,
     next_frame_id: Arc<AtomicU64>,
+    idr_in_flight: Arc<IdrInFlight>,
     frames_per_second: u32,
     conversion_permits: mpsc::SyncSender<()>,
     submission_done: mpsc::Sender<()>,
@@ -2254,6 +2342,7 @@ fn spawn_nvenc_submission(
                 &encoder,
                 converted,
                 &force_keyframe,
+                &idr_in_flight,
                 &metrics,
                 &next_frame_id,
                 &busy_sleeper,
@@ -2503,11 +2592,16 @@ fn submit_converted_frame(
     encoder: &NvencEncoder,
     converted: ConvertedHardwareFrame,
     force_keyframe: &AtomicBool,
+    idr_in_flight: &IdrInFlight,
     metrics: &WindowsCaptureMetrics,
     next_frame_id: &AtomicU64,
     busy_sleeper: &PreciseSleeper,
 ) -> Result<Option<PendingNvencFrame>, String> {
-    let force_idr = force_keyframe.swap(false, Ordering::Relaxed);
+    let idr_decision = take_idr_request(force_keyframe, idr_in_flight);
+    if idr_decision == IdrDecision::CoveredByInFlight {
+        metrics.idr_requests_covered.fetch_add(1, Ordering::Relaxed);
+    }
+    let force_idr = idr_decision == IdrDecision::Force;
     let capture_us = elapsed_microseconds(converted.captured_at);
     let submit_result = match encoder.submit(
         converted.slot,
@@ -2539,6 +2633,9 @@ fn submit_converted_frame(
     let encode_started = Instant::now();
     metrics.nvenc_submissions.fetch_add(1, Ordering::Relaxed);
     let frame_id = allocate_submitted_frame_id(next_frame_id);
+    if force_idr {
+        idr_in_flight.record_submitted(frame_id);
+    }
 
     Ok(Some(PendingNvencFrame {
         slot: converted.slot,
@@ -2568,6 +2665,7 @@ fn spawn_hardware_sender(
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     peer_epoch: Arc<AtomicU64>,
     force_keyframe: Arc<AtomicBool>,
+    idr_in_flight: Arc<IdrInFlight>,
     events: mpsc::Sender<SessionEvent>,
     encoded_frames: mpsc::Receiver<EncodedHardwareFrame>,
     cursor_updates: mpsc::Receiver<CursorPosition>,
@@ -2586,8 +2684,14 @@ fn spawn_hardware_sender(
         let mut waiting_for_keyframe = true;
         let mut sender_peer = None::<SocketAddr>;
         let mut sender_peer_epoch = u64::MAX;
+        let mut handled_frame_id = None::<u64>;
 
         while running.load(Ordering::Relaxed) && pipeline_running.load(Ordering::Acquire) {
+            // Every path below ends the previous frame's iteration, including
+            // its sends, so this is where it counts as handled.
+            if let Some(frame_id) = handled_frame_id.take() {
+                idr_in_flight.record_handled(frame_id);
+            }
             send_pending_cursor(&socket, &active_peer, &cursor_updates, &mut cursor_packet);
             let frame = match encoded_frames.recv_timeout(Duration::from_millis(20)) {
                 Ok(frame) => frame,
@@ -2597,6 +2701,7 @@ fn spawn_hardware_sender(
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            handled_frame_id = Some(frame.frame_id);
             let encode_queue_elapsed = frame.encoded_at.elapsed();
             let peer = *active_peer.lock().unwrap();
             let current_peer_epoch = peer_epoch.load(Ordering::Acquire);
@@ -2609,13 +2714,13 @@ fn spawn_hardware_sender(
                 // is an IDR. Do not leave a redundant static-surface refresh
                 // armed after successfully sending that keyframe.
                 if !frame.is_keyframe {
-                    force_keyframe.store(true, Ordering::Release);
+                    request_recovery_idr(&force_keyframe, &idr_in_flight);
                 }
             }
             if last_sent_frame.is_some_and(|last| frame.frame_id != last.wrapping_add(1)) {
                 waiting_for_keyframe = true;
                 if !frame.is_keyframe {
-                    force_keyframe.store(true, Ordering::Release);
+                    request_recovery_idr(&force_keyframe, &idr_in_flight);
                 }
             }
             // Once NVENC has accepted a frame it participates in the H.264
@@ -2625,7 +2730,7 @@ fn spawn_hardware_sender(
             // age checks and newest-frame coalescing prevent the adaptive ring
             // from turning GPU pressure into an unbounded capture queue.
             if waiting_for_keyframe && !frame.is_keyframe {
-                force_keyframe.store(true, Ordering::Release);
+                request_recovery_idr(&force_keyframe, &idr_in_flight);
                 continue;
             }
             if frame.is_keyframe {
@@ -2651,7 +2756,7 @@ fn spawn_hardware_sender(
                     )));
                     waiting_for_keyframe = true;
                     last_sent_frame = None;
-                    force_keyframe.store(true, Ordering::Release);
+                    request_recovery_idr(&force_keyframe, &idr_in_flight);
                     continue;
                 }
             };
@@ -2669,7 +2774,7 @@ fn spawn_hardware_sender(
                     warn!("Video send to {peer} failed: {error}");
                     metrics.video_send_failures.fetch_add(1, Ordering::Relaxed);
                     frame_sent = false;
-                    force_keyframe.store(true, Ordering::Release);
+                    request_recovery_idr(&force_keyframe, &idr_in_flight);
                     break;
                 }
                 pacer.account(packet.len());
@@ -2825,7 +2930,8 @@ fn report_sender_stats(
     }
     let seconds = elapsed.as_secs_f32();
     let source_frames = metrics.source_frames.swap(0, Ordering::Relaxed);
-    if stats.keyframes > 0 {
+    let idr_requests_covered = metrics.idr_requests_covered.swap(0, Ordering::Relaxed);
+    if stats.keyframes > 0 || idr_requests_covered > 0 {
         // After startup every IDR is a recovery. Each one is coded inside the
         // one-frame VBV and visibly resets picture quality, so a steady stream
         // of these lines identifies a recovery storm rather than an encoder or
@@ -2833,7 +2939,7 @@ fn report_sender_stats(
         let delta_frames = stats.frames.saturating_sub(stats.keyframes);
         let delta_bytes = stats.encoded_bytes.saturating_sub(stats.keyframe_bytes);
         info!(
-            "Windows host sent {} IDR frame(s) in {seconds:.1} s: IDR avg {:.1} KB, P-frame avg {:.1} KB",
+            "Windows host sent {} IDR frame(s) in {seconds:.1} s: IDR avg {:.1} KB, P-frame avg {:.1} KB; {idr_requests_covered} IDR request(s) covered by an IDR already in flight",
             stats.keyframes,
             average_kilobytes(stats.keyframe_bytes, stats.keyframes),
             average_kilobytes(delta_bytes, delta_frames),
@@ -4091,6 +4197,104 @@ mod tests {
         force_keyframe.store(false, Ordering::Release);
         restore_force_keyframe_request(&force_keyframe, false);
         assert!(!force_keyframe.load(Ordering::Acquire));
+    }
+
+    fn submit_for_test(
+        frame_id: u64,
+        force_keyframe: &AtomicBool,
+        idr_in_flight: &IdrInFlight,
+        forced: &mut Vec<u64>,
+    ) {
+        if take_idr_request(force_keyframe, idr_in_flight) == IdrDecision::Force {
+            idr_in_flight.record_submitted(frame_id);
+            forced.push(frame_id);
+        }
+    }
+
+    #[test]
+    fn idr_requests_raised_while_an_idr_is_in_flight_are_covered_by_it() {
+        let force_keyframe = AtomicBool::new(true);
+        let idr_in_flight = IdrInFlight::new();
+
+        assert_eq!(
+            take_idr_request(&force_keyframe, &idr_in_flight),
+            IdrDecision::Force
+        );
+        idr_in_flight.record_submitted(10);
+        force_keyframe.store(true, Ordering::Release);
+
+        assert_eq!(
+            take_idr_request(&force_keyframe, &idr_in_flight),
+            IdrDecision::CoveredByInFlight
+        );
+        assert!(!force_keyframe.load(Ordering::Acquire));
+        assert_eq!(
+            take_idr_request(&force_keyframe, &idr_in_flight),
+            IdrDecision::NotRequested
+        );
+    }
+
+    #[test]
+    fn only_the_in_flight_idr_or_a_later_frame_reopens_idr_requests() {
+        let idr_in_flight = IdrInFlight::new();
+        idr_in_flight.record_submitted(10);
+        idr_in_flight.record_handled(9);
+        assert!(idr_in_flight.is_pending());
+        idr_in_flight.record_handled(10);
+        assert!(!idr_in_flight.is_pending());
+
+        // An IDR lost in a session teardown never reaches the sender; the
+        // replacement session's frames must still reopen the gate.
+        idr_in_flight.record_submitted(20);
+        idr_in_flight.record_handled(23);
+        assert!(!idr_in_flight.is_pending());
+
+        idr_in_flight.record_submitted(30);
+        idr_in_flight.clear();
+        assert!(!idr_in_flight.is_pending());
+    }
+
+    #[test]
+    fn send_failure_recovery_forces_one_idr_for_the_whole_nvenc_backlog() {
+        let force_keyframe = AtomicBool::new(false);
+        let idr_in_flight = IdrInFlight::new();
+        let mut forced = Vec::new();
+
+        // Frame 0 fails to send while P-frames 1-4 are already inside NVENC.
+        request_recovery_idr(&force_keyframe, &idr_in_flight);
+        idr_in_flight.record_handled(0);
+        submit_for_test(5, &force_keyframe, &idr_in_flight, &mut forced);
+        // The sender discards the stale P-frames while capture keeps feeding
+        // NVENC. Each discard used to re-arm the request and force an IDR on
+        // the next submission.
+        for (discarded, submitted) in (1..=4).zip(6..) {
+            request_recovery_idr(&force_keyframe, &idr_in_flight);
+            idr_in_flight.record_handled(discarded);
+            submit_for_test(submitted, &force_keyframe, &idr_in_flight, &mut forced);
+        }
+        idr_in_flight.record_handled(5);
+        submit_for_test(10, &force_keyframe, &idr_in_flight, &mut forced);
+
+        assert_eq!(forced, [5]);
+    }
+
+    #[test]
+    fn a_viewer_request_after_the_idr_was_sent_forces_a_new_one() {
+        let force_keyframe = AtomicBool::new(true);
+        let idr_in_flight = IdrInFlight::new();
+        let mut forced = Vec::new();
+
+        submit_for_test(1, &force_keyframe, &idr_in_flight, &mut forced);
+        // A viewer loss report that arrives before IDR 1 is sent is about an
+        // earlier frame and is covered.
+        force_keyframe.store(true, Ordering::Release);
+        submit_for_test(2, &force_keyframe, &idr_in_flight, &mut forced);
+        idr_in_flight.record_handled(1);
+        // Once IDR 1 has left, a new report may concern IDR 1 itself.
+        force_keyframe.store(true, Ordering::Release);
+        submit_for_test(3, &force_keyframe, &idr_in_flight, &mut forced);
+
+        assert_eq!(forced, [1, 3]);
     }
 
     #[test]

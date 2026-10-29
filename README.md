@@ -76,7 +76,9 @@ as a reported fallback.
 The low-latency path has no B-frame reordering, uses one H.264 slice per picture
 and a one-frame NVENC VBV, generates IDRs only for startup or recovery, requests
 UI repaints directly from the decoder callback, and bounds every host and
-decode queue. The UI reports
+decode queue. On Windows at most one forced recovery IDR is in flight: a
+viewer keyframe request, send failure, or discarded P-frame raised before that
+IDR reaches the sender is resolved by it instead of forcing another. The UI reports
 capture, encode, send, reassembly, decode,
 presentation, RTT, jitter, drop, loss, and host send-failure measurements.
 Encoded datagrams are paced in byte-bounded batches on both hardware backends
