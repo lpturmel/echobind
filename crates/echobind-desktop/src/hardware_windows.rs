@@ -1,6 +1,6 @@
 use super::{
     publish_server_stats, video_pacing_batch_datagrams, DatagramPacer, PendingServerStats,
-    PreciseSleeper, SessionEvent,
+    PreciseSleeper, SessionEvent, VIDEO_SEND_STALE_AGE,
 };
 use echobind_core::{
     protocol::{CursorPosition, Packet, ServerStats, MAX_DATAGRAM_SIZE},
@@ -97,6 +97,7 @@ const MAX_PRE_NVENC_IN_FLIGHT: usize = 2;
 // flooding the graphics queue or turning into an unbounded latency queue.
 const NVENC_BUFFER_BUDGET_MS: u32 = 100;
 const NVENC_H264_NUM_SLICES_MODE: u32 = 3;
+// The pre-NVENC freshness limit at low frame rates; see max_pre_encode_frame_age.
 const MAX_PREPARED_FRAME_AGE_INTERVALS: f64 = 2.0;
 const NVENC_BUSY_RETRY_DELAY: Duration = Duration::from_millis(1);
 const NVENC_BUSY_RETRY_TIMEOUT: Duration = Duration::from_millis(50);
@@ -412,6 +413,20 @@ fn nvenc_buffer_count(frames_per_second: u32) -> usize {
         .saturating_mul(NVENC_BUFFER_BUDGET_MS)
         .div_ceil(1_000) as usize;
     requested.clamp(MIN_NVENC_BUFFER_COUNT, MAX_NVENC_BUFFER_COUNT)
+}
+
+fn max_pre_encode_frame_age(frames_per_second: u32) -> Duration {
+    // Only two frames may be in the copy/convert/submit stages, so while one
+    // waits in NvEncMapInputResource for its GPU copy and conversion, the next
+    // converted frame waits behind it. Under a GPU-bound game that map can
+    // exceed two 120 FPS intervals (16.7 ms). A frame-relative limit then
+    // discarded the waiting frame on every cycle, roughly halving throughput
+    // exactly when the GPU was already the bottleneck. That frame's GPU work
+    // has already been issued, and coalescing already prefers a newer sample
+    // whenever one is queued. Use the same absolute bound as the macOS host
+    // and keep two intervals as the floor for low frame rates.
+    Duration::from_secs_f64(MAX_PREPARED_FRAME_AGE_INTERVALS / f64::from(frames_per_second.max(1)))
+        .max(VIDEO_SEND_STALE_AGE)
 }
 
 fn retain_newest_queued<T>(
@@ -2053,9 +2068,7 @@ fn spawn_d3d_conversion(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         raise_current_thread_priority("D3D11 conversion", THREAD_PRIORITY_HIGHEST);
-        let max_prepared_frame_age = Duration::from_secs_f64(
-            MAX_PREPARED_FRAME_AGE_INTERVALS / f64::from(frames_per_second.max(1)),
-        );
+        let max_prepared_frame_age = max_pre_encode_frame_age(frames_per_second);
 
         'worker: loop {
             if !running.load(Ordering::Relaxed) || !workers_running.load(Ordering::Acquire) {
@@ -2096,7 +2109,7 @@ fn spawn_d3d_conversion(
                 if prepared.captured_at.elapsed() > max_prepared_frame_age {
                     // Keep the permit and wait for a fresh sample rather than
                     // waking submission with work that already missed its
-                    // two-frame latency budget.
+                    // freshness budget.
                     metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
                     let _ = free_slots.try_send(slot);
                     preprocess_in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -2188,9 +2201,7 @@ fn spawn_nvenc_submission(
         // sequence. Frames discarded before NVENC must not create a false
         // reference gap at the sender.
         let busy_sleeper = PreciseSleeper::new();
-        let max_converted_frame_age = Duration::from_secs_f64(
-            MAX_PREPARED_FRAME_AGE_INTERVALS / f64::from(frames_per_second.max(1)),
-        );
+        let max_converted_frame_age = max_pre_encode_frame_age(frames_per_second);
 
         loop {
             if !running.load(Ordering::Relaxed) || !workers_running.load(Ordering::Acquire) {
@@ -3838,6 +3849,21 @@ mod tests {
 
         assert_eq!(config.sliceMode, NVENC_H264_NUM_SLICES_MODE);
         assert_eq!(config.sliceModeData, 1);
+    }
+
+    #[test]
+    fn pre_encode_freshness_limit_tolerates_a_loaded_map_at_high_rates() {
+        // Two 120 FPS intervals (16.7 ms) is shorter than NvEncMapInputResource
+        // under a GPU-bound game; the absolute bound must win at high rates.
+        assert_eq!(max_pre_encode_frame_age(120), VIDEO_SEND_STALE_AGE);
+        assert_eq!(max_pre_encode_frame_age(240), VIDEO_SEND_STALE_AGE);
+        assert_eq!(max_pre_encode_frame_age(60), VIDEO_SEND_STALE_AGE);
+        // Low frame rates keep their two-interval allowance.
+        assert_eq!(
+            max_pre_encode_frame_age(30),
+            Duration::from_secs_f64(2.0 / 30.0)
+        );
+        assert!(max_pre_encode_frame_age(0) >= VIDEO_SEND_STALE_AGE);
     }
 
     #[test]

@@ -48,9 +48,11 @@ submission order.
 
 Only two frames may remain in the copy/convert/submit stages, while the deeper
 ring retains frames already accepted by NVENC. Prepared and converted frames
-older than two target frame intervals are discarded, queued desktop samples
-are coalesced before conversion, and conversion is limited to one frame of
-work-ahead. GPU overload therefore cannot flood the graphics queue with stale
+older than 50 ms (two frame intervals below 40 FPS) are discarded, queued
+desktop samples are coalesced before conversion, and conversion is limited to
+one frame of work-ahead. A loaded GPU can hold the frame being mapped for
+longer than two 120 FPS intervals, so a frame-relative limit would discard the
+next frame on every cycle. GPU overload therefore cannot flood the graphics queue with stale
 full-screen copies or scaler work. A transient `NV_ENC_ERR_ENCODER_BUSY`
 response is retried only within the frame's latency budget instead of tearing
 down the stream; a genuinely stalled session is rebuilt with a bounded retry
