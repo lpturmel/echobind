@@ -12,7 +12,7 @@ use std::{
     collections::VecDeque,
     net::{SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -51,6 +51,33 @@ pub(super) struct AudioPlayback {
     sender: SyncSender<EncodedAudioFrame>,
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+/// A linear gain shared between the UI and an audio thread; 1.0 is unity.
+#[derive(Clone)]
+pub(super) struct AudioGain(Arc<AtomicU32>);
+
+impl AudioGain {
+    pub(super) fn new(gain: f32) -> Self {
+        Self(Arc::new(AtomicU32::new(gain.max(0.0).to_bits())))
+    }
+
+    pub(super) fn set(&self, gain: f32) {
+        self.0.store(gain.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
+fn apply_gain(samples: &mut [f32], gain: f32) {
+    if gain == 1.0 {
+        return;
+    }
+    for sample in samples {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
 }
 
 impl AudioCaptureSettings {
@@ -144,10 +171,11 @@ pub(super) fn spawn_audio_capture(
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     events: mpsc::Sender<SessionEvent>,
     settings: AudioCaptureSettings,
+    gain: AudioGain,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         if let Err(error) =
-            run_audio_capture(socket, running, active_peer, events.clone(), settings)
+            run_audio_capture(socket, running, active_peer, events.clone(), settings, gain)
         {
             let _ = events.send(SessionEvent::AudioBackend(format!(
                 "Audio unavailable: {error}"
@@ -162,6 +190,7 @@ fn run_audio_capture(
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     events: mpsc::Sender<SessionEvent>,
     settings: AudioCaptureSettings,
+    gain: AudioGain,
 ) -> Result<(), String> {
     let host = cpal::default_host();
     let device = find_output_device(&host, Some(&settings.device_name))?;
@@ -229,6 +258,7 @@ fn run_audio_capture(
             let _ = recycle_tx.try_send(samples);
             continue;
         };
+        apply_gain(&mut samples, gain.get());
         pending.extend_from_slice(&samples);
         samples.clear();
         let _ = recycle_tx.try_send(samples);
@@ -349,6 +379,7 @@ pub(super) fn spawn_audio_playback(
     config: AudioConfig,
     output_device: Option<String>,
     events: mpsc::Sender<SessionEvent>,
+    gain: AudioGain,
 ) -> AudioPlayback {
     let (sender, receiver) = mpsc::sync_channel(AUDIO_PACKET_QUEUE);
     let running = Arc::new(AtomicBool::new(true));
@@ -360,6 +391,7 @@ pub(super) fn spawn_audio_playback(
             events.clone(),
             thread_running,
             receiver,
+            gain,
         ) {
             let _ = events.send(SessionEvent::AudioBackend(format!(
                 "Audio unavailable: {error}"
@@ -400,6 +432,7 @@ fn run_audio_playback(
     events: mpsc::Sender<SessionEvent>,
     running: Arc<AtomicBool>,
     receiver: mpsc::Receiver<EncodedAudioFrame>,
+    gain: AudioGain,
 ) -> Result<(), String> {
     if !matches!(config.channels, 1 | 2) {
         return Err(format!(
@@ -475,6 +508,7 @@ fn run_audio_playback(
         };
         expected_sequence = Some(frame.sequence.wrapping_add(1));
         let sample_count = frames * usize::from(config.channels);
+        apply_gain(&mut decoded[..sample_count], gain.get());
         let mut playback = buffer.lock().unwrap();
         while playback.samples.len() + sample_count > max_samples {
             for _ in 0..usize::from(config.channels) {
@@ -681,6 +715,31 @@ mod tests {
     fn maps_mono_to_each_output_channel() {
         let samples = VecDeque::from([0.25, 0.75]);
         assert_eq!(interpolated_source_pair(&samples, 1, 2, 1), (0.25, 0.75));
+    }
+
+    #[test]
+    fn gain_scales_samples_and_never_clips_past_full_scale() {
+        let mut samples = [0.5, -0.5, 0.9, -0.9];
+        apply_gain(&mut samples, 0.5);
+        assert_eq!(samples, [0.25, -0.25, 0.45, -0.45]);
+
+        let mut loud = [0.8, -0.8];
+        apply_gain(&mut loud, 2.0);
+        assert_eq!(loud, [1.0, -1.0]);
+
+        let mut muted = [0.3, -0.7];
+        apply_gain(&mut muted, 0.0);
+        assert_eq!(muted, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn shared_gain_is_visible_to_the_audio_thread_and_never_negative() {
+        let ui = AudioGain::new(1.0);
+        let audio_thread = ui.clone();
+        ui.set(0.36);
+        assert_eq!(audio_thread.get(), 0.36);
+        ui.set(-1.0);
+        assert_eq!(audio_thread.get(), 0.0);
     }
 
     #[test]

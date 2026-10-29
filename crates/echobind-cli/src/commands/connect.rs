@@ -290,6 +290,7 @@ fn request_config(socket: &UdpSocket) -> Result<AudioConfig> {
 
     Packet::Hello {
         max_datagram_size: echobind_core::protocol::STANDARD_DATAGRAM_SIZE as u16,
+        audio_only: false,
     }
     .encode(&mut hello);
     info!("[UDP] Sending hello and waiting for audio config");

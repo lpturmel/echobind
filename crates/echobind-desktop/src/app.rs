@@ -1,4 +1,9 @@
-use crate::session::{DesktopSession, DisplayFrameData, SessionEvent, VideoResolution};
+mod views;
+
+use crate::{
+    session::{DesktopSession, DisplayFrameData, SessionEvent, VideoResolution},
+    theme::{self, Tone},
+};
 use echobind_core::protocol::{CursorPosition, ServerStats};
 use eframe::egui;
 use std::{
@@ -19,6 +24,39 @@ enum Mode {
     Connect,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchPhase {
+    Idle,
+    Waiting,
+    Live,
+    /// Connected to an audio-only session.
+    Listening,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharePhase {
+    Idle,
+    Listening,
+    Live,
+}
+
+/// A message shown as a banner until the next session starts.
+struct Notice {
+    tone: Tone,
+    title: String,
+    body: String,
+}
+
+impl Notice {
+    fn new(tone: Tone, title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            tone,
+            title: title.into(),
+            body: body.into(),
+        }
+    }
+}
+
 struct GpuVideoTexture {
     texture: eframe::wgpu::Texture,
     id: egui::TextureId,
@@ -35,14 +73,33 @@ pub struct EchobindApp {
     mode: Mode,
     host_ip: String,
     server_ip: String,
+    port_text: String,
     port: u16,
+    ip_error: Option<String>,
+    port_error: Option<String>,
     frames_per_second: u32,
     bitrate_mbps: u32,
     resolution: VideoResolution,
     jumbo_datagrams: bool,
     transport: String,
-    status: String,
+    notice: Option<Notice>,
+    listen_address: Option<SocketAddr>,
+    capture_ready: bool,
+    target: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
+    reconnecting: bool,
     pending_peer: Option<SocketAddr>,
+    health_open: bool,
+    drawer_open: bool,
+    watch_audio_only: bool,
+    share_audio_only: bool,
+    watch_volume: u32,
+    watch_muted: bool,
+    share_volume: u32,
+    share_muted: bool,
+    /// Whether the connected session carries video, once the peer says so.
+    peer_video: Option<bool>,
+    pending_video: bool,
     session: Option<DesktopSession>,
     shutdown: Option<SessionShutdown>,
     texture: Option<GpuVideoTexture>,
@@ -109,7 +166,7 @@ pub struct EchobindApp {
 
 impl EchobindApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
-        creation_context.egui_ctx.set_theme(egui::Theme::Dark);
+        theme::install(&creation_context.egui_ctx);
         let audio_output_devices = DesktopSession::audio_output_devices().unwrap_or_default();
         let render_state = creation_context
             .wgpu_render_state
@@ -137,16 +194,34 @@ impl EchobindApp {
             mode: Mode::Connect,
             host_ip: "0.0.0.0".to_owned(),
             server_ip: "127.0.0.1".to_owned(),
+            port_text: "3013".to_owned(),
             port: 3013,
+            ip_error: None,
+            port_error: None,
             frames_per_second: 60,
             // Native high-refresh game streaming needs substantially more than
             // 20 Mbps to avoid macroblocking during rapid full-screen motion.
             bitrate_mbps: 100,
             resolution: VideoResolution::Native,
             jumbo_datagrams: false,
-            transport: "standard MTU".to_owned(),
-            status: "Ready".to_owned(),
+            transport: "Standard MTU".to_owned(),
+            notice: None,
+            listen_address: None,
+            capture_ready: false,
+            target: None,
+            peer: None,
+            reconnecting: false,
             pending_peer: None,
+            health_open: true,
+            drawer_open: false,
+            watch_audio_only: false,
+            share_audio_only: false,
+            watch_volume: 100,
+            watch_muted: false,
+            share_volume: 100,
+            share_muted: false,
+            peer_video: None,
+            pending_video: true,
             session: None,
             shutdown: None,
             texture: None,
@@ -212,6 +287,55 @@ impl EchobindApp {
         }
     }
 
+    fn has_video(&self) -> bool {
+        self.texture.is_some() || self.nv12_ready
+    }
+
+    fn watch_phase(&self) -> WatchPhase {
+        if self.mode != Mode::Connect || self.session.is_none() {
+            WatchPhase::Idle
+        } else if self.has_video() {
+            WatchPhase::Live
+        } else if self.peer.is_some() && self.audio_only_session() {
+            WatchPhase::Listening
+        } else {
+            WatchPhase::Waiting
+        }
+    }
+
+    /// True when the current or next session carries no video: either side
+    /// chose audio only, or the peer reported it has none.
+    fn audio_only_session(&self) -> bool {
+        let chosen = match self.mode {
+            Mode::Connect => self.watch_audio_only,
+            Mode::Host => self.share_audio_only,
+        };
+        chosen || self.peer_video == Some(false)
+    }
+
+    fn volume_gain(&self) -> f32 {
+        match self.mode {
+            Mode::Connect => volume_gain(self.watch_volume, self.watch_muted),
+            Mode::Host => volume_gain(self.share_volume, self.share_muted),
+        }
+    }
+
+    fn apply_volume(&self) {
+        if let Some(session) = &self.session {
+            session.set_volume(self.volume_gain());
+        }
+    }
+
+    fn share_phase(&self) -> SharePhase {
+        if self.mode != Mode::Host || self.session.is_none() {
+            SharePhase::Idle
+        } else if self.peer.is_some() {
+            SharePhase::Live
+        } else {
+            SharePhase::Listening
+        }
+    }
+
     fn process_session_updates(&mut self, context: &egui::Context) {
         let stopped = self.shutdown.as_ref().is_some_and(|shutdown| {
             matches!(
@@ -225,7 +349,6 @@ impl EchobindApp {
                     let _ = handle.join();
                 }
             }
-            self.status = "Ready".to_owned();
         }
         let Some(session) = &self.session else {
             if self.shutdown.is_some() {
@@ -236,41 +359,48 @@ impl EchobindApp {
 
         let events: Vec<_> = session.drain_events().collect();
         let newest_frame = session.take_latest_frame();
+        let mut rejected = false;
 
         for event in events {
             match event {
                 SessionEvent::Listening(address) => {
-                    self.status = format!("Listening on {address}");
+                    self.listen_address = Some(address);
                 }
-                SessionEvent::AwaitingApproval => {
-                    self.status = "Waiting for the host to accept…".to_owned();
-                }
-                SessionEvent::PendingConnection(peer) => {
-                    self.status = format!("{peer} wants to connect");
+                SessionEvent::AwaitingApproval => {}
+                SessionEvent::PendingConnection { peer, video } => {
                     self.pending_peer = Some(peer);
+                    self.pending_video = video;
+                }
+                SessionEvent::PeerMedia { video } => {
+                    self.peer_video = Some(video);
                 }
                 SessionEvent::Connected(peer) => {
-                    self.status = format!("Connected to {peer}");
+                    self.peer = Some(peer);
                     self.pending_peer = None;
+                    self.reconnecting = false;
+                    self.notice = None;
                 }
                 SessionEvent::ConnectionRejected(reason) => {
-                    self.status = format!("Connection rejected: {reason}");
+                    self.notice = Some(Notice::new(Tone::Danger, "The host declined", reason));
                     self.server_stats = None;
                     self.server_stats_received_at = None;
+                    rejected = true;
                 }
                 SessionEvent::Disconnected(reason) => {
-                    self.status = format!("Disconnected: {reason}");
+                    let title = if self.mode == Mode::Host {
+                        self.peer = None;
+                        "Viewer disconnected"
+                    } else {
+                        self.reconnecting = true;
+                        "Connection lost"
+                    };
+                    self.notice = Some(Notice::new(Tone::Caution, title, reason));
                     self.pending_peer = None;
                     self.server_stats = None;
                     self.server_stats_received_at = None;
                 }
                 SessionEvent::CaptureReady => {
-                    if self.mode == Mode::Host
-                        && self.pending_peer.is_none()
-                        && !self.status.contains("capture ready")
-                    {
-                        self.status = format!("{} · capture ready", self.status);
-                    }
+                    self.capture_ready = true;
                 }
                 SessionEvent::VideoConfigured { width, height } => {
                     self.stream_width = width;
@@ -350,14 +480,10 @@ impl EchobindApp {
                     self.lost_frames = lost_frames;
                 }
                 SessionEvent::TransportConfigured { datagram_size } => {
-                    self.transport = if datagram_size > 1400 {
-                        format!("jumbo {datagram_size}-byte UDP")
-                    } else {
-                        "standard MTU".to_owned()
-                    };
+                    self.transport = transport_label(datagram_size);
                 }
                 SessionEvent::Error(error) => {
-                    self.status = format!("Error: {error}");
+                    self.notice = Some(Notice::new(Tone::Danger, "Something went wrong", error));
                 }
             }
         }
@@ -380,22 +506,47 @@ impl EchobindApp {
             self.present_stats_at = Instant::now();
         }
 
+        // A rejected viewer's network thread has already exited; release the
+        // socket and audio device instead of leaving a dead session running.
+        if rejected {
+            self.stop();
+        }
+
         context.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// Validates the IP and port fields, flagging the one that is wrong.
+    fn parse_fields(&mut self, ip: &str) -> Option<SocketAddr> {
+        self.ip_error = None;
+        self.port_error = None;
+        let port = match parse_port(&self.port_text) {
+            Ok(port) => port,
+            Err(error) => {
+                self.port_error = Some(error);
+                return None;
+            }
+        };
+        self.port = port;
+        match parse_address(ip, port) {
+            Ok(address) => Some(address),
+            Err(error) => {
+                self.ip_error = Some(error);
+                None
+            }
+        }
     }
 
     fn start_host(&mut self) {
         if self.shutdown.is_some() {
-            self.status = "Waiting for the previous session to finish stopping…".to_owned();
+            self.notice = Some(still_stopping_notice());
             return;
         }
-        let address = match parse_address(&self.host_ip, self.port) {
-            Ok(address) => address,
-            Err(error) => {
-                self.status = error;
-                return;
-            }
+        let host_ip = self.host_ip.clone();
+        let Some(address) = self.parse_fields(&host_ip) else {
+            return;
         };
         self.stop();
+        self.notice = None;
 
         match DesktopSession::start_host(
             address,
@@ -403,30 +554,29 @@ impl EchobindApp {
             self.bitrate_mbps.saturating_mul(1_000_000),
             self.resolution,
             self.jumbo_datagrams,
+            !self.share_audio_only,
+            self.volume_gain(),
         ) {
             Ok(session) => {
-                self.status = format!("Starting server on {address}…");
                 self.session = Some(session);
             }
             Err(error) => {
-                self.status = format!("Unable to start server: {error}");
+                self.notice = Some(Notice::new(Tone::Danger, "Couldn't start sharing", error));
             }
         }
     }
 
     fn connect(&mut self, context: &egui::Context) {
         if self.shutdown.is_some() {
-            self.status = "Waiting for the previous session to finish stopping…".to_owned();
+            self.notice = Some(still_stopping_notice());
             return;
         }
-        let address = match parse_address(&self.server_ip, self.port) {
-            Ok(address) => address,
-            Err(error) => {
-                self.status = error;
-                return;
-            }
+        let server_ip = self.server_ip.clone();
+        let Some(address) = self.parse_fields(&server_ip) else {
+            return;
         };
         self.stop();
+        self.notice = None;
 
         let repaint_context = context.clone();
         let frame_notifier = Arc::new(move || repaint_context.request_repaint());
@@ -434,13 +584,15 @@ impl EchobindApp {
             address,
             self.audio_output_device.clone(),
             frame_notifier,
+            self.watch_audio_only,
+            self.volume_gain(),
         ) {
             Ok(session) => {
-                self.status = format!("Requesting connection to {address}…");
+                self.target = Some(address);
                 self.session = Some(session);
             }
             Err(error) => {
-                self.status = format!("Unable to connect: {error}");
+                self.notice = Some(Notice::new(Tone::Danger, "Couldn't connect", error));
             }
         }
     }
@@ -460,7 +612,14 @@ impl EchobindApp {
                 handle: Some(handle),
             });
         }
+        self.listen_address = None;
+        self.capture_ready = false;
+        self.target = None;
+        self.peer = None;
+        self.reconnecting = false;
         self.pending_peer = None;
+        self.pending_video = true;
+        self.peer_video = None;
         self.remote_cursor = None;
         self.clear_texture();
         self.stream_fps = 0.0;
@@ -513,12 +672,21 @@ impl EchobindApp {
         self.video_send_failures = 0;
         self.cursor_only_frames = 0;
         self.stale_frames = 0;
-        self.transport = "standard MTU".to_owned();
-        self.status = if self.shutdown.is_some() {
-            "Stopping session and releasing media devices and socket…".to_owned()
-        } else {
-            "Ready".to_owned()
-        };
+        self.transport = "Standard MTU".to_owned();
+    }
+
+    fn accept_pending(&mut self) {
+        if let (Some(peer), Some(session)) = (self.pending_peer, &self.session) {
+            session.accept(peer);
+        }
+    }
+
+    fn reject_pending(&mut self) {
+        if let Some(peer) = self.pending_peer.take() {
+            if let Some(session) = &self.session {
+                session.reject(peer);
+            }
+        }
     }
 
     fn upload_frame(&mut self, frame: crate::session::DisplayFrame) {
@@ -552,7 +720,11 @@ impl EchobindApp {
                     }
                     Err(error) => {
                         self.nv12_ready = false;
-                        self.status = format!("Metal video import failed: {error}");
+                        self.notice = Some(Notice::new(
+                            Tone::Danger,
+                            "Metal video import failed",
+                            error,
+                        ));
                     }
                 }
             }
@@ -648,295 +820,10 @@ impl EchobindApp {
         }
     }
 
-    fn show_controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.mode, Mode::Host, "Create server");
-            ui.selectable_value(&mut self.mode, Mode::Connect, "Connect");
-            ui.separator();
-            ui.label(&self.status);
-        });
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            match self.mode {
-                Mode::Host => {
-                    ui.label("Bind IP");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.host_ip)
-                            .desired_width(150.0)
-                            .hint_text("0.0.0.0"),
-                    );
-                }
-                Mode::Connect => {
-                    ui.label("Server IP");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.server_ip)
-                            .desired_width(150.0)
-                            .hint_text("192.168.1.10"),
-                    );
-                }
-            }
-
-            ui.label("Port");
-            ui.add(egui::DragValue::new(&mut self.port).range(1..=u16::MAX));
-
-            if self.mode == Mode::Host {
-                ui.label("Resolution");
-                egui::ComboBox::from_id_salt("stream-resolution")
-                    .selected_text(self.resolution.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.resolution,
-                            VideoResolution::Native,
-                            "Native",
-                        );
-                        ui.selectable_value(&mut self.resolution, VideoResolution::P720, "720p");
-                        ui.selectable_value(&mut self.resolution, VideoResolution::P1080, "1080p");
-                    });
-                ui.label("FPS");
-                ui.add(egui::DragValue::new(&mut self.frames_per_second).range(15..=120));
-                ui.label("Mbps");
-                ui.add(egui::DragValue::new(&mut self.bitrate_mbps).range(1..=200))
-                    .on_hover_text(
-                        "This is encoded-video payload before recovery, UDP/IP, and Ethernet overhead. Use 80 Mbps or less on a physical 100-Mbps path.",
-                    );
-                if self.bitrate_mbps > 85 {
-                    ui.label(egui::RichText::new("fast LAN").small().weak())
-                        .on_hover_text(
-                            "100 Mbps of encoded video needs roughly 108–110 Mbps on the wire at 90–120 FPS. Use a gigabit path or lower this to 80 Mbps.",
-                        );
-                }
-                ui.checkbox(&mut self.jumbo_datagrams, "Jumbo MTU 9000")
-                    .on_hover_text(
-                        "Only enable when every LAN hop supports a 9000-byte MTU; negotiation falls back to standard MTU for older clients.",
-                    );
-            }
-
-            let active = self.session.is_some();
-            let stopping = self.shutdown.is_some();
-            if !active {
-                let label = if self.mode == Mode::Host {
-                    "Start server"
-                } else {
-                    "Connect"
-                };
-                if ui.add_enabled(!stopping, egui::Button::new(label)).clicked() {
-                    match self.mode {
-                        Mode::Host => self.start_host(),
-                        Mode::Connect => self.connect(ui.ctx()),
-                    }
-                }
-            } else if ui.button("Stop").clicked() {
-                self.stop();
-            }
-
-            if (self.texture.is_some() || self.nv12_ready) && ui.button("Fullscreen").clicked() {
-                self.set_fullscreen(ui.ctx(), true);
-            }
-        });
-
-        if self.mode == Mode::Connect {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Audio output");
-                let selected_text = self
-                    .audio_output_device
-                    .as_deref()
-                    .unwrap_or("System default");
-                let mut changed = false;
-                egui::ComboBox::from_id_salt("audio-output-device")
-                    .selected_text(selected_text)
-                    .width(260.0)
-                    .show_ui(ui, |ui| {
-                        changed |= ui
-                            .selectable_value(&mut self.audio_output_device, None, "System default")
-                            .changed();
-                        for device in &self.audio_output_devices {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.audio_output_device,
-                                    Some(device.clone()),
-                                    device,
-                                )
-                                .changed();
-                        }
-                    });
-                if changed {
-                    if let Some(session) = &self.session {
-                        session.set_audio_output_device(self.audio_output_device.clone());
-                    }
-                }
-                if ui.small_button("Refresh").clicked() {
-                    self.refresh_audio_devices();
-                }
-                if self.session.is_some() {
-                    ui.separator();
-                    ui.label(&self.audio_backend);
-                }
-            });
-        }
-
-        if let Some(peer) = self.pending_peer {
-            ui.add_space(8.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Allow {peer} to view this screen?"));
-                    if ui.button("Accept").clicked() {
-                        if let Some(session) = &self.session {
-                            session.accept(peer);
-                        }
-                    }
-                    if ui.button("Reject").clicked() {
-                        if let Some(session) = &self.session {
-                            session.reject(peer);
-                        }
-                        self.pending_peer = None;
-                        self.status = format!("Rejected {peer}");
-                    }
-                });
-            });
-        }
-
-        let has_pipeline_stats = self.stream_fps > 0.0
-            || self.stream_mbps > 0.0
-            || self.server_stats.is_some()
-            || self.source_fps > 0.0
-            || self.video_send_failures > 0
-            || self.dxgi_timeouts > 0
-            || self.slot_busy_skips > 0;
-        if has_pipeline_stats {
-            ui.add_space(6.0);
-            let resolution = if self.stream_width > 0 && self.stream_height > 0 {
-                format!("{}×{}", self.stream_width, self.stream_height)
-            } else {
-                self.resolution.label().to_owned()
-            };
-            if self.mode == Mode::Host {
-                ui.label(format!(
-                    "{:.1} FPS sent · {:.2} Mbps · {resolution} H.264 · {} · {} · {}",
-                    self.stream_fps,
-                    self.stream_mbps,
-                    self.video_backend,
-                    self.audio_backend,
-                    self.transport,
-                ));
-                ui.label(format!(
-                    "pipeline avg: capture {:.2} ms (GPU {:.2} / lock {:.2}) · encode {:.2} ms · encode→send {:.2} ms · send {:.2} ms",
-                    self.capture_ms,
-                    self.gpu_wait_ms,
-                    self.gpu_lock_ms,
-                    self.encode_ms,
-                    self.encode_queue_ms,
-                    self.send_ms,
-                ));
-                #[cfg(target_os = "windows")]
-                ui.label(format!(
-                    "stages: copy issue {:.2} ms · convert issue {:.2} ms · sync/map {:.2} ms · submit {:.2} ms (API {:.2} · busy {:.2} / {} retries)",
-                    self.copy_wait_ms,
-                    self.convert_wait_ms,
-                    self.map_ms,
-                    self.submit_ms,
-                    self.submit_api_ms,
-                    self.submit_busy_wait_ms,
-                    self.submit_busy_retries,
-                ));
-                #[cfg(target_os = "windows")]
-                ui.label(format!(
-                    "completion: wait {:.2} ms · bitstream {:.2} ms (lock {:.2} · copy {:.2} · unlock {:.2} · unmap {:.2})",
-                    self.completion_wait_ms,
-                    self.bitstream_ms,
-                    self.bitstream_lock_ms,
-                    self.bitstream_copy_ms,
-                    self.bitstream_unlock_ms,
-                    self.unmap_ms,
-                ));
-                #[cfg(target_os = "windows")]
-                ui.label(format!(
-                    "capture: {:.1} DXGI updates/s · NVENC submit/complete {}/{} · {} timeouts · {} accumulated (max {}) · skips pacing {} / preprocess {} / no slot {} / NVENC busy {} / cursor-only {} / stale {} · send failures {}",
-                    self.source_fps,
-                    self.nvenc_submissions,
-                    self.nvenc_completions,
-                    self.dxgi_timeouts,
-                    self.dxgi_backlog,
-                    self.dxgi_backlog_max,
-                    self.pacing_skips,
-                    self.preprocess_busy_skips,
-                    self.no_free_slot_skips,
-                    nvenc_busy_skips(
-                        self.slot_busy_skips,
-                        self.preprocess_busy_skips,
-                        self.no_free_slot_skips,
-                    ),
-                    self.cursor_only_frames,
-                    self.stale_frames,
-                    self.video_send_failures,
-                ));
-            } else {
-                if let Some(age) =
-                    stale_server_stats_age(self.server_stats_received_at, Instant::now())
-                {
-                    show_stale_server_stats_warning(ui, age);
-                }
-                if let Some(server) = self.server_stats {
-                    ui.label(format!(
-                        "server: {:.1} source updates / {:.1} sent FPS · {:.2} Mbps · capture {:.2} ms · encode {:.2} ms · queue {:.2} ms · send {:.2} ms",
-                        server.source_fps,
-                        server.fps,
-                        server.megabits_per_second,
-                        server.capture_ms,
-                        server.encode_ms,
-                        server.encode_queue_ms,
-                        server.send_ms,
-                    ));
-                    ui.label(format!(
-                        "server stages: copy issue {:.2} · convert issue {:.2} · sync/map {:.2} · submit {:.2} ms (API {:.2} · busy {:.2} / {} retries)",
-                        server.copy_wait_ms,
-                        server.convert_wait_ms,
-                        server.map_ms,
-                        server.submit_ms,
-                        server.submit_api_ms,
-                        server.submit_busy_wait_ms,
-                        server.submit_busy_retries,
-                    ));
-                    ui.label(format!(
-                        "server completion: wait {:.2} · bitstream {:.2} ms (lock {:.2} · copy {:.2} · unlock {:.2} · unmap {:.2}) · GPU {} / {} · NVENC submit/complete {}/{} · skips preprocess {} / no slot {} / NVENC busy {} · send failures {}",
-                        server.completion_wait_ms,
-                        server.bitstream_ms,
-                        server.bitstream_lock_ms,
-                        server.bitstream_copy_ms,
-                        server.bitstream_unlock_ms,
-                        server.unmap_ms,
-                        gpu_priority_label(server.gpu_priority_class),
-                        nvenc_slot_label(server.nvenc_buffer_count),
-                        server.nvenc_submissions,
-                        server.nvenc_completions,
-                        server.preprocess_busy_skips,
-                        server.no_free_slot_skips,
-                        nvenc_busy_skips(
-                            server.slot_busy_skips,
-                            server.preprocess_busy_skips,
-                            server.no_free_slot_skips,
-                        ),
-                        server.video_send_failures,
-                    ));
-                }
-                ui.label(format!(
-                    "client: {:.1} decoded · {:.1} received · {:.1} presented · {} dropped / {} lost · {:.2} Mbps · {resolution} H.264 · {} · {} · {}",
-                    self.stream_fps,
-                    self.received_fps,
-                    self.present_fps,
-                    self.dropped_frames,
-                    self.lost_frames,
-                    self.stream_mbps,
-                    self.video_backend,
-                    self.audio_backend,
-                    self.transport,
-                ));
-                ui.label(format!(
-                    "pipeline avg: reassemble {:.2} ms · decode queue {:.2} ms · decode {:.2} ms · repaint→present {:.2} ms · jitter {:.2} ms · RTT {:.2} ms",
-                    self.reassembly_ms, self.decode_queue_ms, self.decode_ms, self.present_latency_ms, self.jitter_ms, self.rtt_ms,
-                ));
-            }
+    fn set_audio_output(&mut self, device: Option<String>) {
+        self.audio_output_device = device;
+        if let Some(session) = &self.session {
+            session.set_audio_output_device(self.audio_output_device.clone());
         }
     }
 
@@ -945,45 +832,26 @@ impl EchobindApp {
         context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
     }
 
-    fn show_video(&self, ui: &mut egui::Ui) {
-        if self.texture.is_none() && !self.nv12_ready {
-            ui.centered_and_justified(|ui| {
-                ui.label(if self.mode == Mode::Host {
-                    "Start a server and accept a viewer to begin sharing."
-                } else {
-                    "The remote screen will appear here after the host accepts."
-                });
-            });
-            return;
+    /// Paints the remote video letterboxed inside `area` and returns its rect.
+    fn paint_video(&self, ui: &egui::Ui, area: egui::Rect) -> egui::Rect {
+        if !self.has_video() || self.stream_width == 0 || self.stream_height == 0 {
+            return egui::Rect::NOTHING;
         }
-
-        let available = ui.available_size();
         let source = egui::vec2(self.stream_width as f32, self.stream_height as f32);
-        let scale = (available.x / source.x)
-            .min(available.y / source.y)
+        let scale = (area.width() / source.x)
+            .min(area.height() / source.y)
             .max(0.01);
-        let display_size = source * scale;
-        let video_rect = ui
-            .centered_and_justified(|ui| {
-                if self.nv12_ready {
-                    let (rect, _) = ui.allocate_exact_size(display_size, egui::Sense::hover());
-                    #[cfg(target_os = "macos")]
-                    ui.painter().add(egui::Shape::Callback(
-                        crate::video_renderer_macos::paint_callback(rect),
-                    ));
-                    rect
-                } else if let Some(texture) = &self.texture {
-                    ui.add(
-                        egui::Image::from_texture((texture.id, source))
-                            .fit_to_exact_size(display_size),
-                    )
-                    .rect
-                } else {
-                    egui::Rect::NOTHING
-                }
-            })
-            .inner;
+        let video_rect = egui::Rect::from_center_size(area.center(), source * scale);
+        if self.nv12_ready {
+            #[cfg(target_os = "macos")]
+            ui.painter().add(egui::Shape::Callback(
+                crate::video_renderer_macos::paint_callback(video_rect),
+            ));
+        } else if let Some(texture) = &self.texture {
+            egui::Image::from_texture((texture.id, source)).paint_at(ui, video_rect);
+        }
         self.paint_remote_cursor(ui, video_rect);
+        video_rect
     }
 
     fn paint_remote_cursor(&self, ui: &egui::Ui, video_rect: egui::Rect) {
@@ -1022,120 +890,6 @@ impl EchobindApp {
             egui::Stroke::new(2.0, egui::Color32::BLACK),
         ));
     }
-
-    fn show_fullscreen_stats(&self, context: &egui::Context) {
-        if self.mode != Mode::Connect {
-            return;
-        }
-
-        egui::Area::new("fullscreen-stats".into())
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
-            .interactable(false)
-            .show(context, |ui| {
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(190))
-                    .corner_radius(6.0)
-                    .inner_margin(10.0)
-                    .show(ui, |ui| {
-                        ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
-                        ui.label(egui::RichText::new("ECHOBIND").strong());
-                        if let Some(age) = stale_server_stats_age(
-                            self.server_stats_received_at,
-                            Instant::now(),
-                        ) {
-                            show_stale_server_stats_warning(ui, age);
-                        }
-                        if let Some(server) = self.server_stats {
-                            ui.label(format!(
-                                "SERVER  {:.1} source  {:.1} sent  {:.1} Mbps",
-                                server.source_fps, server.fps, server.megabits_per_second,
-                            ));
-                            ui.label(format!(
-                                "capture {:.2} ms  GPU {:.2} / lock {:.2} ms  encode {:.2} ms",
-                                server.capture_ms,
-                                server.gpu_wait_ms,
-                                server.gpu_lock_ms,
-                                server.encode_ms,
-                            ));
-                            ui.label(format!(
-                                "queue {:.2} ms  send {:.2} ms  GPU {} / {}  NVENC {}/{}",
-                                server.encode_queue_ms,
-                                server.send_ms,
-                                gpu_priority_label(server.gpu_priority_class),
-                                nvenc_slot_label(server.nvenc_buffer_count),
-                                server.nvenc_submissions,
-                                server.nvenc_completions,
-                            ));
-                            ui.label(format!(
-                                "copy {:.2}  convert {:.2}  map {:.2}  submit {:.2} ms (API {:.2}  busy {:.2}/{}x)",
-                                server.copy_wait_ms,
-                                server.convert_wait_ms,
-                                server.map_ms,
-                                server.submit_ms,
-                                server.submit_api_ms,
-                                server.submit_busy_wait_ms,
-                                server.submit_busy_retries,
-                            ));
-                            ui.label(format!(
-                                "complete {:.2}  bits {:.2} ms (lock {:.2}  copy {:.2}  unlock {:.2}  unmap {:.2})",
-                                server.completion_wait_ms,
-                                server.bitstream_ms,
-                                server.bitstream_lock_ms,
-                                server.bitstream_copy_ms,
-                                server.bitstream_unlock_ms,
-                                server.unmap_ms,
-                            ));
-                            if [
-                                server.dxgi_timeouts,
-                                server.dxgi_backlog,
-                                server.pacing_skips,
-                                server.slot_busy_skips,
-                                server.preprocess_busy_skips,
-                                server.no_free_slot_skips,
-                                server.cursor_only_frames,
-                                server.stale_frames,
-                                server.video_send_failures,
-                            ]
-                            .into_iter()
-                            .any(|value| value > 0)
-                            {
-                                ui.label(format!(
-                                    "DXGI timeout {}  backlog {} (max {})  skips pace/pre/no-slot/NVENC-busy/cursor/stale {}/{}/{}/{}/{}/{}  send failures {}",
-                                    server.dxgi_timeouts,
-                                    server.dxgi_backlog,
-                                    server.dxgi_backlog_max,
-                                    server.pacing_skips,
-                                    server.preprocess_busy_skips,
-                                    server.no_free_slot_skips,
-                                    nvenc_busy_skips(
-                                        server.slot_busy_skips,
-                                        server.preprocess_busy_skips,
-                                        server.no_free_slot_skips,
-                                    ),
-                                    server.cursor_only_frames,
-                                    server.stale_frames,
-                                    server.video_send_failures,
-                                ));
-                            }
-                        } else {
-                            ui.label("SERVER  waiting for stats…");
-                        }
-                        ui.label(format!(
-                            "CLIENT  {:.1} recv  {:.1} decode  {:.1} present  {:.1} Mbps",
-                            self.received_fps, self.stream_fps, self.present_fps, self.stream_mbps,
-                        ));
-                        ui.label(format!(
-                            "decode {:.2} ms  RTT {:.2} ms  jitter {:.2} ms  drop {} / loss {}",
-                            self.decode_ms,
-                            self.rtt_ms,
-                            self.jitter_ms,
-                            self.dropped_frames,
-                            self.lost_frames,
-                        ));
-                        ui.label(egui::RichText::new("F11 or Esc to exit").small().weak());
-                    });
-            });
-    }
 }
 
 impl eframe::App for EchobindApp {
@@ -1149,22 +903,33 @@ impl eframe::App for EchobindApp {
         }
         self.process_session_updates(&context);
 
-        if !self.fullscreen {
-            egui::Panel::top("controls")
-                .resizable(false)
+        if self.fullscreen {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(ui, |ui| {
-                    ui.add_space(10.0);
-                    self.show_controls(ui);
-                    ui.add_space(10.0);
+                    let area = ui.max_rect();
+                    self.paint_video(ui, area);
                 });
+            self.show_fullscreen_stats(&context);
+            return;
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.show_video(ui);
-        });
-        if self.fullscreen {
-            self.show_fullscreen_stats(&context);
-        }
+        egui::Panel::top("top-bar")
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::WINDOW)
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(ui, |ui| self.show_top_bar(ui));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::WINDOW)
+                    .inner_margin(theme::GUTTER as i8),
+            )
+            .show(ui, |ui| self.show_body(ui));
     }
 }
 
@@ -1181,12 +946,45 @@ impl Drop for EchobindApp {
     }
 }
 
+fn still_stopping_notice() -> Notice {
+    Notice::new(
+        Tone::Caution,
+        "Still stopping the last session",
+        "Releasing the media devices and socket. Try again in a moment.",
+    )
+}
+
+fn transport_label(datagram_size: usize) -> String {
+    if datagram_size > 1400 {
+        format!("Jumbo · {datagram_size} B")
+    } else {
+        "Standard MTU".to_owned()
+    }
+}
+
 fn parse_address(ip: &str, port: u16) -> Result<SocketAddr, String> {
     let ip: IpAddr = ip
         .trim()
         .parse()
-        .map_err(|_| format!("Invalid IP address: {ip}"))?;
+        .map_err(|_| "Enter a full IPv4 or IPv6 address.".to_owned())?;
     Ok(SocketAddr::new(ip, port))
+}
+
+/// Maps a 0–100 volume slider to a linear gain on a squared curve, which
+/// follows perceived loudness more closely than a linear one.
+fn volume_gain(percent: u32, muted: bool) -> f32 {
+    if muted {
+        return 0.0;
+    }
+    let level = percent.min(100) as f32 / 100.0;
+    level * level
+}
+
+fn parse_port(port: &str) -> Result<u16, String> {
+    match port.trim().parse::<u16>() {
+        Ok(port) if port > 0 => Ok(port),
+        _ => Err("Enter a port from 1 to 65535.".to_owned()),
+    }
 }
 
 fn nvenc_busy_skips(total: u64, preprocess_full: u64, no_free_slot: u64) -> u64 {
@@ -1195,6 +993,7 @@ fn nvenc_busy_skips(total: u64, preprocess_full: u64, no_free_slot: u64) -> u64 
 
 fn gpu_priority_label(class: u64) -> &'static str {
     match class {
+        5 => "realtime",
         4 => "high",
         3 => "above-normal",
         2 => "normal",
@@ -1215,20 +1014,6 @@ fn stale_server_stats_age(received_at: Option<Instant>, now: Instant) -> Option<
     (age >= SERVER_STATS_STALE_AFTER).then_some(age)
 }
 
-fn show_stale_server_stats_warning(ui: &mut egui::Ui, age: Duration) {
-    ui.label(
-        egui::RichText::new(format!(
-            "SERVER TELEMETRY STALE ({:.1} s) · values below are not live",
-            age.as_secs_f32(),
-        ))
-        .strong()
-        .color(egui::Color32::YELLOW),
-    )
-    .on_hover_text(
-        "The viewer is still connected, but the host has stopped publishing its once-per-second video-pipeline snapshot. The host pipeline may have exited or stalled.",
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,6 +1028,30 @@ mod tests {
             parse_address("::1", 3013).unwrap(),
             "[::1]:3013".parse().unwrap()
         );
+        assert!(parse_address("192.168.1", 3013).is_err());
+    }
+
+    #[test]
+    fn parses_only_nonzero_ports() {
+        assert_eq!(parse_port(" 3013 ").unwrap(), 3013);
+        assert!(parse_port("0").is_err());
+        assert!(parse_port("65536").is_err());
+        assert!(parse_port("udp").is_err());
+    }
+
+    #[test]
+    fn volume_slider_maps_to_a_squared_gain() {
+        assert_eq!(volume_gain(100, false), 1.0);
+        assert_eq!(volume_gain(50, false), 0.25);
+        assert_eq!(volume_gain(0, false), 0.0);
+        assert_eq!(volume_gain(150, false), 1.0);
+        assert_eq!(volume_gain(100, true), 0.0);
+    }
+
+    #[test]
+    fn labels_jumbo_transport_only_above_standard_datagrams() {
+        assert_eq!(transport_label(1400), "Standard MTU");
+        assert_eq!(transport_label(8192), "Jumbo · 8192 B");
     }
 
     #[test]

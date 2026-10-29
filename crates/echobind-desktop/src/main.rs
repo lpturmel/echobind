@@ -1,8 +1,11 @@
 mod app;
+mod icons;
 mod session;
+mod theme;
 mod video;
 #[cfg(target_os = "macos")]
 mod video_renderer_macos;
+mod widgets;
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt::init();

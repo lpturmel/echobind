@@ -437,8 +437,15 @@ impl DecodeQueue {
 pub enum SessionEvent {
     Listening(SocketAddr),
     AwaitingApproval,
-    PendingConnection(SocketAddr),
+    PendingConnection {
+        peer: SocketAddr,
+        video: bool,
+    },
     Connected(SocketAddr),
+    /// Whether the connected session carries video, or only audio.
+    PeerMedia {
+        video: bool,
+    },
     ConnectionRejected(String),
     Disconnected(String),
     CaptureReady,
@@ -483,7 +490,36 @@ pub struct DesktopSession {
     latest_frame: LatestFrame,
     capture_slot: Option<CaptureSlot>,
     decode_queue: Option<DecodeQueue>,
+    volume: audio::AudioGain,
     handles: Vec<JoinHandle<()>>,
+}
+
+/// The accepted viewer as each host pipeline sees it. Audio, control and stats
+/// always follow the viewer; video only does when the viewer asked for it.
+struct HostPeers {
+    active: Arc<Mutex<Option<SocketAddr>>>,
+    video: Arc<Mutex<Option<SocketAddr>>>,
+    epoch: Arc<AtomicU64>,
+}
+
+/// The serialized session configs a host offers, chosen per viewer.
+struct HostConfigs {
+    standard: Vec<u8>,
+    jumbo: Vec<u8>,
+    audio_only: Vec<u8>,
+    video: bool,
+}
+
+impl HostConfigs {
+    fn for_viewer(&self, datagram_size: usize, video: bool) -> &[u8] {
+        if !video {
+            &self.audio_only
+        } else if datagram_size == JUMBO_DATAGRAM_SIZE {
+            &self.jumbo
+        } else {
+            &self.standard
+        }
+    }
 }
 
 impl DesktopSession {
@@ -491,19 +527,28 @@ impl DesktopSession {
         audio::output_device_names()
     }
 
+    /// Starts a host. With `video` off it shares system audio only and never
+    /// captures the screen.
     pub fn start_host(
         bind_addr: SocketAddr,
         frames_per_second: u32,
         bitrate_bps: u32,
         resolution: VideoResolution,
         jumbo_datagrams: bool,
+        video: bool,
+        volume: f32,
     ) -> Result<Self, String> {
         let (audio_capture, audio_probe_error) = match audio::discover_system_audio_capture() {
             Ok(settings) => (Some(settings), None),
             Err(error) => (None, Some(error)),
         };
+        if !video {
+            if let Some(error) = &audio_probe_error {
+                return Err(format!("System audio isn't available to share: {error}"));
+            }
+        }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
+        if video {
             ensure_software_capture_available()?;
         }
 
@@ -527,6 +572,7 @@ impl DesktopSession {
 
         let running = Arc::new(AtomicBool::new(true));
         let active_peer = Arc::new(Mutex::new(None::<SocketAddr>));
+        let video_peer = Arc::new(Mutex::new(None::<SocketAddr>));
         let peer_epoch = Arc::new(AtomicU64::new(0));
         let force_keyframe = Arc::new(AtomicBool::new(true));
         let active_datagram_size = Arc::new(AtomicUsize::new(STANDARD_DATAGRAM_SIZE));
@@ -534,13 +580,18 @@ impl DesktopSession {
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
         let pending_server_stats = Arc::new(Mutex::new(None));
+        let volume = audio::AudioGain::new(volume);
 
-        let (width, height) = configured_video_dimensions(resolution)?;
+        let dimensions = if video {
+            Some(configured_video_dimensions(resolution)?)
+        } else {
+            None
+        };
         let session_config = SessionConfig {
             audio: audio_capture
                 .as_ref()
                 .map(audio::AudioCaptureSettings::session_config),
-            video: Some(VideoConfig {
+            video: dimensions.map(|(width, height)| VideoConfig {
                 codec: VideoCodec::H264,
                 width,
                 height,
@@ -552,23 +603,37 @@ impl DesktopSession {
                 datagram_size: STANDARD_DATAGRAM_SIZE as u16,
             }),
         };
-        let standard_config_json = serde_json::to_vec(&session_config)
-            .map_err(|error| format!("Unable to serialize session config: {error}"))?;
+        let serialize = |config: &SessionConfig| {
+            serde_json::to_vec(config)
+                .map_err(|error| format!("Unable to serialize session config: {error}"))
+        };
         let mut jumbo_config = session_config.clone();
-        jumbo_config.video.as_mut().unwrap().datagram_size = JUMBO_DATAGRAM_SIZE as u16;
-        let jumbo_config_json = serde_json::to_vec(&jumbo_config)
-            .map_err(|error| format!("Unable to serialize jumbo session config: {error}"))?;
+        if let Some(video) = jumbo_config.video.as_mut() {
+            video.datagram_size = JUMBO_DATAGRAM_SIZE as u16;
+        }
+        let audio_only_config = SessionConfig {
+            audio: session_config.audio.clone(),
+            video: None,
+        };
+        let configs = HostConfigs {
+            standard: serialize(&session_config)?,
+            jumbo: serialize(&jumbo_config)?,
+            audio_only: serialize(&audio_only_config)?,
+            video,
+        };
 
         let network_handle = spawn_host_network(
             socket.clone(),
             running.clone(),
-            active_peer.clone(),
-            peer_epoch.clone(),
+            HostPeers {
+                active: active_peer.clone(),
+                video: video_peer.clone(),
+                epoch: peer_epoch.clone(),
+            },
             force_keyframe.clone(),
             command_rx,
             event_tx.clone(),
-            standard_config_json,
-            jumbo_config_json,
+            configs,
             jumbo_datagrams,
             active_datagram_size.clone(),
             pending_server_stats.clone(),
@@ -579,66 +644,77 @@ impl DesktopSession {
             )));
         }
 
+        // Video pipelines follow `video_peer`, so an audio-only viewer never
+        // starts screen capture or the encoder.
         #[cfg(target_os = "macos")]
-        let (capture_slot, mut media_handles) = {
-            let hardware_handle = hardware_macos::spawn_hardware_pipeline(
-                socket.clone(),
-                running.clone(),
-                active_peer.clone(),
-                force_keyframe.clone(),
-                event_tx.clone(),
-                frames_per_second,
-                bitrate_bps,
-                resolution,
-                active_datagram_size.clone(),
-                pending_server_stats.clone(),
-            );
-            (None, vec![hardware_handle])
+        let (capture_slot, mut media_handles) = match dimensions {
+            Some(_) => {
+                let hardware_handle = hardware_macos::spawn_hardware_pipeline(
+                    socket.clone(),
+                    running.clone(),
+                    video_peer,
+                    force_keyframe.clone(),
+                    event_tx.clone(),
+                    frames_per_second,
+                    bitrate_bps,
+                    resolution,
+                    active_datagram_size.clone(),
+                    pending_server_stats.clone(),
+                );
+                (None::<CaptureSlot>, vec![hardware_handle])
+            }
+            None => (None, Vec::new()),
         };
 
         #[cfg(target_os = "windows")]
-        let (capture_slot, mut media_handles) = {
-            let hardware_handle = hardware_windows::spawn_hardware_pipeline(
-                socket.clone(),
-                running.clone(),
-                active_peer.clone(),
-                peer_epoch,
-                force_keyframe.clone(),
-                event_tx.clone(),
-                frames_per_second,
-                bitrate_bps,
-                width,
-                height,
-                active_datagram_size.clone(),
-                pending_server_stats.clone(),
-            );
-            (None, vec![hardware_handle])
+        let (capture_slot, mut media_handles) = match dimensions {
+            Some((width, height)) => {
+                let hardware_handle = hardware_windows::spawn_hardware_pipeline(
+                    socket.clone(),
+                    running.clone(),
+                    video_peer,
+                    peer_epoch,
+                    force_keyframe.clone(),
+                    event_tx.clone(),
+                    frames_per_second,
+                    bitrate_bps,
+                    width,
+                    height,
+                    active_datagram_size.clone(),
+                    pending_server_stats.clone(),
+                );
+                (None::<CaptureSlot>, vec![hardware_handle])
+            }
+            None => (None, Vec::new()),
         };
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let (capture_slot, mut media_handles) = {
-            let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
-            let capture_handle = spawn_capture(
-                running.clone(),
-                capture_slot.clone(),
-                event_tx.clone(),
-                frames_per_second,
-                resolution,
-            );
-            let encoder_handle = spawn_encoder(
-                socket.clone(),
-                running.clone(),
-                active_peer.clone(),
-                force_keyframe.clone(),
-                capture_slot.clone(),
-                event_tx.clone(),
-                frames_per_second,
-                bitrate_bps,
-                resolution,
-                active_datagram_size.clone(),
-                pending_server_stats,
-            );
-            (Some(capture_slot), vec![capture_handle, encoder_handle])
+        let (capture_slot, mut media_handles) = match dimensions {
+            Some(_) => {
+                let capture_slot: CaptureSlot = Arc::new((Mutex::new(None), Condvar::new()));
+                let capture_handle = spawn_capture(
+                    running.clone(),
+                    capture_slot.clone(),
+                    event_tx.clone(),
+                    frames_per_second,
+                    resolution,
+                );
+                let encoder_handle = spawn_encoder(
+                    socket.clone(),
+                    running.clone(),
+                    video_peer,
+                    force_keyframe.clone(),
+                    capture_slot.clone(),
+                    event_tx.clone(),
+                    frames_per_second,
+                    bitrate_bps,
+                    resolution,
+                    active_datagram_size.clone(),
+                    pending_server_stats,
+                );
+                (Some(capture_slot), vec![capture_handle, encoder_handle])
+            }
+            None => (None, Vec::new()),
         };
 
         if let Some(settings) = audio_capture {
@@ -648,10 +724,13 @@ impl DesktopSession {
                 active_peer,
                 event_tx.clone(),
                 settings,
+                volume.clone(),
             ));
         }
         let _ = event_tx.send(SessionEvent::Listening(local_addr));
-        let _ = event_tx.send(SessionEvent::VideoConfigured { width, height });
+        if let Some((width, height)) = dimensions {
+            let _ = event_tx.send(SessionEvent::VideoConfigured { width, height });
+        }
         let mut handles = vec![network_handle];
         handles.append(&mut media_handles);
         Ok(Self {
@@ -662,14 +741,19 @@ impl DesktopSession {
             latest_frame,
             capture_slot,
             decode_queue: None,
+            volume,
             handles,
         })
     }
 
+    /// Connects to a host. With `audio_only` set the viewer asks the host to
+    /// skip video and ignores any video it still receives.
     pub fn start_client(
         server_addr: SocketAddr,
         audio_output_device: Option<String>,
         frame_notifier: FrameNotifier,
+        audio_only: bool,
+        volume: f32,
     ) -> Result<Self, String> {
         let bind_addr = if server_addr.is_ipv4() {
             "0.0.0.0:0"
@@ -693,6 +777,7 @@ impl DesktopSession {
         let decoder_needs_keyframe = Arc::new(AtomicBool::new(true));
         let (event_tx, event_rx) = mpsc::channel();
         let (audio_command_tx, audio_command_rx) = mpsc::channel();
+        let volume = audio::AudioGain::new(volume);
         let network_handle = spawn_client_network(
             socket,
             server_addr,
@@ -704,6 +789,8 @@ impl DesktopSession {
             frame_notifier.clone(),
             audio_output_device,
             audio_command_rx,
+            audio_only,
+            volume.clone(),
         );
         let decoder_handle = spawn_video_decoder(
             running.clone(),
@@ -723,8 +810,15 @@ impl DesktopSession {
             latest_frame,
             capture_slot: None,
             decode_queue: Some(decode_queue),
+            volume,
             handles: vec![network_handle, decoder_handle],
         })
+    }
+
+    /// Sets the linear gain applied to shared audio on a host, or to playback
+    /// on a viewer. Takes effect on the next audio buffer.
+    pub fn set_volume(&self, gain: f32) {
+        self.volume.set(gain);
     }
 
     pub fn accept(&self, peer: SocketAddr) {
@@ -852,30 +946,59 @@ impl Drop for DesktopSession {
     }
 }
 
+/// Replaces the accepted viewer; `replacement` carries whether it receives
+/// video. Returns the previous viewer.
 fn replace_active_peer(
-    active_peer: &Mutex<Option<SocketAddr>>,
-    peer_epoch: &AtomicU64,
-    replacement: Option<SocketAddr>,
+    peers: &HostPeers,
+    replacement: Option<(SocketAddr, bool)>,
 ) -> Option<SocketAddr> {
-    let previous = std::mem::replace(&mut *active_peer.lock().unwrap(), replacement);
+    let previous = std::mem::replace(
+        &mut *peers.active.lock().unwrap(),
+        replacement.map(|(peer, _)| peer),
+    );
+    *peers.video.lock().unwrap() = replacement.and_then(|(peer, video)| video.then_some(peer));
     // The address can be reused after a disconnect, so SocketAddr alone is
     // not a session identity. Every transition advances an ABA-resistant
     // epoch consumed by the Windows capture and sender pipelines.
-    peer_epoch.fetch_add(1, Ordering::AcqRel);
+    peers.epoch.fetch_add(1, Ordering::AcqRel);
     previous
+}
+
+/// Folds a pending viewer's latest Hello into what it asked for earlier. The
+/// largest advertised datagram wins, and one audio-only request is enough to
+/// keep video off, since viewers also send a legacy Hello without the flag.
+fn merge_pending_hello(
+    previous: Option<(usize, bool)>,
+    advertised: usize,
+    video: bool,
+) -> (usize, bool) {
+    match previous {
+        Some((previous_max, previous_video)) => {
+            (previous_max.max(advertised), previous_video && video)
+        }
+        None => (advertised, video),
+    }
+}
+
+/// Picks the datagram size for a viewer: jumbo only when the host enabled it,
+/// the viewer supports it, and the viewer receives video.
+fn negotiated_datagram_size(jumbo_requested: bool, client_max: usize, video: bool) -> usize {
+    if video && jumbo_requested && client_max >= JUMBO_DATAGRAM_SIZE {
+        JUMBO_DATAGRAM_SIZE
+    } else {
+        STANDARD_DATAGRAM_SIZE
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_host_network(
     socket: Arc<UdpSocket>,
     running: Arc<AtomicBool>,
-    active_peer: Arc<Mutex<Option<SocketAddr>>>,
-    peer_epoch: Arc<AtomicU64>,
+    peers: HostPeers,
     force_keyframe: Arc<AtomicBool>,
     commands: mpsc::Receiver<HostCommand>,
     events: mpsc::Sender<SessionEvent>,
-    standard_config_json: Vec<u8>,
-    jumbo_config_json: Vec<u8>,
+    configs: HostConfigs,
     jumbo_requested: bool,
     active_datagram_size: Arc<AtomicUsize>,
     pending_server_stats: PendingServerStats,
@@ -883,9 +1006,11 @@ fn spawn_host_network(
     thread::spawn(move || {
         let mut packet_buffer = [0_u8; MAX_DATAGRAM_SIZE];
         let mut response = Vec::with_capacity(MAX_DATAGRAM_SIZE);
-        let mut pending_peer = None::<(SocketAddr, usize)>;
+        // (peer, advertised datagram size, receives video)
+        let mut pending_peer = None::<(SocketAddr, usize, bool)>;
         let mut last_seen = None::<Instant>;
-        let mut reconnect_peer = None::<(SocketAddr, usize, Instant)>;
+        let mut reconnect_peer = None::<(SocketAddr, usize, bool, Instant)>;
+        let mut active_video = false;
         let mut keyframe_requests = 0_u64;
         let mut keyframe_requests_since = Instant::now();
 
@@ -893,41 +1018,35 @@ fn spawn_host_network(
             while let Ok(command) = commands.try_recv() {
                 match command {
                     HostCommand::Accept(peer)
-                        if pending_peer.is_some_and(|(pending, _)| pending == peer) =>
+                        if pending_peer.is_some_and(|(pending, ..)| pending == peer) =>
                     {
-                        let client_max =
-                            pending_peer.map_or(STANDARD_DATAGRAM_SIZE, |(_, max)| max);
-                        let datagram_size = if jumbo_requested && client_max >= JUMBO_DATAGRAM_SIZE
-                        {
-                            JUMBO_DATAGRAM_SIZE
-                        } else {
-                            STANDARD_DATAGRAM_SIZE
-                        };
+                        let (_, client_max, video) =
+                            pending_peer.expect("the pending peer was just matched");
+                        let datagram_size =
+                            negotiated_datagram_size(jumbo_requested, client_max, video);
                         active_datagram_size.store(datagram_size, Ordering::Release);
-                        replace_active_peer(&active_peer, &peer_epoch, Some(peer));
+                        replace_active_peer(&peers, Some((peer, video)));
+                        active_video = video;
                         pending_peer = None;
                         reconnect_peer = None;
                         last_seen = Some(Instant::now());
                         force_keyframe.store(true, Ordering::Relaxed);
-                        let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
-                            &jumbo_config_json
-                        } else {
-                            &standard_config_json
-                        };
-                        Packet::Config(config_json).encode(&mut response);
+                        Packet::Config(configs.for_viewer(datagram_size, video))
+                            .encode(&mut response);
                         if let Err(error) = socket.send_to(&response, peer) {
                             let _ = events.send(SessionEvent::Error(format!(
                                 "Unable to accept {peer}: {error}"
                             )));
-                            replace_active_peer(&active_peer, &peer_epoch, None);
+                            replace_active_peer(&peers, None);
                         } else {
                             let _ = events.send(SessionEvent::Connected(peer));
+                            let _ = events.send(SessionEvent::PeerMedia { video });
                             let _ =
                                 events.send(SessionEvent::TransportConfigured { datagram_size });
                         }
                     }
                     HostCommand::Reject(peer)
-                        if pending_peer.is_some_and(|(pending, _)| pending == peer) =>
+                        if pending_peer.is_some_and(|(pending, ..)| pending == peer) =>
                     {
                         Packet::ConnectionRejected(b"Connection rejected by host")
                             .encode(&mut response);
@@ -947,24 +1066,35 @@ fn spawn_host_network(
                             continue;
                         }
                     };
-                    let current_peer = *active_peer.lock().unwrap();
+                    let current_peer = *peers.active.lock().unwrap();
 
                     match packet {
-                        Packet::Hello { .. } if current_peer == Some(peer) => {
+                        Packet::Hello { audio_only, .. } if current_peer == Some(peer) => {
                             last_seen = Some(Instant::now());
+                            // Viewers send a legacy Hello alongside the one that
+                            // carries their request, so an audio-only request
+                            // sticks: it can downgrade video but never upgrade.
+                            if audio_only && active_video {
+                                active_video = false;
+                                replace_active_peer(&peers, Some((peer, false)));
+                                active_datagram_size
+                                    .store(STANDARD_DATAGRAM_SIZE, Ordering::Release);
+                                let _ = events.send(SessionEvent::PeerMedia { video: false });
+                                let _ = events.send(SessionEvent::TransportConfigured {
+                                    datagram_size: STANDARD_DATAGRAM_SIZE,
+                                });
+                            }
                             let datagram_size = active_datagram_size.load(Ordering::Acquire);
-                            let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
-                                &jumbo_config_json
-                            } else {
-                                &standard_config_json
-                            };
-                            Packet::Config(config_json).encode(&mut response);
+                            Packet::Config(configs.for_viewer(datagram_size, active_video))
+                                .encode(&mut response);
                             let _ = socket.send_to(&response, peer);
                         }
-                        Packet::Hello { max_datagram_size }
-                            if current_peer.is_some_and(|current| {
-                                current != peer && current.ip() == peer.ip()
-                            }) =>
+                        Packet::Hello {
+                            max_datagram_size,
+                            audio_only,
+                        } if current_peer.is_some_and(|current| {
+                            current != peer && current.ip() == peer.ip()
+                        }) =>
                         {
                             // A manually restarted client keeps the same host
                             // address but receives a new ephemeral UDP port.
@@ -972,64 +1102,67 @@ fn spawn_host_network(
                             // of rejecting the user's own Mac as a second peer.
                             let client_max = usize::from(max_datagram_size)
                                 .clamp(STANDARD_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
+                            let video = configs.video && !audio_only;
                             let datagram_size =
-                                if jumbo_requested && client_max >= JUMBO_DATAGRAM_SIZE {
-                                    JUMBO_DATAGRAM_SIZE
-                                } else {
-                                    STANDARD_DATAGRAM_SIZE
-                                };
+                                negotiated_datagram_size(jumbo_requested, client_max, video);
                             active_datagram_size.store(datagram_size, Ordering::Release);
-                            replace_active_peer(&active_peer, &peer_epoch, Some(peer));
+                            replace_active_peer(&peers, Some((peer, video)));
+                            active_video = video;
                             last_seen = Some(Instant::now());
                             reconnect_peer = None;
                             force_keyframe.store(true, Ordering::Release);
-                            let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
-                                &jumbo_config_json
-                            } else {
-                                &standard_config_json
-                            };
-                            Packet::Config(config_json).encode(&mut response);
+                            Packet::Config(configs.for_viewer(datagram_size, video))
+                                .encode(&mut response);
                             if socket.send_to(&response, peer).is_ok() {
                                 let _ = events.send(SessionEvent::Connected(peer));
+                                let _ = events.send(SessionEvent::PeerMedia { video });
                             }
                         }
                         Packet::Hello { .. }
                             if current_peer.is_none()
-                                && reconnect_peer.is_some_and(|(trusted, _, since)| {
+                                && reconnect_peer.is_some_and(|(trusted, _, _, since)| {
                                     trusted == peer && since.elapsed() < RECONNECT_GRACE
                                 }) =>
                         {
-                            let (_, datagram_size, _) = reconnect_peer
+                            let (_, datagram_size, video, _) = reconnect_peer
                                 .take()
                                 .expect("the reconnect peer was just matched");
                             active_datagram_size.store(datagram_size, Ordering::Release);
-                            replace_active_peer(&active_peer, &peer_epoch, Some(peer));
+                            replace_active_peer(&peers, Some((peer, video)));
+                            active_video = video;
                             last_seen = Some(Instant::now());
                             force_keyframe.store(true, Ordering::Release);
-                            let config_json = if datagram_size == JUMBO_DATAGRAM_SIZE {
-                                &jumbo_config_json
-                            } else {
-                                &standard_config_json
-                            };
-                            Packet::Config(config_json).encode(&mut response);
+                            Packet::Config(configs.for_viewer(datagram_size, video))
+                                .encode(&mut response);
                             if let Err(error) = socket.send_to(&response, peer) {
-                                replace_active_peer(&active_peer, &peer_epoch, None);
-                                reconnect_peer = Some((peer, datagram_size, Instant::now()));
+                                replace_active_peer(&peers, None);
+                                reconnect_peer = Some((peer, datagram_size, video, Instant::now()));
                                 last_seen = None;
                                 let _ = events.send(SessionEvent::Error(format!(
                                     "Unable to restore {peer}: {error}"
                                 )));
                             } else {
                                 let _ = events.send(SessionEvent::Connected(peer));
+                                let _ = events.send(SessionEvent::PeerMedia { video });
                             }
                         }
-                        Packet::Hello { max_datagram_size } if current_peer.is_none() => {
+                        Packet::Hello {
+                            max_datagram_size,
+                            audio_only,
+                        } if current_peer.is_none() => {
                             let advertised = usize::from(max_datagram_size)
                                 .clamp(STANDARD_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
-                            let is_new = pending_peer.map(|(pending, _)| pending) != Some(peer);
-                            pending_peer = Some((peer, advertised));
-                            if is_new {
-                                let _ = events.send(SessionEvent::PendingConnection(peer));
+                            let previous = pending_peer.filter(|(pending, ..)| *pending == peer);
+                            let (advertised, video) = merge_pending_hello(
+                                previous.map(|(_, max, video)| (max, video)),
+                                advertised,
+                                configs.video && !audio_only,
+                            );
+                            pending_peer = Some((peer, advertised, video));
+                            if previous.is_none_or(|(_, _, previous_video)| previous_video != video)
+                            {
+                                let _ =
+                                    events.send(SessionEvent::PendingConnection { peer, video });
                             }
                         }
                         Packet::Hello { .. } => {
@@ -1071,7 +1204,7 @@ fn spawn_host_network(
             }
 
             let latest_stats = pending_server_stats.lock().unwrap().take();
-            if let (Some(stats), Some(peer)) = (latest_stats, *active_peer.lock().unwrap()) {
+            if let (Some(stats), Some(peer)) = (latest_stats, *peers.active.lock().unwrap()) {
                 Packet::ServerStats(stats).encode(&mut response);
                 if let Err(error) = socket.send_to(&response, peer) {
                     warn!("Server stats send to {peer} failed: {error}");
@@ -1092,10 +1225,11 @@ fn spawn_host_network(
             }
 
             if last_seen.is_some_and(|seen| seen.elapsed() >= CONNECTION_TIMEOUT) {
-                if let Some(peer) = replace_active_peer(&active_peer, &peer_epoch, None) {
+                if let Some(peer) = replace_active_peer(&peers, None) {
                     reconnect_peer = Some((
                         peer,
                         active_datagram_size.load(Ordering::Acquire),
+                        active_video,
                         Instant::now(),
                     ));
                     let _ = events.send(SessionEvent::Disconnected(format!(
@@ -1104,7 +1238,7 @@ fn spawn_host_network(
                 }
                 last_seen = None;
             }
-            if reconnect_peer.is_some_and(|(_, _, since)| since.elapsed() >= RECONNECT_GRACE) {
+            if reconnect_peer.is_some_and(|(.., since)| since.elapsed() >= RECONNECT_GRACE) {
                 reconnect_peer = None;
                 active_datagram_size.store(STANDARD_DATAGRAM_SIZE, Ordering::Release);
             }
@@ -1402,9 +1536,13 @@ fn spawn_client_network(
     frame_notifier: FrameNotifier,
     mut audio_output_device: Option<String>,
     audio_commands: mpsc::Receiver<Option<String>>,
+    audio_only: bool,
+    volume: audio::AudioGain,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut reassembler = VideoReassembler::new(8, VIDEO_REASSEMBLY_AGE);
+        // Set from the host's config; an audio-only viewer never enables it.
+        let mut video_enabled = false;
         let mut packet_buffer = [0_u8; MAX_DATAGRAM_SIZE];
         let mut outgoing = Vec::with_capacity(MAX_DATAGRAM_SIZE);
         let mut accepted = false;
@@ -1440,7 +1578,10 @@ fn spawn_client_network(
                 completed_frames.clear();
                 next_frame_id = None;
                 waiting_for_keyframe = true;
-                if accepted && last_keyframe_request.elapsed() >= KEYFRAME_RETRY_INTERVAL {
+                if accepted
+                    && video_enabled
+                    && last_keyframe_request.elapsed() >= KEYFRAME_RETRY_INTERVAL
+                {
                     request_keyframe(&socket, &mut outgoing);
                     last_keyframe_request = Instant::now();
                 }
@@ -1450,7 +1591,10 @@ fn spawn_client_network(
                 completed_frames.clear();
                 next_frame_id = None;
                 waiting_for_keyframe = true;
-                if accepted && last_keyframe_request.elapsed() >= KEYFRAME_RETRY_INTERVAL {
+                if accepted
+                    && video_enabled
+                    && last_keyframe_request.elapsed() >= KEYFRAME_RETRY_INTERVAL
+                {
                     request_keyframe(&socket, &mut outgoing);
                     last_keyframe_request = Instant::now();
                 }
@@ -1463,20 +1607,23 @@ fn spawn_client_network(
                         config,
                         audio_output_device.clone(),
                         events.clone(),
+                        volume.clone(),
                     ));
                 }
             }
             if !accepted && last_hello.elapsed() >= HELLO_INTERVAL {
                 // Send the legacy empty hello first so standard-MTU ECB2 hosts
-                // still see the request, then advertise jumbo capability to
-                // upgraded hosts.
+                // still see the request, then advertise jumbo capability and
+                // any audio-only request to upgraded hosts.
                 Packet::Hello {
                     max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+                    audio_only: false,
                 }
                 .encode(&mut outgoing);
                 let _ = socket.send(&outgoing);
                 Packet::Hello {
                     max_datagram_size: MAX_DATAGRAM_SIZE as u16,
+                    audio_only,
                 }
                 .encode(&mut outgoing);
                 if let Err(error) = socket.send(&outgoing) {
@@ -1531,6 +1678,7 @@ fn spawn_client_network(
                                         config,
                                         audio_output_device.clone(),
                                         events.clone(),
+                                        volume.clone(),
                                     ));
                                 } else {
                                     let _ = events.send(SessionEvent::AudioBackend(
@@ -1538,11 +1686,20 @@ fn spawn_client_network(
                                     ));
                                 }
                             }
-                            let Some(video) = config.video else {
-                                let _ = events.send(SessionEvent::Error(
-                                    "Host did not offer a video stream".to_owned(),
-                                ));
-                                return;
+                            // Older hosts ignore the audio-only request, so an
+                            // audio-only viewer also drops any video offer.
+                            let Some(video) = config.video.filter(|_| !audio_only) else {
+                                video_enabled = false;
+                                negotiated_datagram_size = STANDARD_DATAGRAM_SIZE;
+                                let _ = events.send(SessionEvent::TransportConfigured {
+                                    datagram_size: negotiated_datagram_size,
+                                });
+                                if !accepted {
+                                    accepted = true;
+                                    let _ = events.send(SessionEvent::Connected(server_addr));
+                                    let _ = events.send(SessionEvent::PeerMedia { video: false });
+                                }
+                                continue;
                             };
                             if video.codec != VideoCodec::H264 {
                                 let _ = events.send(SessionEvent::Error(format!(
@@ -1568,9 +1725,11 @@ fn spawn_client_network(
                                 width: video.width,
                                 height: video.height,
                             });
+                            video_enabled = true;
                             if !accepted {
                                 accepted = true;
                                 let _ = events.send(SessionEvent::Connected(server_addr));
+                                let _ = events.send(SessionEvent::PeerMedia { video: true });
                                 request_keyframe(&socket, &mut outgoing);
                             }
                         }
@@ -1596,7 +1755,7 @@ fn spawn_client_network(
                                 playback.push(frame);
                             }
                         }
-                        Packet::Video(fragment) if accepted => {
+                        Packet::Video(fragment) if accepted && video_enabled => {
                             if size > negotiated_datagram_size {
                                 metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                                 metrics.lost_frames.fetch_add(1, Ordering::Relaxed);
@@ -1981,19 +2140,92 @@ fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
 mod tests {
     use super::*;
 
+    fn host_peers() -> HostPeers {
+        HostPeers {
+            active: Arc::new(Mutex::new(None)),
+            video: Arc::new(Mutex::new(None)),
+            epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     #[test]
     fn peer_epoch_distinguishes_a_reused_socket_address() {
         let peer = "127.0.0.1:3013".parse().unwrap();
-        let active_peer = Mutex::new(None);
-        let epoch = AtomicU64::new(0);
+        let peers = host_peers();
 
-        assert_eq!(replace_active_peer(&active_peer, &epoch, Some(peer)), None);
-        assert_eq!(epoch.load(Ordering::Acquire), 1);
+        assert_eq!(replace_active_peer(&peers, Some((peer, true))), None);
+        assert_eq!(peers.epoch.load(Ordering::Acquire), 1);
+        assert_eq!(replace_active_peer(&peers, Some((peer, true))), Some(peer));
+        assert_eq!(peers.epoch.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn audio_only_viewer_never_reaches_the_video_pipelines() {
+        let peer = "192.168.1.42:51820".parse().unwrap();
+        let peers = host_peers();
+
+        replace_active_peer(&peers, Some((peer, false)));
+        assert_eq!(*peers.active.lock().unwrap(), Some(peer));
+        assert_eq!(*peers.video.lock().unwrap(), None);
+
+        replace_active_peer(&peers, Some((peer, true)));
+        assert_eq!(*peers.video.lock().unwrap(), Some(peer));
+
+        replace_active_peer(&peers, None);
+        assert_eq!(*peers.active.lock().unwrap(), None);
+        assert_eq!(*peers.video.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn host_offers_an_audio_only_config_to_audio_only_viewers() {
+        let configs = HostConfigs {
+            standard: b"standard".to_vec(),
+            jumbo: b"jumbo".to_vec(),
+            audio_only: b"audio".to_vec(),
+            video: true,
+        };
         assert_eq!(
-            replace_active_peer(&active_peer, &epoch, Some(peer)),
-            Some(peer)
+            configs.for_viewer(STANDARD_DATAGRAM_SIZE, true),
+            b"standard"
         );
-        assert_eq!(epoch.load(Ordering::Acquire), 2);
+        assert_eq!(configs.for_viewer(JUMBO_DATAGRAM_SIZE, true), b"jumbo");
+        assert_eq!(configs.for_viewer(JUMBO_DATAGRAM_SIZE, false), b"audio");
+    }
+
+    #[test]
+    fn jumbo_datagrams_need_video_and_both_sides_to_agree() {
+        assert_eq!(
+            negotiated_datagram_size(true, JUMBO_DATAGRAM_SIZE, true),
+            JUMBO_DATAGRAM_SIZE
+        );
+        assert_eq!(
+            negotiated_datagram_size(false, JUMBO_DATAGRAM_SIZE, true),
+            STANDARD_DATAGRAM_SIZE
+        );
+        assert_eq!(
+            negotiated_datagram_size(true, STANDARD_DATAGRAM_SIZE, true),
+            STANDARD_DATAGRAM_SIZE
+        );
+        assert_eq!(
+            negotiated_datagram_size(true, JUMBO_DATAGRAM_SIZE, false),
+            STANDARD_DATAGRAM_SIZE
+        );
+    }
+
+    #[test]
+    fn one_audio_only_hello_keeps_a_pending_viewer_audio_only() {
+        // The legacy Hello (video) and the capability Hello (audio-only) can
+        // arrive in either order; both orders end audio-only at jumbo size.
+        let first = merge_pending_hello(None, STANDARD_DATAGRAM_SIZE, true);
+        assert_eq!(
+            merge_pending_hello(Some(first), JUMBO_DATAGRAM_SIZE, false),
+            (JUMBO_DATAGRAM_SIZE, false)
+        );
+        let first = merge_pending_hello(None, JUMBO_DATAGRAM_SIZE, false);
+        assert_eq!(
+            merge_pending_hello(Some(first), STANDARD_DATAGRAM_SIZE, true),
+            (JUMBO_DATAGRAM_SIZE, false)
+        );
     }
 
     fn received(frame_id: u64, is_keyframe: bool, age: Duration) -> ReceivedVideoFrame {
