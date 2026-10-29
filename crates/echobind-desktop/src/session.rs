@@ -404,13 +404,20 @@ impl DecodeQueue {
         DecodeQueuePush::Queued
     }
 
-    pub(super) fn pop_timeout(&self, timeout: Duration) -> Option<ReceivedVideoFrame> {
+    /// Pops the next frame together with the decoder generation it belongs
+    /// to. Both are read under one lock because the receive thread advances
+    /// the generation and queues the new IDR back to back. A decoder that read
+    /// the generation before waiting here would build its new session under
+    /// the old generation, discard every picture as stale, and keep requesting
+    /// keyframes until a lucky wake-up order broke the cycle.
+    pub(super) fn pop_timeout(&self, timeout: Duration) -> Option<(ReceivedVideoFrame, u64)> {
         let (lock, ready) = &*self.inner;
         let mut state = lock.lock().unwrap();
         if state.frames.is_empty() {
             state = ready.wait_timeout(state, timeout).unwrap().0;
         }
-        state.frames.pop_front()
+        let frame = state.frames.pop_front()?;
+        Some((frame, state.generation))
     }
 
     fn require_keyframe(&self) {
@@ -2052,15 +2059,15 @@ fn run_software_video_decoder(
     ));
 
     while running.load(Ordering::Relaxed) {
-        let generation = decode_queue.generation();
+        let Some((received, generation)) = decode_queue.pop_timeout(Duration::from_millis(20))
+        else {
+            continue;
+        };
         if generation != decoder_generation {
             decoder = Decoder::new()
                 .map_err(|error| format!("Unable to reset H.264 decoder: {error}"))?;
             decoder_generation = generation;
         }
-        let Some(received) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
-            continue;
-        };
         let queue_elapsed = received.received_at.elapsed();
         if queue_elapsed > VIDEO_STALE_AGE {
             metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
@@ -2267,6 +2274,30 @@ mod tests {
         assert_eq!(
             queue.push(received(4, true, Duration::ZERO)),
             DecodeQueuePush::Queued
+        );
+    }
+
+    #[test]
+    fn an_idr_queued_right_after_a_reset_is_popped_with_the_new_generation() {
+        let queue = DecodeQueue::new();
+        // The decoder last saw this generation before it waited for a frame.
+        let decoder_generation = queue.generation();
+        // The receive thread resets the decoder for a new IDR and queues the
+        // IDR before the decoder wakes up.
+        queue.require_keyframe();
+        assert_eq!(
+            queue.push(received(7, true, Duration::ZERO)),
+            DecodeQueuePush::Queued
+        );
+
+        let (frame, generation) = queue
+            .pop_timeout(Duration::ZERO)
+            .expect("the IDR is queued");
+        assert!(frame.frame.is_keyframe);
+        assert_eq!(generation, queue.generation());
+        assert_ne!(
+            generation, decoder_generation,
+            "the decoder must rebuild its session under the IDR's generation"
         );
     }
 
