@@ -48,9 +48,11 @@ submission order.
 
 Only two frames may remain in the copy/convert/submit stages, while the deeper
 ring retains frames already accepted by NVENC. Prepared and converted frames
-older than two target frame intervals are discarded, queued desktop samples
-are coalesced before conversion, and conversion is limited to one frame of
-work-ahead. GPU overload therefore cannot flood the graphics queue with stale
+older than 50 ms (two frame intervals below 40 FPS) are discarded, queued
+desktop samples are coalesced before conversion, and conversion is limited to
+one frame of work-ahead. A loaded GPU can hold the frame being mapped for
+longer than two 120 FPS intervals, so a frame-relative limit would discard the
+next frame on every cycle. GPU overload therefore cannot flood the graphics queue with stale
 full-screen copies or scaler work. A transient `NV_ENC_ERR_ENCODER_BUSY`
 response is retried only within the frame's latency budget instead of tearing
 down the stream; a genuinely stalled session is rebuilt with a bounded retry
@@ -64,6 +66,11 @@ send uses the same refresh path when an unchanged desktop has no new bitmap to
 encode. Cursor-only acquisition can provide the initial desktop surface, while
 pointer traffic itself is coalesced off the highest-priority capture thread.
 Device-removal status from D3D11 or NVENC triggers a fresh device/session retry.
+The Windows host requests realtime GPU scheduling priority and falls back to
+high when it isn't elevated. With hardware-accelerated GPU scheduling and an
+uncapped game saturating the GPU, high priority left every NVENC frame waiting
+about 190 ms and capped the stream near 10 FPS; realtime kept 120 FPS with a
+4 ms encode. Set `ECHOBIND_GPU_REALTIME=0` to stay at high priority.
 macOS uses ScreenCaptureKit and a four-frame
 asynchronous VideoToolbox pipeline for hardware encode.
 `VTCompressionSessionCompleteFrames` is used only for final drain rather than
@@ -72,9 +79,12 @@ IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264 is retained
 as a reported fallback.
 
 The low-latency path has no B-frame reordering, uses one H.264 slice per picture
-and a one-frame NVENC VBV, generates IDRs only for startup or recovery, requests
+and a one-frame NVENC VBV (recovery IDRs may use twice the P-frame budget so
+they do not blur the picture), generates IDRs only for startup or recovery, requests
 UI repaints directly from the decoder callback, and bounds every host and
-decode queue. The UI reports
+decode queue. On Windows at most one forced recovery IDR is in flight: a
+viewer keyframe request, send failure, or discarded P-frame raised before that
+IDR reaches the sender is resolved by it instead of forcing another. The UI reports
 capture, encode, send, reassembly, decode,
 presentation, RTT, jitter, drop, loss, and host send-failure measurements.
 Encoded datagrams are paced in byte-bounded batches on both hardware backends

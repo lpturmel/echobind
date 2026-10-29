@@ -1,6 +1,6 @@
 use super::{
     publish_server_stats, video_pacing_batch_datagrams, DatagramPacer, PendingServerStats,
-    PreciseSleeper, SessionEvent,
+    PreciseSleeper, SessionEvent, VIDEO_SEND_STALE_AGE,
 };
 use echobind_core::{
     protocol::{CursorPosition, Packet, ServerStats, MAX_DATAGRAM_SIZE},
@@ -18,7 +18,7 @@ use moq_nvenc::sys::nvEncodeAPI::{
     NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS,
     NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
-    NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID,
+    NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID, NV_ENC_RC_PARAMS,
     NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER, NV_ENC_TUNING_INFO,
     NV_ENC_VUI_COLOR_PRIMARIES, NV_ENC_VUI_MATRIX_COEFFS, NV_ENC_VUI_TRANSFER_CHARACTERISTIC,
     NV_ENC_VUI_VIDEO_FORMAT,
@@ -35,7 +35,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use tracing::warn;
+use tracing::{info, warn};
 use windows::{
     core::{w, Interface},
     Win32::{
@@ -97,6 +97,11 @@ const MAX_PRE_NVENC_IN_FLIGHT: usize = 2;
 // flooding the graphics queue or turning into an unbounded latency queue.
 const NVENC_BUFFER_BUDGET_MS: u32 = 100;
 const NVENC_H264_NUM_SLICES_MODE: u32 = 3;
+// NV_ENC_RC_PARAMS::lowDelayKeyFrameScale: I-frame to P-frame bit ratio under
+// CBR with a single-frame VBV. NVIDIA defaults it to 1 for the ultra-low-latency
+// tuning used here and to 2 for the low-latency tuning.
+const NVENC_RECOVERY_IDR_BIT_SCALE: u8 = 2;
+// The pre-NVENC freshness limit at low frame rates; see max_pre_encode_frame_age.
 const MAX_PREPARED_FRAME_AGE_INTERVALS: f64 = 2.0;
 const NVENC_BUSY_RETRY_DELAY: Duration = Duration::from_millis(1);
 const NVENC_BUSY_RETRY_TIMEOUT: Duration = Duration::from_millis(50);
@@ -129,18 +134,23 @@ const ACCESS_LOST_MAX_RETRY_DELAY_MS: u64 = 200;
 const INACTIVE_PEER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const CURSOR_UPDATE_INTERVAL: Duration = Duration::from_millis(4);
 const CURSOR_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
-// Keep capture/conversion work ahead of a saturated game without using DXGI's
-// absolute realtime priorities, which Microsoft reserves for privileged work
-// and which can make a HAGS system unresponsive when VRAM is exhausted.
+// The highest relative priority inside the capture D3D11 device. Arbitration
+// against a saturated game is decided by the process class below.
 const CAPTURE_GPU_THREAD_PRIORITY: i32 = 7;
-// D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH. Realtime is intentionally not used:
-// NVIDIA documents no contract for it, and production streamers avoid it on
-// HAGS because it can freeze encoding or reset the driver near the VRAM limit.
+// D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME, falling back to HIGH. Measured
+// with HAGS and an uncapped game at 99% GPU (RTX 3060): at HIGH, every NVENC
+// frame waited ~190 ms between submission and completion, which also held
+// back DXGI delivery and capped the stream at ~10 FPS; at REALTIME the wait
+// was ~4 ms at 120 FPS. Sunshine also defaults to realtime on HAGS. NVIDIA
+// drivers have been reported to freeze the encoder at realtime when VRAM is
+// nearly full, so ECHOBIND_GPU_REALTIME=0 keeps the host at HIGH.
+const D3DKMT_PROCESS_GPU_PRIORITY_REALTIME: i32 = 5;
 const D3DKMT_PROCESS_GPU_PRIORITY_HIGH: i32 = 4;
 const D3DKMT_PROCESS_GPU_PRIORITY_ABOVE_NORMAL: i32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessGpuPriority {
+    Realtime,
     High,
     AboveNormal,
     Normal,
@@ -149,6 +159,7 @@ enum ProcessGpuPriority {
 impl ProcessGpuPriority {
     fn label(self) -> &'static str {
         match self {
+            Self::Realtime => "process GPU realtime",
             Self::High => "process GPU high",
             Self::AboveNormal => "process GPU above-normal",
             Self::Normal => "process GPU normal",
@@ -157,6 +168,7 @@ impl ProcessGpuPriority {
 
     fn class(self) -> u64 {
         match self {
+            Self::Realtime => D3DKMT_PROCESS_GPU_PRIORITY_REALTIME as u64,
             Self::High => D3DKMT_PROCESS_GPU_PRIORITY_HIGH as u64,
             Self::AboveNormal => D3DKMT_PROCESS_GPU_PRIORITY_ABOVE_NORMAL as u64,
             Self::Normal => 2,
@@ -174,6 +186,7 @@ struct CaptureFlags {
     nvenc_activity: Arc<Mutex<NvencActivityState>>,
     hardware_progress: Arc<AtomicU64>,
     next_frame_id: Arc<AtomicU64>,
+    idr_in_flight: Arc<IdrInFlight>,
     stream_started: Instant,
     events: mpsc::Sender<SessionEvent>,
     frames_per_second: u32,
@@ -248,6 +261,83 @@ struct WindowsCaptureMetrics {
     process_gpu_priority: AtomicU64,
     nvenc_buffer_count: AtomicU64,
     video_send_failures: AtomicU64,
+    idr_requests_covered: AtomicU64,
+}
+
+/// The forced IDR that NVENC has accepted but the sender has not finished
+/// with. Frames reach the sender in submission order, so every IDR request
+/// raised before that frame is handled (a viewer loss report, a send failure,
+/// a discarded P-frame, a new peer or the stall watchdog) concerns an earlier
+/// frame and is resolved by it. Forcing another IDR for such a request only
+/// adds a second large, low-quality frame to the recovery.
+struct IdrInFlight {
+    frame_id: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdrDecision {
+    NotRequested,
+    Force,
+    CoveredByInFlight,
+}
+
+impl IdrInFlight {
+    const NONE: u64 = u64::MAX;
+
+    fn new() -> Self {
+        Self {
+            frame_id: AtomicU64::new(Self::NONE),
+        }
+    }
+
+    fn clear(&self) {
+        self.frame_id.store(Self::NONE, Ordering::Release);
+    }
+
+    fn is_pending(&self) -> bool {
+        self.frame_id.load(Ordering::Acquire) != Self::NONE
+    }
+
+    /// Called by the submission thread before the frame is handed to the
+    /// completion worker, so the sender can never observe it first.
+    fn record_submitted(&self, frame_id: u64) {
+        self.frame_id.store(frame_id, Ordering::Release);
+    }
+
+    /// Called by the sender once it has sent or discarded a frame. A later
+    /// frame also clears the gate: the IDR was then lost in a session
+    /// teardown and can no longer satisfy anyone.
+    fn record_handled(&self, frame_id: u64) {
+        let pending = self.frame_id.load(Ordering::Acquire);
+        if pending != Self::NONE && frame_id >= pending {
+            let _ = self.frame_id.compare_exchange(
+                pending,
+                Self::NONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+fn take_idr_request(force_keyframe: &AtomicBool, idr_in_flight: &IdrInFlight) -> IdrDecision {
+    if !force_keyframe.swap(false, Ordering::AcqRel) {
+        IdrDecision::NotRequested
+    } else if idr_in_flight.is_pending() {
+        IdrDecision::CoveredByInFlight
+    } else {
+        IdrDecision::Force
+    }
+}
+
+/// The sender's recovery request. While an IDR is still on its way to the
+/// sender it will repair this loss too; re-arming the shared flag for each
+/// discarded P-frame would otherwise survive until just after that IDR is
+/// sent and force a second one.
+fn request_recovery_idr(force_keyframe: &AtomicBool, idr_in_flight: &IdrInFlight) {
+    if !idr_in_flight.is_pending() {
+        force_keyframe.store(true, Ordering::Release);
+    }
 }
 
 struct HardwareCapture {
@@ -414,6 +504,20 @@ fn nvenc_buffer_count(frames_per_second: u32) -> usize {
     requested.clamp(MIN_NVENC_BUFFER_COUNT, MAX_NVENC_BUFFER_COUNT)
 }
 
+fn max_pre_encode_frame_age(frames_per_second: u32) -> Duration {
+    // Only two frames may be in the copy/convert/submit stages, so while one
+    // waits in NvEncMapInputResource for its GPU copy and conversion, the next
+    // converted frame waits behind it. Under a GPU-bound game that map can
+    // exceed two 120 FPS intervals (16.7 ms). A frame-relative limit then
+    // discarded the waiting frame on every cycle, roughly halving throughput
+    // exactly when the GPU was already the bottleneck. That frame's GPU work
+    // has already been issued, and coalescing already prefers a newer sample
+    // whenever one is queued. Use the same absolute bound as the macOS host
+    // and keep two intervals as the floor for low frame rates.
+    Duration::from_secs_f64(MAX_PREPARED_FRAME_AGE_INTERVALS / f64::from(frames_per_second.max(1)))
+        .max(VIDEO_SEND_STALE_AGE)
+}
+
 fn retain_newest_queued<T>(
     receiver: &mpsc::Receiver<T>,
     mut newest: T,
@@ -501,6 +605,34 @@ fn publish_first_worker_failure(
     }
     failure.get_or_insert(error);
     true
+}
+
+fn configure_low_latency_rate_control(
+    rc: &mut NV_ENC_RC_PARAMS,
+    frames_per_second: u32,
+    bitrate_bps: u32,
+) {
+    rc.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
+    rc.averageBitRate = bitrate_bps;
+    rc.maxBitRate = bitrate_bps;
+    let frame_budget = bitrate_bps / frames_per_second.max(1);
+    rc.vbvBufferSize = frame_budget.max(1);
+    rc.vbvInitialDelay = rc.vbvBufferSize;
+    // IDRs exist only for startup and recovery. With the ultra-low-latency
+    // default of 1, a full intra picture must fit a P-frame's one-frame
+    // budget, so every recovery visibly blurs the image for several frames
+    // while the following P-frames rebuild detail. Twice the P budget is the
+    // driver's own low-latency default; such IDRs stay rare and are paced
+    // like any other frame.
+    rc.lowDelayKeyFrameScale = NVENC_RECOVERY_IDR_BIT_SCALE;
+    // At native ultrawide 120 FPS, throughput takes precedence over AQ.
+    // The LAN bitrate budget is high enough to preserve detail without
+    // spending extra NVENC cycles on adaptive quantization.
+    rc.set_enableAQ(0);
+    rc.set_aqStrength(0);
+    rc.set_enableTemporalAQ(0);
+    rc.set_enableLookahead(0);
+    rc.set_zeroReorderDelay(1);
 }
 
 fn configure_single_h264_slice(config: &mut NV_ENC_CONFIG_H264) {
@@ -598,6 +730,7 @@ fn run_dxgi_pipeline(
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
     let (cursor_tx, cursor_rx) = mpsc::sync_channel(1);
     let metrics = Arc::new(WindowsCaptureMetrics::default());
+    let idr_in_flight = Arc::new(IdrInFlight::new());
     let sender_running = Arc::new(AtomicBool::new(true));
     let sender_handle = spawn_hardware_sender(
         socket.clone(),
@@ -606,6 +739,7 @@ fn run_dxgi_pipeline(
         active_peer.clone(),
         peer_epoch.clone(),
         force_keyframe.clone(),
+        idr_in_flight.clone(),
         events.clone(),
         encoded_rx,
         cursor_rx,
@@ -650,6 +784,7 @@ fn run_dxgi_pipeline(
             metrics.clone(),
             hardware_progress.clone(),
             next_frame_id.clone(),
+            idr_in_flight.clone(),
             stream_started,
         );
         if hardware_progress.load(Ordering::Acquire) > progress_before {
@@ -798,6 +933,7 @@ fn run_dxgi_capture_session(
     metrics: Arc<WindowsCaptureMetrics>,
     hardware_progress: Arc<AtomicU64>,
     next_frame_id: Arc<AtomicU64>,
+    idr_in_flight: Arc<IdrInFlight>,
     stream_started: Instant,
 ) -> Result<(), DxgiCaptureFailure> {
     let session_peer = active_peer
@@ -851,6 +987,7 @@ fn run_dxgi_capture_session(
             nvenc_activity,
             hardware_progress: hardware_progress.clone(),
             next_frame_id,
+            idr_in_flight,
             stream_started,
             events: events.clone(),
             frames_per_second,
@@ -1347,6 +1484,19 @@ fn configure_process_gpu_priority() -> ProcessGpuPriority {
             return ProcessGpuPriority::Normal;
         }
     };
+    if gpu_realtime_opted_out(std::env::var("ECHOBIND_GPU_REALTIME").ok().as_deref()) {
+        info!("Realtime capture GPU scheduling priority is disabled by ECHOBIND_GPU_REALTIME");
+    } else {
+        let realtime_status =
+            unsafe { set_priority(GetCurrentProcess(), D3DKMT_PROCESS_GPU_PRIORITY_REALTIME) };
+        if realtime_status >= 0 {
+            return ProcessGpuPriority::Realtime;
+        }
+        warn!(
+            "Realtime capture GPU scheduling priority was refused (NTSTATUS 0x{:08X}); run the host elevated for it. Trying high",
+            realtime_status as u32
+        );
+    }
     let high_status =
         unsafe { set_priority(GetCurrentProcess(), D3DKMT_PROCESS_GPU_PRIORITY_HIGH) };
     if high_status >= 0 {
@@ -1378,6 +1528,15 @@ fn configure_process_gpu_priority() -> ProcessGpuPriority {
         );
         ProcessGpuPriority::Normal
     }
+}
+
+fn gpu_realtime_opted_out(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
 }
 
 fn enable_gpu_scheduling_privilege() {
@@ -1598,6 +1757,9 @@ impl HardwareCapture {
             .metrics
             .nvenc_buffer_count
             .store(buffer_count as u64, Ordering::Release);
+        // An IDR accepted by the previous session may have been dropped in its
+        // teardown. This session's first frame must be free to force one.
+        flags.idr_in_flight.clear();
         // Feed NVENC NV12 rather than RGB. RGB input is supported, but the
         // driver performs additional preprocessing before the dedicated
         // encoder. On Ampere at ultrawide resolutions that work serialized
@@ -1701,6 +1863,7 @@ impl HardwareCapture {
             flags.nvenc_activity.clone(),
             worker_failure.clone(),
             flags.next_frame_id.clone(),
+            flags.idr_in_flight.clone(),
             flags.frames_per_second,
             conversion_permit_tx,
             submission_done_tx,
@@ -2053,9 +2216,7 @@ fn spawn_d3d_conversion(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         raise_current_thread_priority("D3D11 conversion", THREAD_PRIORITY_HIGHEST);
-        let max_prepared_frame_age = Duration::from_secs_f64(
-            MAX_PREPARED_FRAME_AGE_INTERVALS / f64::from(frames_per_second.max(1)),
-        );
+        let max_prepared_frame_age = max_pre_encode_frame_age(frames_per_second);
 
         'worker: loop {
             if !running.load(Ordering::Relaxed) || !workers_running.load(Ordering::Acquire) {
@@ -2096,7 +2257,7 @@ fn spawn_d3d_conversion(
                 if prepared.captured_at.elapsed() > max_prepared_frame_age {
                     // Keep the permit and wait for a fresh sample rather than
                     // waking submission with work that already missed its
-                    // two-frame latency budget.
+                    // freshness budget.
                     metrics.stale_frames.fetch_add(1, Ordering::Relaxed);
                     let _ = free_slots.try_send(slot);
                     preprocess_in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -2178,6 +2339,7 @@ fn spawn_nvenc_submission(
     nvenc_activity: Arc<Mutex<NvencActivityState>>,
     worker_failure: Arc<Mutex<Option<String>>>,
     next_frame_id: Arc<AtomicU64>,
+    idr_in_flight: Arc<IdrInFlight>,
     frames_per_second: u32,
     conversion_permits: mpsc::SyncSender<()>,
     submission_done: mpsc::Sender<()>,
@@ -2188,9 +2350,7 @@ fn spawn_nvenc_submission(
         // sequence. Frames discarded before NVENC must not create a false
         // reference gap at the sender.
         let busy_sleeper = PreciseSleeper::new();
-        let max_converted_frame_age = Duration::from_secs_f64(
-            MAX_PREPARED_FRAME_AGE_INTERVALS / f64::from(frames_per_second.max(1)),
-        );
+        let max_converted_frame_age = max_pre_encode_frame_age(frames_per_second);
 
         loop {
             if !running.load(Ordering::Relaxed) || !workers_running.load(Ordering::Acquire) {
@@ -2243,6 +2403,7 @@ fn spawn_nvenc_submission(
                 &encoder,
                 converted,
                 &force_keyframe,
+                &idr_in_flight,
                 &metrics,
                 &next_frame_id,
                 &busy_sleeper,
@@ -2492,11 +2653,16 @@ fn submit_converted_frame(
     encoder: &NvencEncoder,
     converted: ConvertedHardwareFrame,
     force_keyframe: &AtomicBool,
+    idr_in_flight: &IdrInFlight,
     metrics: &WindowsCaptureMetrics,
     next_frame_id: &AtomicU64,
     busy_sleeper: &PreciseSleeper,
 ) -> Result<Option<PendingNvencFrame>, String> {
-    let force_idr = force_keyframe.swap(false, Ordering::Relaxed);
+    let idr_decision = take_idr_request(force_keyframe, idr_in_flight);
+    if idr_decision == IdrDecision::CoveredByInFlight {
+        metrics.idr_requests_covered.fetch_add(1, Ordering::Relaxed);
+    }
+    let force_idr = idr_decision == IdrDecision::Force;
     let capture_us = elapsed_microseconds(converted.captured_at);
     let submit_result = match encoder.submit(
         converted.slot,
@@ -2528,6 +2694,9 @@ fn submit_converted_frame(
     let encode_started = Instant::now();
     metrics.nvenc_submissions.fetch_add(1, Ordering::Relaxed);
     let frame_id = allocate_submitted_frame_id(next_frame_id);
+    if force_idr {
+        idr_in_flight.record_submitted(frame_id);
+    }
 
     Ok(Some(PendingNvencFrame {
         slot: converted.slot,
@@ -2557,6 +2726,7 @@ fn spawn_hardware_sender(
     active_peer: Arc<Mutex<Option<SocketAddr>>>,
     peer_epoch: Arc<AtomicU64>,
     force_keyframe: Arc<AtomicBool>,
+    idr_in_flight: Arc<IdrInFlight>,
     events: mpsc::Sender<SessionEvent>,
     encoded_frames: mpsc::Receiver<EncodedHardwareFrame>,
     cursor_updates: mpsc::Receiver<CursorPosition>,
@@ -2575,8 +2745,14 @@ fn spawn_hardware_sender(
         let mut waiting_for_keyframe = true;
         let mut sender_peer = None::<SocketAddr>;
         let mut sender_peer_epoch = u64::MAX;
+        let mut handled_frame_id = None::<u64>;
 
         while running.load(Ordering::Relaxed) && pipeline_running.load(Ordering::Acquire) {
+            // Every path below ends the previous frame's iteration, including
+            // its sends, so this is where it counts as handled.
+            if let Some(frame_id) = handled_frame_id.take() {
+                idr_in_flight.record_handled(frame_id);
+            }
             send_pending_cursor(&socket, &active_peer, &cursor_updates, &mut cursor_packet);
             let frame = match encoded_frames.recv_timeout(Duration::from_millis(20)) {
                 Ok(frame) => frame,
@@ -2586,6 +2762,7 @@ fn spawn_hardware_sender(
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            handled_frame_id = Some(frame.frame_id);
             let encode_queue_elapsed = frame.encoded_at.elapsed();
             let peer = *active_peer.lock().unwrap();
             let current_peer_epoch = peer_epoch.load(Ordering::Acquire);
@@ -2598,13 +2775,13 @@ fn spawn_hardware_sender(
                 // is an IDR. Do not leave a redundant static-surface refresh
                 // armed after successfully sending that keyframe.
                 if !frame.is_keyframe {
-                    force_keyframe.store(true, Ordering::Release);
+                    request_recovery_idr(&force_keyframe, &idr_in_flight);
                 }
             }
             if last_sent_frame.is_some_and(|last| frame.frame_id != last.wrapping_add(1)) {
                 waiting_for_keyframe = true;
                 if !frame.is_keyframe {
-                    force_keyframe.store(true, Ordering::Release);
+                    request_recovery_idr(&force_keyframe, &idr_in_flight);
                 }
             }
             // Once NVENC has accepted a frame it participates in the H.264
@@ -2614,7 +2791,7 @@ fn spawn_hardware_sender(
             // age checks and newest-frame coalescing prevent the adaptive ring
             // from turning GPU pressure into an unbounded capture queue.
             if waiting_for_keyframe && !frame.is_keyframe {
-                force_keyframe.store(true, Ordering::Release);
+                request_recovery_idr(&force_keyframe, &idr_in_flight);
                 continue;
             }
             if frame.is_keyframe {
@@ -2640,7 +2817,7 @@ fn spawn_hardware_sender(
                     )));
                     waiting_for_keyframe = true;
                     last_sent_frame = None;
-                    force_keyframe.store(true, Ordering::Release);
+                    request_recovery_idr(&force_keyframe, &idr_in_flight);
                     continue;
                 }
             };
@@ -2658,7 +2835,7 @@ fn spawn_hardware_sender(
                     warn!("Video send to {peer} failed: {error}");
                     metrics.video_send_failures.fetch_add(1, Ordering::Relaxed);
                     frame_sent = false;
-                    force_keyframe.store(true, Ordering::Release);
+                    request_recovery_idr(&force_keyframe, &idr_in_flight);
                     break;
                 }
                 pacer.account(packet.len());
@@ -2667,6 +2844,12 @@ fn spawn_hardware_sender(
             if frame_sent {
                 last_sent_frame = Some(frame.frame_id);
                 stats.frames = stats.frames.saturating_add(1);
+                stats.encoded_bytes = stats.encoded_bytes.saturating_add(frame.data.len() as u64);
+                if frame.is_keyframe {
+                    stats.keyframes = stats.keyframes.saturating_add(1);
+                    stats.keyframe_bytes =
+                        stats.keyframe_bytes.saturating_add(frame.data.len() as u64);
+                }
                 stats.capture_us = stats.capture_us.saturating_add(frame.capture_us);
                 stats.gpu_wait_us = stats.gpu_wait_us.saturating_add(frame.gpu_wait_us);
                 stats.gpu_lock_us = stats.gpu_lock_us.saturating_add(frame.gpu_lock_us);
@@ -2736,6 +2919,9 @@ struct HardwareSenderStats {
     started: Instant,
     frames: u64,
     bytes: u64,
+    encoded_bytes: u64,
+    keyframes: u64,
+    keyframe_bytes: u64,
     capture_us: u64,
     gpu_wait_us: u64,
     gpu_lock_us: u64,
@@ -2763,6 +2949,9 @@ impl HardwareSenderStats {
             started: Instant::now(),
             frames: 0,
             bytes: 0,
+            encoded_bytes: 0,
+            keyframes: 0,
+            keyframe_bytes: 0,
             capture_us: 0,
             gpu_wait_us: 0,
             gpu_lock_us: 0,
@@ -2802,6 +2991,21 @@ fn report_sender_stats(
     }
     let seconds = elapsed.as_secs_f32();
     let source_frames = metrics.source_frames.swap(0, Ordering::Relaxed);
+    let idr_requests_covered = metrics.idr_requests_covered.swap(0, Ordering::Relaxed);
+    if stats.keyframes > 0 || idr_requests_covered > 0 {
+        // After startup every IDR is a recovery. Each one is coded inside the
+        // one-frame VBV and visibly resets picture quality, so a steady stream
+        // of these lines identifies a recovery storm rather than an encoder or
+        // capture throughput problem.
+        let delta_frames = stats.frames.saturating_sub(stats.keyframes);
+        let delta_bytes = stats.encoded_bytes.saturating_sub(stats.keyframe_bytes);
+        info!(
+            "Windows host sent {} IDR frame(s) in {seconds:.1} s: IDR avg {:.1} KB, P-frame avg {:.1} KB; {idr_requests_covered} IDR request(s) covered by an IDR already in flight",
+            stats.keyframes,
+            average_kilobytes(stats.keyframe_bytes, stats.keyframes),
+            average_kilobytes(delta_bytes, delta_frames),
+        );
+    }
     publish_server_stats(
         events,
         pending_server_stats,
@@ -2852,6 +3056,14 @@ fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
         0.0
     } else {
         total_us as f32 / samples as f32 / 1_000.0
+    }
+}
+
+fn average_kilobytes(total_bytes: u64, samples: u64) -> f32 {
+    if samples == 0 {
+        0.0
+    } else {
+        total_bytes as f32 / samples as f32 / 1_000.0
     }
 }
 
@@ -3240,20 +3452,7 @@ impl NvencEncoder {
         config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
         config.gopLength = u32::MAX;
         config.frameIntervalP = 1;
-        config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-        config.rcParams.averageBitRate = bitrate_bps;
-        config.rcParams.maxBitRate = bitrate_bps;
-        let frame_budget = bitrate_bps / frames_per_second.max(1);
-        config.rcParams.vbvBufferSize = frame_budget.max(1);
-        config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
-        // At native ultrawide 120 FPS, throughput takes precedence over AQ.
-        // The LAN bitrate budget is high enough to preserve detail without
-        // spending extra NVENC cycles on adaptive quantization.
-        config.rcParams.set_enableAQ(0);
-        config.rcParams.set_aqStrength(0);
-        config.rcParams.set_enableTemporalAQ(0);
-        config.rcParams.set_enableLookahead(0);
-        config.rcParams.set_zeroReorderDelay(1);
+        configure_low_latency_rate_control(&mut config.rcParams, frames_per_second, bitrate_bps);
         let mut h264 = unsafe { config.encodeCodecConfig.h264Config };
         h264.idrPeriod = u32::MAX;
         // One slice per picture. Row-per-slice mode creates hundreds of NAL
@@ -3807,6 +4006,50 @@ mod tests {
     }
 
     #[test]
+    fn realtime_gpu_priority_is_the_default_unless_explicitly_disabled() {
+        for value in [None, Some(""), Some("1"), Some("yes"), Some("anything")] {
+            assert!(!gpu_realtime_opted_out(value), "{value:?}");
+        }
+        for value in ["0", "false", "No", " off "] {
+            assert!(gpu_realtime_opted_out(Some(value)), "{value}");
+        }
+    }
+
+    #[test]
+    fn rate_control_keeps_a_one_frame_vbv_but_lets_recovery_idrs_double_it() {
+        let mut rc = NV_ENC_RC_PARAMS::default();
+
+        configure_low_latency_rate_control(&mut rc, 120, 100_000_000);
+
+        assert_eq!(
+            rc.rateControlMode,
+            NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
+        );
+        assert_eq!(rc.averageBitRate, 100_000_000);
+        assert_eq!(rc.maxBitRate, 100_000_000);
+        assert_eq!(rc.vbvBufferSize, 833_333);
+        assert_eq!(rc.vbvInitialDelay, rc.vbvBufferSize);
+        assert_eq!(rc.lowDelayKeyFrameScale, 2);
+        assert_eq!(rc.zeroReorderDelay(), 1);
+        assert_eq!(rc.enableLookahead(), 0);
+    }
+
+    #[test]
+    fn pre_encode_freshness_limit_tolerates_a_loaded_map_at_high_rates() {
+        // Two 120 FPS intervals (16.7 ms) is shorter than NvEncMapInputResource
+        // under a GPU-bound game; the absolute bound must win at high rates.
+        assert_eq!(max_pre_encode_frame_age(120), VIDEO_SEND_STALE_AGE);
+        assert_eq!(max_pre_encode_frame_age(240), VIDEO_SEND_STALE_AGE);
+        assert_eq!(max_pre_encode_frame_age(60), VIDEO_SEND_STALE_AGE);
+        // Low frame rates keep their two-interval allowance.
+        assert_eq!(
+            max_pre_encode_frame_age(30),
+            Duration::from_secs_f64(2.0 / 30.0)
+        );
+        assert!(max_pre_encode_frame_age(0) >= VIDEO_SEND_STALE_AGE);
+    }
+
+    #[test]
     fn queued_preprocessing_keeps_only_the_newest_sample() {
         let (sender, receiver) = mpsc::channel();
         sender.send(2_u32).unwrap();
@@ -4031,6 +4274,104 @@ mod tests {
         force_keyframe.store(false, Ordering::Release);
         restore_force_keyframe_request(&force_keyframe, false);
         assert!(!force_keyframe.load(Ordering::Acquire));
+    }
+
+    fn submit_for_test(
+        frame_id: u64,
+        force_keyframe: &AtomicBool,
+        idr_in_flight: &IdrInFlight,
+        forced: &mut Vec<u64>,
+    ) {
+        if take_idr_request(force_keyframe, idr_in_flight) == IdrDecision::Force {
+            idr_in_flight.record_submitted(frame_id);
+            forced.push(frame_id);
+        }
+    }
+
+    #[test]
+    fn idr_requests_raised_while_an_idr_is_in_flight_are_covered_by_it() {
+        let force_keyframe = AtomicBool::new(true);
+        let idr_in_flight = IdrInFlight::new();
+
+        assert_eq!(
+            take_idr_request(&force_keyframe, &idr_in_flight),
+            IdrDecision::Force
+        );
+        idr_in_flight.record_submitted(10);
+        force_keyframe.store(true, Ordering::Release);
+
+        assert_eq!(
+            take_idr_request(&force_keyframe, &idr_in_flight),
+            IdrDecision::CoveredByInFlight
+        );
+        assert!(!force_keyframe.load(Ordering::Acquire));
+        assert_eq!(
+            take_idr_request(&force_keyframe, &idr_in_flight),
+            IdrDecision::NotRequested
+        );
+    }
+
+    #[test]
+    fn only_the_in_flight_idr_or_a_later_frame_reopens_idr_requests() {
+        let idr_in_flight = IdrInFlight::new();
+        idr_in_flight.record_submitted(10);
+        idr_in_flight.record_handled(9);
+        assert!(idr_in_flight.is_pending());
+        idr_in_flight.record_handled(10);
+        assert!(!idr_in_flight.is_pending());
+
+        // An IDR lost in a session teardown never reaches the sender; the
+        // replacement session's frames must still reopen the gate.
+        idr_in_flight.record_submitted(20);
+        idr_in_flight.record_handled(23);
+        assert!(!idr_in_flight.is_pending());
+
+        idr_in_flight.record_submitted(30);
+        idr_in_flight.clear();
+        assert!(!idr_in_flight.is_pending());
+    }
+
+    #[test]
+    fn send_failure_recovery_forces_one_idr_for_the_whole_nvenc_backlog() {
+        let force_keyframe = AtomicBool::new(false);
+        let idr_in_flight = IdrInFlight::new();
+        let mut forced = Vec::new();
+
+        // Frame 0 fails to send while P-frames 1-4 are already inside NVENC.
+        request_recovery_idr(&force_keyframe, &idr_in_flight);
+        idr_in_flight.record_handled(0);
+        submit_for_test(5, &force_keyframe, &idr_in_flight, &mut forced);
+        // The sender discards the stale P-frames while capture keeps feeding
+        // NVENC. Each discard used to re-arm the request and force an IDR on
+        // the next submission.
+        for (discarded, submitted) in (1..=4).zip(6..) {
+            request_recovery_idr(&force_keyframe, &idr_in_flight);
+            idr_in_flight.record_handled(discarded);
+            submit_for_test(submitted, &force_keyframe, &idr_in_flight, &mut forced);
+        }
+        idr_in_flight.record_handled(5);
+        submit_for_test(10, &force_keyframe, &idr_in_flight, &mut forced);
+
+        assert_eq!(forced, [5]);
+    }
+
+    #[test]
+    fn a_viewer_request_after_the_idr_was_sent_forces_a_new_one() {
+        let force_keyframe = AtomicBool::new(true);
+        let idr_in_flight = IdrInFlight::new();
+        let mut forced = Vec::new();
+
+        submit_for_test(1, &force_keyframe, &idr_in_flight, &mut forced);
+        // A viewer loss report that arrives before IDR 1 is sent is about an
+        // earlier frame and is covered.
+        force_keyframe.store(true, Ordering::Release);
+        submit_for_test(2, &force_keyframe, &idr_in_flight, &mut forced);
+        idr_in_flight.record_handled(1);
+        // Once IDR 1 has left, a new report may concern IDR 1 itself.
+        force_keyframe.store(true, Ordering::Release);
+        submit_for_test(3, &force_keyframe, &idr_in_flight, &mut forced);
+
+        assert_eq!(forced, [1, 3]);
     }
 
     #[test]
