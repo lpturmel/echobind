@@ -74,7 +74,8 @@ IOSurface-to-Metal presentation without a CPU pixel copy. OpenH264 is retained
 as a reported fallback.
 
 The low-latency path has no B-frame reordering, uses one H.264 slice per picture
-and a one-frame NVENC VBV, generates IDRs only for startup or recovery, requests
+and a one-frame NVENC VBV (recovery IDRs may use twice the P-frame budget so
+they do not blur the picture), generates IDRs only for startup or recovery, requests
 UI repaints directly from the decoder callback, and bounds every host and
 decode queue. On Windows at most one forced recovery IDR is in flight: a
 viewer keyframe request, send failure, or discarded P-frame raised before that

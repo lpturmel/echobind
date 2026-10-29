@@ -18,7 +18,7 @@ use moq_nvenc::sys::nvEncodeAPI::{
     NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS,
     NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
-    NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID,
+    NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID, NV_ENC_RC_PARAMS,
     NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER, NV_ENC_TUNING_INFO,
     NV_ENC_VUI_COLOR_PRIMARIES, NV_ENC_VUI_MATRIX_COEFFS, NV_ENC_VUI_TRANSFER_CHARACTERISTIC,
     NV_ENC_VUI_VIDEO_FORMAT,
@@ -97,6 +97,10 @@ const MAX_PRE_NVENC_IN_FLIGHT: usize = 2;
 // flooding the graphics queue or turning into an unbounded latency queue.
 const NVENC_BUFFER_BUDGET_MS: u32 = 100;
 const NVENC_H264_NUM_SLICES_MODE: u32 = 3;
+// NV_ENC_RC_PARAMS::lowDelayKeyFrameScale: I-frame to P-frame bit ratio under
+// CBR with a single-frame VBV. NVIDIA defaults it to 1 for the ultra-low-latency
+// tuning used here and to 2 for the low-latency tuning.
+const NVENC_RECOVERY_IDR_BIT_SCALE: u8 = 2;
 // The pre-NVENC freshness limit at low frame rates; see max_pre_encode_frame_age.
 const MAX_PREPARED_FRAME_AGE_INTERVALS: f64 = 2.0;
 const NVENC_BUSY_RETRY_DELAY: Duration = Duration::from_millis(1);
@@ -594,6 +598,34 @@ fn publish_first_worker_failure(
     }
     failure.get_or_insert(error);
     true
+}
+
+fn configure_low_latency_rate_control(
+    rc: &mut NV_ENC_RC_PARAMS,
+    frames_per_second: u32,
+    bitrate_bps: u32,
+) {
+    rc.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
+    rc.averageBitRate = bitrate_bps;
+    rc.maxBitRate = bitrate_bps;
+    let frame_budget = bitrate_bps / frames_per_second.max(1);
+    rc.vbvBufferSize = frame_budget.max(1);
+    rc.vbvInitialDelay = rc.vbvBufferSize;
+    // IDRs exist only for startup and recovery. With the ultra-low-latency
+    // default of 1, a full intra picture must fit a P-frame's one-frame
+    // budget, so every recovery visibly blurs the image for several frames
+    // while the following P-frames rebuild detail. Twice the P budget is the
+    // driver's own low-latency default; such IDRs stay rare and are paced
+    // like any other frame.
+    rc.lowDelayKeyFrameScale = NVENC_RECOVERY_IDR_BIT_SCALE;
+    // At native ultrawide 120 FPS, throughput takes precedence over AQ.
+    // The LAN bitrate budget is high enough to preserve detail without
+    // spending extra NVENC cycles on adaptive quantization.
+    rc.set_enableAQ(0);
+    rc.set_aqStrength(0);
+    rc.set_enableTemporalAQ(0);
+    rc.set_enableLookahead(0);
+    rc.set_zeroReorderDelay(1);
 }
 
 fn configure_single_h264_slice(config: &mut NV_ENC_CONFIG_H264) {
@@ -3391,20 +3423,7 @@ impl NvencEncoder {
         config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
         config.gopLength = u32::MAX;
         config.frameIntervalP = 1;
-        config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-        config.rcParams.averageBitRate = bitrate_bps;
-        config.rcParams.maxBitRate = bitrate_bps;
-        let frame_budget = bitrate_bps / frames_per_second.max(1);
-        config.rcParams.vbvBufferSize = frame_budget.max(1);
-        config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
-        // At native ultrawide 120 FPS, throughput takes precedence over AQ.
-        // The LAN bitrate budget is high enough to preserve detail without
-        // spending extra NVENC cycles on adaptive quantization.
-        config.rcParams.set_enableAQ(0);
-        config.rcParams.set_aqStrength(0);
-        config.rcParams.set_enableTemporalAQ(0);
-        config.rcParams.set_enableLookahead(0);
-        config.rcParams.set_zeroReorderDelay(1);
+        configure_low_latency_rate_control(&mut config.rcParams, frames_per_second, bitrate_bps);
         let mut h264 = unsafe { config.encodeCodecConfig.h264Config };
         h264.idrPeriod = u32::MAX;
         // One slice per picture. Row-per-slice mode creates hundreds of NAL
@@ -3955,6 +3974,25 @@ mod tests {
 
         assert_eq!(config.sliceMode, NVENC_H264_NUM_SLICES_MODE);
         assert_eq!(config.sliceModeData, 1);
+    }
+
+    #[test]
+    fn rate_control_keeps_a_one_frame_vbv_but_lets_recovery_idrs_double_it() {
+        let mut rc = NV_ENC_RC_PARAMS::default();
+
+        configure_low_latency_rate_control(&mut rc, 120, 100_000_000);
+
+        assert_eq!(
+            rc.rateControlMode,
+            NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
+        );
+        assert_eq!(rc.averageBitRate, 100_000_000);
+        assert_eq!(rc.maxBitRate, 100_000_000);
+        assert_eq!(rc.vbvBufferSize, 833_333);
+        assert_eq!(rc.vbvInitialDelay, rc.vbvBufferSize);
+        assert_eq!(rc.lowDelayKeyFrameScale, 2);
+        assert_eq!(rc.zeroReorderDelay(), 1);
+        assert_eq!(rc.enableLookahead(), 0);
     }
 
     #[test]
