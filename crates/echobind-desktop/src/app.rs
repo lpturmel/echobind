@@ -993,6 +993,7 @@ fn nvenc_busy_skips(total: u64, preprocess_full: u64, no_free_slot: u64) -> u64 
 
 fn gpu_priority_label(class: u64) -> &'static str {
     match class {
+        5 => "realtime",
         4 => "high",
         3 => "above-normal",
         2 => "normal",
