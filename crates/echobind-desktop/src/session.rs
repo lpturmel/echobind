@@ -31,7 +31,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "windows")]
 use windows::{
@@ -75,6 +75,7 @@ const CLIENT_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const HOST_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const HELLO_INTERVAL: Duration = Duration::from_millis(400);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const KEYFRAME_REQUEST_LOG_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const VIDEO_PACING_RATE_MULTIPLIER: u64 = 4;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -403,13 +404,20 @@ impl DecodeQueue {
         DecodeQueuePush::Queued
     }
 
-    pub(super) fn pop_timeout(&self, timeout: Duration) -> Option<ReceivedVideoFrame> {
+    /// Pops the next frame together with the decoder generation it belongs
+    /// to. Both are read under one lock because the receive thread advances
+    /// the generation and queues the new IDR back to back. A decoder that read
+    /// the generation before waiting here would build its new session under
+    /// the old generation, discard every picture as stale, and keep requesting
+    /// keyframes until a lucky wake-up order broke the cycle.
+    pub(super) fn pop_timeout(&self, timeout: Duration) -> Option<(ReceivedVideoFrame, u64)> {
         let (lock, ready) = &*self.inner;
         let mut state = lock.lock().unwrap();
         if state.frames.is_empty() {
             state = ready.wait_timeout(state, timeout).unwrap().0;
         }
-        state.frames.pop_front()
+        let frame = state.frames.pop_front()?;
+        Some((frame, state.generation))
     }
 
     fn require_keyframe(&self) {
@@ -878,6 +886,8 @@ fn spawn_host_network(
         let mut pending_peer = None::<(SocketAddr, usize)>;
         let mut last_seen = None::<Instant>;
         let mut reconnect_peer = None::<(SocketAddr, usize, Instant)>;
+        let mut keyframe_requests = 0_u64;
+        let mut keyframe_requests_since = Instant::now();
 
         while running.load(Ordering::Relaxed) {
             while let Ok(command) = commands.try_recv() {
@@ -1034,6 +1044,7 @@ fn spawn_host_network(
                         }
                         Packet::VideoKeyframeRequest if current_peer == Some(peer) => {
                             last_seen = Some(Instant::now());
+                            keyframe_requests = keyframe_requests.saturating_add(1);
                             force_keyframe.store(true, Ordering::Relaxed);
                         }
                         Packet::Clipboard(_)
@@ -1065,6 +1076,19 @@ fn spawn_host_network(
                 if let Err(error) = socket.send_to(&response, peer) {
                     warn!("Server stats send to {peer} failed: {error}");
                 }
+            }
+            if keyframe_requests_since.elapsed() >= KEYFRAME_REQUEST_LOG_INTERVAL {
+                // Every viewer request becomes a host IDR. Reporting the
+                // request rate separates viewer-side loss from IDRs that the
+                // host pipeline forces on its own.
+                if keyframe_requests > 0 {
+                    info!(
+                        "Viewer requested {keyframe_requests} keyframe(s) in the last {:.1} s",
+                        keyframe_requests_since.elapsed().as_secs_f32()
+                    );
+                }
+                keyframe_requests = 0;
+                keyframe_requests_since = Instant::now();
             }
 
             if last_seen.is_some_and(|seen| seen.elapsed() >= CONNECTION_TIMEOUT) {
@@ -1876,15 +1900,15 @@ fn run_software_video_decoder(
     ));
 
     while running.load(Ordering::Relaxed) {
-        let generation = decode_queue.generation();
+        let Some((received, generation)) = decode_queue.pop_timeout(Duration::from_millis(20))
+        else {
+            continue;
+        };
         if generation != decoder_generation {
             decoder = Decoder::new()
                 .map_err(|error| format!("Unable to reset H.264 decoder: {error}"))?;
             decoder_generation = generation;
         }
-        let Some(received) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
-            continue;
-        };
         let queue_elapsed = received.received_at.elapsed();
         if queue_elapsed > VIDEO_STALE_AGE {
             metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
@@ -2018,6 +2042,30 @@ mod tests {
         assert_eq!(
             queue.push(received(4, true, Duration::ZERO)),
             DecodeQueuePush::Queued
+        );
+    }
+
+    #[test]
+    fn an_idr_queued_right_after_a_reset_is_popped_with_the_new_generation() {
+        let queue = DecodeQueue::new();
+        // The decoder last saw this generation before it waited for a frame.
+        let decoder_generation = queue.generation();
+        // The receive thread resets the decoder for a new IDR and queues the
+        // IDR before the decoder wakes up.
+        queue.require_keyframe();
+        assert_eq!(
+            queue.push(received(7, true, Duration::ZERO)),
+            DecodeQueuePush::Queued
+        );
+
+        let (frame, generation) = queue
+            .pop_timeout(Duration::ZERO)
+            .expect("the IDR is queued");
+        assert!(frame.frame.is_keyframe);
+        assert_eq!(generation, queue.generation());
+        assert_ne!(
+            generation, decoder_generation,
+            "the decoder must rebuild its session under the IDR's generation"
         );
     }
 
