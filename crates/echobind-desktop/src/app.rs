@@ -29,6 +29,8 @@ enum WatchPhase {
     Idle,
     Waiting,
     Live,
+    /// Connected to an audio-only session.
+    Listening,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +91,15 @@ pub struct EchobindApp {
     pending_peer: Option<SocketAddr>,
     health_open: bool,
     drawer_open: bool,
+    watch_audio_only: bool,
+    share_audio_only: bool,
+    watch_volume: u32,
+    watch_muted: bool,
+    share_volume: u32,
+    share_muted: bool,
+    /// Whether the connected session carries video, once the peer says so.
+    peer_video: Option<bool>,
+    pending_video: bool,
     session: Option<DesktopSession>,
     shutdown: Option<SessionShutdown>,
     texture: Option<GpuVideoTexture>,
@@ -203,6 +214,14 @@ impl EchobindApp {
             pending_peer: None,
             health_open: true,
             drawer_open: false,
+            watch_audio_only: false,
+            share_audio_only: false,
+            watch_volume: 100,
+            watch_muted: false,
+            share_volume: 100,
+            share_muted: false,
+            peer_video: None,
+            pending_video: true,
             session: None,
             shutdown: None,
             texture: None,
@@ -277,8 +296,33 @@ impl EchobindApp {
             WatchPhase::Idle
         } else if self.has_video() {
             WatchPhase::Live
+        } else if self.peer.is_some() && self.audio_only_session() {
+            WatchPhase::Listening
         } else {
             WatchPhase::Waiting
+        }
+    }
+
+    /// True when the current or next session carries no video: either side
+    /// chose audio only, or the peer reported it has none.
+    fn audio_only_session(&self) -> bool {
+        let chosen = match self.mode {
+            Mode::Connect => self.watch_audio_only,
+            Mode::Host => self.share_audio_only,
+        };
+        chosen || self.peer_video == Some(false)
+    }
+
+    fn volume_gain(&self) -> f32 {
+        match self.mode {
+            Mode::Connect => volume_gain(self.watch_volume, self.watch_muted),
+            Mode::Host => volume_gain(self.share_volume, self.share_muted),
+        }
+    }
+
+    fn apply_volume(&self) {
+        if let Some(session) = &self.session {
+            session.set_volume(self.volume_gain());
         }
     }
 
@@ -323,8 +367,12 @@ impl EchobindApp {
                     self.listen_address = Some(address);
                 }
                 SessionEvent::AwaitingApproval => {}
-                SessionEvent::PendingConnection(peer) => {
+                SessionEvent::PendingConnection { peer, video } => {
                     self.pending_peer = Some(peer);
+                    self.pending_video = video;
+                }
+                SessionEvent::PeerMedia { video } => {
+                    self.peer_video = Some(video);
                 }
                 SessionEvent::Connected(peer) => {
                     self.peer = Some(peer);
@@ -506,6 +554,8 @@ impl EchobindApp {
             self.bitrate_mbps.saturating_mul(1_000_000),
             self.resolution,
             self.jumbo_datagrams,
+            !self.share_audio_only,
+            self.volume_gain(),
         ) {
             Ok(session) => {
                 self.session = Some(session);
@@ -534,6 +584,8 @@ impl EchobindApp {
             address,
             self.audio_output_device.clone(),
             frame_notifier,
+            self.watch_audio_only,
+            self.volume_gain(),
         ) {
             Ok(session) => {
                 self.target = Some(address);
@@ -566,6 +618,8 @@ impl EchobindApp {
         self.peer = None;
         self.reconnecting = false;
         self.pending_peer = None;
+        self.pending_video = true;
+        self.peer_video = None;
         self.remote_cursor = None;
         self.clear_texture();
         self.stream_fps = 0.0;
@@ -916,6 +970,16 @@ fn parse_address(ip: &str, port: u16) -> Result<SocketAddr, String> {
     Ok(SocketAddr::new(ip, port))
 }
 
+/// Maps a 0–100 volume slider to a linear gain on a squared curve, which
+/// follows perceived loudness more closely than a linear one.
+fn volume_gain(percent: u32, muted: bool) -> f32 {
+    if muted {
+        return 0.0;
+    }
+    let level = percent.min(100) as f32 / 100.0;
+    level * level
+}
+
 fn parse_port(port: &str) -> Result<u16, String> {
     match port.trim().parse::<u16>() {
         Ok(port) if port > 0 => Ok(port),
@@ -972,6 +1036,15 @@ mod tests {
         assert!(parse_port("0").is_err());
         assert!(parse_port("65536").is_err());
         assert!(parse_port("udp").is_err());
+    }
+
+    #[test]
+    fn volume_slider_maps_to_a_squared_gain() {
+        assert_eq!(volume_gain(100, false), 1.0);
+        assert_eq!(volume_gain(50, false), 0.25);
+        assert_eq!(volume_gain(0, false), 0.0);
+        assert_eq!(volume_gain(150, false), 1.0);
+        assert_eq!(volume_gain(100, true), 0.0);
     }
 
     #[test]

@@ -7,6 +7,7 @@ const VIDEO_HEADER_LEN: usize = 21;
 const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
+const HELLO_FLAG_AUDIO_ONLY: u8 = 1;
 const LEGACY_SERVER_STATS_LEN: usize = 9 * size_of::<f32>() + 7 * size_of::<u64>();
 const STAGED_SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 9 * size_of::<u64>();
 const NVENC_COUNTER_SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 11 * size_of::<u64>();
@@ -30,7 +31,11 @@ pub const MAX_VIDEO_FRAGMENTS: usize =
 
 #[derive(Debug, PartialEq)]
 pub enum Packet<'a> {
-    Hello { max_datagram_size: u16 },
+    /// `audio_only` asks the host to skip video for this viewer.
+    Hello {
+        max_datagram_size: u16,
+        audio_only: bool,
+    },
     Config(&'a [u8]),
     Ping(u64),
     Pong(u64),
@@ -133,8 +138,14 @@ impl Packet<'_> {
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Packet::Hello { max_datagram_size } => {
-                if usize::from(*max_datagram_size) <= STANDARD_DATAGRAM_SIZE {
+            Packet::Hello {
+                max_datagram_size,
+                audio_only,
+            } => {
+                if *audio_only {
+                    let [high, low] = max_datagram_size.to_be_bytes();
+                    Self::encode_packet(Self::HELLO, &[high, low, HELLO_FLAG_AUDIO_ONLY], out);
+                } else if usize::from(*max_datagram_size) <= STANDARD_DATAGRAM_SIZE {
                     Self::encode_packet(Self::HELLO, &[], out);
                 } else {
                     Self::encode_packet(Self::HELLO, &max_datagram_size.to_be_bytes(), out);
@@ -289,11 +300,17 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
             Packet::HELLO if payload.is_empty() => Ok(Packet::Hello {
                 // Legacy peers did not advertise transport capabilities.
                 max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+                audio_only: false,
             }),
-            Packet::HELLO if payload.len() == 2 => Ok(Packet::Hello {
+            Packet::HELLO if payload.len() == 2 || payload.len() == 3 => Ok(Packet::Hello {
                 max_datagram_size: u16::from_be_bytes(
-                    payload.try_into().map_err(|_| PacketParseError::Invalid)?,
+                    payload[..2]
+                        .try_into()
+                        .map_err(|_| PacketParseError::Invalid)?,
                 ),
+                audio_only: payload
+                    .get(2)
+                    .is_some_and(|flags| flags & HELLO_FLAG_AUDIO_ONLY != 0),
             }),
             Packet::CONFIG => Ok(Packet::Config(payload)),
             Packet::PING => parse_u64(payload).map(Packet::Ping),
@@ -594,12 +611,14 @@ mod tests {
     fn hello_advertises_datagram_capability_and_accepts_legacy() {
         let hello = Packet::Hello {
             max_datagram_size: JUMBO_DATAGRAM_SIZE as u16,
+            audio_only: false,
         };
         let encoded = round_trip(hello);
         assert_eq!(
             Packet::try_from(encoded.as_slice()),
             Ok(Packet::Hello {
-                max_datagram_size: JUMBO_DATAGRAM_SIZE as u16
+                max_datagram_size: JUMBO_DATAGRAM_SIZE as u16,
+                audio_only: false,
             })
         );
 
@@ -608,7 +627,38 @@ mod tests {
         assert_eq!(
             Packet::try_from(legacy.as_slice()),
             Ok(Packet::Hello {
-                max_datagram_size: STANDARD_DATAGRAM_SIZE as u16
+                max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+                audio_only: false,
+            })
+        );
+    }
+
+    #[test]
+    fn hello_carries_the_audio_only_request() {
+        let hello = Packet::Hello {
+            max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+            audio_only: true,
+        };
+        let encoded = round_trip(hello);
+        assert_eq!(encoded.len(), HEADER_LEN + 3);
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Ok(Packet::Hello {
+                max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+                audio_only: true,
+            })
+        );
+
+        // Unknown flag bits are reserved and must not imply audio-only.
+        let mut future = MAGIC.to_vec();
+        future.push(Packet::HELLO);
+        future.extend_from_slice(&(STANDARD_DATAGRAM_SIZE as u16).to_be_bytes());
+        future.push(0b10);
+        assert_eq!(
+            Packet::try_from(future.as_slice()),
+            Ok(Packet::Hello {
+                max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+                audio_only: false,
             })
         );
     }

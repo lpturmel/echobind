@@ -170,6 +170,95 @@ pub enum IconButtonKind {
     Danger,
 }
 
+/// A full-height but narrow ghost button, used for the toolbar's output menu.
+pub fn narrow_icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
+    let enabled = ui.is_enabled();
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(28.0, theme::CONTROL_HEIGHT), Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    if ui.is_rect_visible(rect) {
+        if enabled && response.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(theme::RADIUS_CONTROL),
+                theme::SELECTED,
+            );
+        }
+        let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(16.0));
+        icons::paint(ui.painter(), icon_rect, icon, theme::MUTED);
+    }
+    response.on_hover_text(label)
+}
+
+/// Mute toggle plus volume slider, with the level shown beside the label.
+/// Returns true when the level or mute state changed.
+pub fn volume_control(ui: &mut Ui, label: &str, percent: &mut u32, muted: &mut bool) -> bool {
+    let mut changed = false;
+    stack(ui, theme::LABEL_GAP, |ui| {
+        ui.horizontal(|ui| {
+            field_label(ui, label);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (level, color) = if *muted {
+                    ("Muted".to_owned(), theme::MUTED)
+                } else {
+                    (format!("{percent}%"), theme::TEXT)
+                };
+                ui.label(mono_text(level, 13.0, color));
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            changed |= mute_button(ui, muted, IconButtonKind::Secondary);
+            changed |= volume_slider(ui, percent, muted, label, ui.available_width());
+        });
+    });
+    changed
+}
+
+/// The stream toolbar's compact volume: a ghost mute toggle and a short
+/// slider. Returns true when the level or mute state changed.
+pub fn volume_inline(ui: &mut Ui, percent: &mut u32, muted: &mut bool, slider_width: f32) -> bool {
+    let mut changed = mute_button(ui, muted, IconButtonKind::Ghost);
+    if slider_width > 0.0 {
+        changed |= volume_slider(ui, percent, muted, "Volume", slider_width);
+    }
+    changed
+}
+
+fn mute_button(ui: &mut Ui, muted: &mut bool, kind: IconButtonKind) -> bool {
+    let (icon, label) = if *muted {
+        (Icon::VolumeOff, "Unmute")
+    } else {
+        (Icon::Volume, "Mute")
+    };
+    let clicked = icon_button(ui, icon, label, kind).clicked();
+    if clicked {
+        *muted = !*muted;
+    }
+    clicked
+}
+
+fn volume_slider(
+    ui: &mut Ui,
+    percent: &mut u32,
+    muted: &mut bool,
+    label: &str,
+    width: f32,
+) -> bool {
+    ui.scope(|ui| {
+        if *muted {
+            ui.multiply_opacity(0.45);
+        }
+        let changed = slider(ui, percent, 0..=100, label, width).changed();
+        // Moving the slider is a clear request to hear the new level.
+        if changed {
+            *muted = false;
+        }
+        changed
+    })
+    .inner
+}
+
 pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str, kind: IconButtonKind) -> Response {
     let enabled = ui.is_enabled();
     let (rect, response) =
@@ -406,10 +495,15 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     response
 }
 
-pub fn slider(ui: &mut Ui, value: &mut u32, range: RangeInclusive<u32>, label: &str) -> Response {
+pub fn slider(
+    ui: &mut Ui,
+    value: &mut u32,
+    range: RangeInclusive<u32>,
+    label: &str,
+    width: f32,
+) -> Response {
     let enabled = ui.is_enabled();
-    let (rect, mut response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click_and_drag());
+    let (rect, mut response) = ui.allocate_exact_size(vec2(width, 24.0), Sense::click_and_drag());
     let (min, max) = (*range.start(), *range.end());
     let knob_radius = 9.0;
     let track = rect.shrink2(vec2(knob_radius, 0.0));
@@ -897,7 +991,18 @@ pub fn key_value(ui: &mut Ui, key: &str, value: &str, mono: bool, size: f32) {
     } else {
         theme::inter(size, Weight::Regular)
     };
-    let value_galley = galley(ui, value, value_font, theme::TEXT);
+    // Long values (device names, backends) give way before the label does.
+    let key_width = galley(ui, key, theme::inter(size, Weight::Regular), theme::MUTED)
+        .size()
+        .x
+        .min(rect.width() * 0.45);
+    let value_galley = truncated_galley(
+        ui,
+        value,
+        value_font,
+        theme::TEXT,
+        rect.width() - key_width - 16.0,
+    );
     let value_width = value_galley.size().x;
     let key_galley = truncated_galley(
         ui,

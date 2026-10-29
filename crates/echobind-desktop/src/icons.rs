@@ -20,6 +20,7 @@ pub enum Icon {
     AlertCircle,
     ChevronDown,
     ChevronUp,
+    VolumeOff,
 }
 
 struct Grid {
@@ -192,5 +193,20 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::ChevronDown => line(grid.points(&[(6.0, 9.0), (12.0, 15.0), (18.0, 9.0)])),
         Icon::ChevronUp => line(grid.points(&[(6.0, 15.0), (12.0, 9.0), (18.0, 15.0)])),
+        Icon::VolumeOff => {
+            painter.add(Shape::closed_line(
+                grid.points(&[
+                    (11.0, 5.0),
+                    (6.0, 9.0),
+                    (2.0, 9.0),
+                    (2.0, 15.0),
+                    (6.0, 15.0),
+                    (11.0, 19.0),
+                ]),
+                stroke,
+            ));
+            segment((22.0, 9.0), (16.0, 15.0));
+            segment((16.0, 9.0), (22.0, 15.0));
+        }
     }
 }

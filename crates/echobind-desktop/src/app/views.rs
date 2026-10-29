@@ -205,9 +205,18 @@ impl EchobindApp {
                 self.target.map(|target| target.to_string()),
                 Dot::Solid,
             ),
+            Mode::Connect if self.peer.is_some() && self.audio_only_session() => (
+                Tone::Signal,
+                "Listening",
+                self.target.map(|target| target.to_string()),
+                Dot::Solid,
+            ),
             Mode::Connect => (Tone::Caution, "Waiting for host", None, Dot::Pulse),
             Mode::Host if self.pending_peer.is_some() => {
                 (Tone::Caution, "1 request", None, Dot::Pulse)
+            }
+            Mode::Host if self.peer.is_some() && self.audio_only_session() => {
+                (Tone::Signal, "Live · 1 listener", None, Dot::Solid)
             }
             Mode::Host if self.peer.is_some() => {
                 (Tone::Signal, "Live · 1 viewer", None, Dot::Solid)
@@ -408,9 +417,10 @@ impl EchobindApp {
 
     fn show_watch(&mut self, ui: &mut Ui, area: Rect, compact: bool) {
         let phase = self.watch_phase();
-        if phase == WatchPhase::Live {
-            self.show_watch_live(ui, area, compact);
-            return;
+        match phase {
+            WatchPhase::Live => return self.show_watch_live(ui, area, compact),
+            WatchPhase::Listening => return self.show_watch_listening(ui, area, compact),
+            WatchPhase::Idle | WatchPhase::Waiting => {}
         }
         let waiting = phase == WatchPhase::Waiting;
         if compact {
@@ -448,7 +458,7 @@ impl EchobindApp {
         if waiting {
             self.waiting_stage(ui, stage);
         } else {
-            watch_empty_stage(ui, stage);
+            watch_empty_stage(ui, stage, self.watch_audio_only);
         }
     }
 
@@ -459,13 +469,190 @@ impl EchobindApp {
                 "Watch a screen",
                 "Connect to a host on your network. Streaming starts once they accept.",
             );
-            ui.add_enabled_ui(!waiting, |ui| {
-                widgets::stack(ui, theme::FIELD_GAP, |ui| {
-                    self.address_fields(ui, "Host IP", "192.168.1.10");
-                    self.audio_output_field(ui);
+            widgets::stack(ui, theme::FIELD_GAP, |ui| {
+                ui.add_enabled_ui(!waiting, |ui| {
+                    widgets::stack(ui, theme::FIELD_GAP, |ui| {
+                        self.watch_session_field(ui);
+                        self.address_fields(ui, "Host IP", "192.168.1.10");
+                        self.audio_output_field(ui);
+                    });
                 });
+                // Volume stays adjustable while the request is pending.
+                self.watch_volume_control(ui);
             });
             self.show_notice(ui);
+        });
+    }
+
+    fn watch_session_field(&mut self, ui: &mut Ui) {
+        widgets::stack(ui, theme::LABEL_GAP, |ui| {
+            widgets::field_label(ui, "Session");
+            widgets::segmented(
+                ui,
+                "watch-session",
+                &mut self.watch_audio_only,
+                &[
+                    Segment::new(false, "Video + audio").icon(Icon::Monitor),
+                    Segment::new(true, "Audio only").icon(Icon::Volume),
+                ],
+                SegmentTrack::Field,
+            );
+            if self.watch_audio_only {
+                widgets::muted(
+                    ui,
+                    "The host sends system audio only. No video is sent or decoded.",
+                    13.0,
+                );
+            }
+        });
+    }
+
+    fn watch_volume_control(&mut self, ui: &mut Ui) {
+        if widgets::volume_control(ui, "Volume", &mut self.watch_volume, &mut self.watch_muted) {
+            self.apply_volume();
+        }
+    }
+
+    fn share_volume_control(&mut self, ui: &mut Ui, label: &str) {
+        if widgets::volume_control(ui, label, &mut self.share_volume, &mut self.share_muted) {
+            self.apply_volume();
+        }
+    }
+
+    fn show_watch_listening(&mut self, ui: &mut Ui, area: Rect, compact: bool) {
+        let host = self
+            .target
+            .map(|target| target.ip().to_string())
+            .unwrap_or_else(|| "the host".to_owned());
+        if compact {
+            compact_column(
+                ui,
+                area,
+                "listening-column",
+                theme::COMPACT_COLUMN_WIDTH,
+                |ui| {
+                    widgets::stack(ui, theme::GUTTER, |ui| {
+                        card(ui, |ui| self.listening_controls(ui, &host, false));
+                        card(ui, |ui| self.listener_health(ui));
+                    });
+                },
+            );
+            return;
+        }
+
+        let (stage, dock) = split_right(area, theme::HEALTH_WIDTH);
+        paint_stage(ui, stage);
+        centered_block(ui, stage.shrink(32.0), "watch-listening", 480.0, |ui| {
+            self.listening_controls(ui, &host, true);
+        });
+        paint_surface(ui, dock, theme::SURFACE);
+        scroll_child(
+            ui,
+            dock.shrink(theme::CARD_PADDING),
+            "listener-health",
+            |ui| self.listener_health(ui),
+        );
+    }
+
+    /// The audio-only session's hero, volume, output and disconnect controls.
+    /// On the stage they sit in their own card; in a compact column the
+    /// surrounding card already frames them.
+    fn listening_controls(&mut self, ui: &mut Ui, host: &str, on_stage: bool) {
+        widgets::stack(ui, theme::SECTION_GAP, |ui| {
+            ui.vertical_centered(|ui| {
+                widgets::stack(ui, 16.0, |ui| {
+                    widgets::pulse(ui, Icon::Volume, Tone::Signal);
+                    stage_message(
+                        ui,
+                        &format!("Listening to {host}"),
+                        "Audio only. The host's system audio plays through your output.",
+                    );
+                });
+            });
+            let controls = |app: &mut Self, ui: &mut Ui| {
+                widgets::stack(ui, theme::FIELD_GAP, |ui| {
+                    app.watch_volume_control(ui);
+                    app.audio_output_field(ui);
+                });
+            };
+            if on_stage {
+                card(ui, |ui| {
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| controls(self, ui));
+                });
+            } else {
+                controls(self, ui);
+            }
+            let disconnect = if on_stage {
+                ui.vertical_centered(|ui| {
+                    widgets::button(
+                        ui,
+                        ButtonKind::Danger,
+                        Some(Icon::Close),
+                        "Disconnect",
+                        None,
+                    )
+                })
+                .inner
+            } else {
+                let width = ui.available_width();
+                widgets::button(
+                    ui,
+                    ButtonKind::Danger,
+                    Some(Icon::Close),
+                    "Disconnect",
+                    Some(width),
+                )
+            };
+            if disconnect.clicked() {
+                self.stop();
+            }
+        });
+    }
+
+    fn listener_health(&self, ui: &mut Ui) {
+        widgets::stack(ui, 20.0, |ui| {
+            ui.horizontal(|ui| {
+                widgets::heading(ui, "Stream health");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    widgets::tag(ui, "Live", Tone::Signal);
+                });
+            });
+            widgets::tile_grid(
+                ui,
+                2,
+                &[
+                    (
+                        "Round trip",
+                        format!("{:.1}", self.rtt_ms),
+                        "ms",
+                        "Live ping".to_owned(),
+                    ),
+                    (
+                        "Bitrate",
+                        format!("{:.2}", self.stream_mbps),
+                        "Mbps",
+                        "Audio only".to_owned(),
+                    ),
+                ],
+            );
+            section(ui, "Session", |ui| {
+                widgets::stack(ui, 12.0, |ui| {
+                    let output = self
+                        .audio_output_device
+                        .clone()
+                        .unwrap_or_else(|| "System default".to_owned());
+                    widgets::key_value(ui, "Mode", "Audio only", false, 13.0);
+                    widgets::key_value(ui, "Output", &output, false, 13.0);
+                    widgets::key_value(ui, "Transport", &self.transport, false, 13.0);
+                    widgets::muted(ui, self.audio_backend.clone(), 12.0);
+                });
+            });
+            let note = if self.watch_audio_only {
+                "To see the host's screen, disconnect and choose Video + audio."
+            } else {
+                "The host is sharing audio only."
+            };
+            widgets::muted(ui, note, 13.0);
         });
     }
 
@@ -624,17 +811,11 @@ impl EchobindApp {
         } else {
             self.stream_fps
         };
-        let mut readout = vec![
+        let readout = [
             (format!("{fps:.1}"), "fps"),
             (format!("{:.1}", self.stream_mbps), "Mbps"),
             (format!("{:.1}", self.rtt_ms), "ms RTT"),
         ];
-        if !compact {
-            readout.push((
-                format!("{}×{}", self.stream_width, self.stream_height),
-                "H.264",
-            ));
-        }
         let readout_galleys: Vec<_> = if icons_only {
             Vec::new()
         } else {
@@ -668,7 +849,14 @@ impl EchobindApp {
         };
         let disconnect_labelled = !compact;
         let disconnect_width = if disconnect_labelled { 128.0 } else { 40.0 };
-        let buttons_width = 40.0 * 3.0 + disconnect_width + 8.0 * 3.0;
+        // Mute, then (unless collapsed) an 88 px slider and the output menu.
+        let volume_slider_width = if icons_only { 0.0 } else { 88.0 };
+        let volume_width = if icons_only {
+            40.0
+        } else {
+            40.0 + 4.0 + volume_slider_width + 4.0 + 28.0
+        };
+        let buttons_width = volume_width + 40.0 * 2.0 + disconnect_width + 8.0 * 3.0;
         let width =
             8.0 + if readout_width > 0.0 {
                 readout_width + 8.0 + 1.0 + 8.0
@@ -722,9 +910,30 @@ impl EchobindApp {
                     ui.painter().rect_filled(divider, 0, theme::CONTROL_BORDER);
                 }
 
-                let audio =
-                    widgets::icon_button(ui, Icon::Volume, "Audio output", IconButtonKind::Ghost);
-                self.audio_output_menu(&audio, RectAlign::TOP_START);
+                let mut volume = self.watch_volume;
+                let mut muted = self.watch_muted;
+                let volume_changed = ui
+                    .scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let changed = widgets::volume_inline(
+                            ui,
+                            &mut volume,
+                            &mut muted,
+                            volume_slider_width,
+                        );
+                        if !icons_only {
+                            let output =
+                                widgets::narrow_icon_button(ui, Icon::ChevronDown, "Audio output");
+                            self.audio_output_menu(&output, RectAlign::TOP_START);
+                        }
+                        changed
+                    })
+                    .inner;
+                self.watch_volume = volume;
+                self.watch_muted = muted;
+                if volume_changed {
+                    self.apply_volume();
+                }
 
                 let health_open = if compact {
                     self.drawer_open
@@ -1261,11 +1470,26 @@ impl EchobindApp {
             } else {
                 theme::COMPACT_COLUMN_WIDTH
             };
+            let audio = self.audio_only_session();
             compact_column(ui, area, "share-column", width, |ui| match phase {
                 SharePhase::Live => {
                     widgets::stack(ui, theme::GUTTER, |ui| {
-                        self.share_session_bar(ui);
-                        card(ui, |ui| self.host_health(ui, 4));
+                        self.share_session_bar(ui, audio);
+                        card(ui, |ui| {
+                            widgets::stack(ui, theme::SECTION_GAP, |ui| {
+                                section(ui, "Shared audio", |ui| {
+                                    self.share_volume_control(ui, "Volume");
+                                });
+                                if audio {
+                                    section(ui, "Session", |ui| {
+                                        self.stream_settings_summary(ui, true);
+                                    });
+                                }
+                            });
+                        });
+                        if !audio {
+                            card(ui, |ui| self.host_health(ui, 4));
+                        }
                     });
                 }
                 _ => card(ui, |ui| {
@@ -1302,6 +1526,10 @@ impl EchobindApp {
                     self.request_dialog(ui, stage, peer, true);
                 }
             }
+            SharePhase::Live if self.audio_only_session() => {
+                paint_stage(ui, stage);
+                self.share_audio_stage(ui, stage);
+            }
             SharePhase::Live => {
                 paint_surface(ui, stage, theme::SURFACE);
                 scroll_child(ui, stage.shrink(theme::CARD_PADDING), "host-health", |ui| {
@@ -1312,6 +1540,25 @@ impl EchobindApp {
         }
     }
 
+    fn share_audio_stage(&self, ui: &mut Ui, stage: Rect) {
+        let listener = self
+            .peer
+            .map(|peer| peer.ip().to_string())
+            .unwrap_or_else(|| "A listener".to_owned());
+        let summary = format!("Audio only · Opus · {}", self.transport);
+        centered_block(ui, stage.shrink(32.0), "share-audio", 520.0, |ui| {
+            widgets::stack(ui, 24.0, |ui| {
+                widgets::pulse(ui, Icon::Volume, Tone::Signal);
+                stage_message(
+                    ui,
+                    &format!("{listener} is listening"),
+                    "Everything your computer plays is shared until you stop.",
+                );
+                widgets::summary_pill(ui, Icon::Volume, &summary);
+            });
+        });
+    }
+
     fn share_panel_body(&mut self, ui: &mut Ui, phase: SharePhase) {
         widgets::stack(ui, theme::SECTION_GAP, |ui| match phase {
             SharePhase::Idle => {
@@ -1320,11 +1567,40 @@ impl EchobindApp {
                     "Share your screen",
                     "Viewers on your network can ask to watch. You approve each one.",
                 );
+                section(ui, "Session", |ui| {
+                    widgets::segmented(
+                        ui,
+                        "share-session",
+                        &mut self.share_audio_only,
+                        &[
+                            Segment::new(false, "Screen + audio").icon(Icon::Monitor),
+                            Segment::new(true, "Audio only").icon(Icon::Volume),
+                        ],
+                        SegmentTrack::Field,
+                    );
+                    if self.share_audio_only {
+                        widgets::muted(
+                            ui,
+                            "Shares system audio without capturing your screen. Video settings don't apply.",
+                            13.0,
+                        );
+                    }
+                });
                 section(ui, "Network", |ui| {
                     self.address_fields(ui, "Bind IP", "0.0.0.0");
                     widgets::muted(ui, "0.0.0.0 listens on every network interface.", 13.0);
                 });
-                section(ui, "Video", |ui| self.video_settings(ui));
+                if !self.share_audio_only {
+                    section(ui, "Video", |ui| self.video_settings(ui));
+                }
+                section(ui, "Audio", |ui| {
+                    self.share_volume_control(ui, "Shared audio volume");
+                    widgets::muted(
+                        ui,
+                        "System audio, encoded with Opus. Volume can change while sharing.",
+                        13.0,
+                    );
+                });
                 section(ui, "Transport", |ui| self.transport_settings(ui));
                 self.show_notice(ui);
             }
@@ -1362,26 +1638,59 @@ impl EchobindApp {
                         }
                     });
                 });
+                section(ui, "Shared audio", |ui| {
+                    self.share_volume_control(ui, "Volume");
+                });
                 section(ui, "Stream settings", |ui| {
                     self.stream_settings_summary(ui, false)
                 });
                 self.show_notice(ui);
             }
             SharePhase::Live => {
+                let audio = self.audio_only_session();
+                let (title, body) = if audio {
+                    (
+                        "Sharing audio",
+                        "System audio is streaming. Your screen isn't captured.",
+                    )
+                } else {
+                    (
+                        "Sharing your screen",
+                        "Primary display and system audio are streaming.",
+                    )
+                };
                 widgets::stack(ui, 4.0, |ui| {
                     ui.horizontal(|ui| {
-                        widgets::title(ui, "Sharing your screen");
+                        widgets::title(ui, title);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             widgets::tag(ui, "Live", Tone::Signal);
                         });
                     });
-                    widgets::muted(ui, "Primary display and system audio are streaming.", 14.0);
+                    widgets::muted(ui, body, 14.0);
                 });
-                self.viewer_card(ui);
-                section(ui, "Stream settings", |ui| {
-                    self.stream_settings_summary(ui, true);
-                    widgets::muted(ui, "Stop sharing to change settings.", 13.0);
+                self.viewer_card(ui, audio);
+                section(ui, "Shared audio", |ui| {
+                    self.share_volume_control(ui, "Volume");
+                    widgets::muted(
+                        ui,
+                        if audio {
+                            "Changes apply to the listener right away."
+                        } else {
+                            "Changes apply to the viewer right away."
+                        },
+                        13.0,
+                    );
                 });
+                section(
+                    ui,
+                    if audio { "Session" } else { "Stream settings" },
+                    |ui| {
+                        self.stream_settings_summary(ui, true);
+                        if !audio {
+                            widgets::muted(ui, "Stop sharing to change settings.", 13.0);
+                        }
+                    },
+                );
                 self.show_notice(ui);
             }
         });
@@ -1466,7 +1775,8 @@ impl EchobindApp {
                     ));
                 });
             });
-            widgets::slider(ui, &mut self.bitrate_mbps, 1..=200, "Bitrate in Mbps").on_hover_text(
+            let width = ui.available_width();
+            widgets::slider(ui, &mut self.bitrate_mbps, 1..=200, "Bitrate in Mbps", width).on_hover_text(
                 "This is encoded-video payload before recovery, UDP/IP, and Ethernet overhead. Use 80 Mbps or less on a physical 100-Mbps path.",
             );
             let (rect, _) =
@@ -1538,6 +1848,9 @@ impl EchobindApp {
         } else {
             "Standard MTU"
         };
+        if self.share_audio_only {
+            return "Audio only · Opus · Standard MTU".to_owned();
+        }
         format!(
             "{} · {} FPS · {} Mbps · {transport}",
             self.resolution.label(),
@@ -1547,7 +1860,16 @@ impl EchobindApp {
     }
 
     fn stream_settings_summary(&self, ui: &mut Ui, live: bool) {
+        if self.audio_only_session() {
+            widgets::stack(ui, 12.0, |ui| {
+                widgets::key_value(ui, "Mode", "Audio only", false, 14.0);
+                widgets::key_value(ui, "Transport", "Standard MTU", false, 14.0);
+                widgets::muted(ui, self.audio_backend.clone(), 13.0);
+            });
+            return;
+        }
         widgets::stack(ui, 12.0, |ui| {
+            widgets::key_value(ui, "Session", "Screen + audio", false, 14.0);
             let resolution = if live {
                 resolution_label(self.resolution, self.stream_width, self.stream_height)
             } else {
@@ -1583,73 +1905,56 @@ impl EchobindApp {
         });
     }
 
-    fn viewer_card(&self, ui: &mut Ui) {
+    fn viewer_card(&self, ui: &mut Ui, listening: bool) {
         theme::inset_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                let (avatar, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-                ui.painter()
-                    .circle_filled(avatar.center(), 20.0, theme::tint(theme::SIGNAL, 0.12));
-                icons::paint(
-                    ui.painter(),
-                    Rect::from_center_size(avatar.center(), Vec2::splat(18.0)),
-                    Icon::Eye,
-                    theme::SIGNAL,
-                );
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    let peer = self.peer.map(|peer| peer.to_string()).unwrap_or_default();
-                    ui.label(
-                        egui::RichText::new(peer)
-                            .font(theme::mono(14.0, Weight::Medium))
-                            .color(theme::TEXT),
-                    );
-                    ui.label(widgets::text(
-                        "Watching now",
-                        13.0,
-                        Weight::Regular,
-                        theme::MUTED,
-                    ));
-                });
+                self.viewer_identity(ui, listening);
             });
         });
     }
 
-    fn share_session_bar(&mut self, ui: &mut Ui) {
+    /// Avatar, address and "Watching now" or "Listening now" for the viewer.
+    fn viewer_identity(&self, ui: &mut Ui, listening: bool) {
+        let (avatar, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+        ui.painter()
+            .circle_filled(avatar.center(), 20.0, theme::tint(theme::SIGNAL, 0.12));
+        icons::paint(
+            ui.painter(),
+            Rect::from_center_size(avatar.center(), Vec2::splat(18.0)),
+            if listening { Icon::Volume } else { Icon::Eye },
+            theme::SIGNAL,
+        );
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let peer = self.peer.map(|peer| peer.to_string()).unwrap_or_default();
+            ui.label(
+                egui::RichText::new(peer)
+                    .font(theme::mono(14.0, Weight::Medium))
+                    .color(theme::TEXT),
+            );
+            ui.label(widgets::text(
+                if listening {
+                    "Listening now"
+                } else {
+                    "Watching now"
+                },
+                13.0,
+                Weight::Regular,
+                theme::MUTED,
+            ));
+        });
+    }
+
+    fn share_session_bar(&mut self, ui: &mut Ui, listening: bool) {
         theme::card_frame()
             .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
-                    let (avatar, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-                    ui.painter().circle_filled(
-                        avatar.center(),
-                        20.0,
-                        theme::tint(theme::SIGNAL, 0.12),
-                    );
-                    icons::paint(
-                        ui.painter(),
-                        Rect::from_center_size(avatar.center(), Vec2::splat(18.0)),
-                        Icon::Eye,
-                        theme::SIGNAL,
-                    );
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        let peer = self.peer.map(|peer| peer.to_string()).unwrap_or_default();
-                        ui.label(
-                            egui::RichText::new(peer)
-                                .font(theme::mono(14.0, Weight::Medium))
-                                .color(theme::TEXT),
-                        );
-                        ui.label(widgets::text(
-                            "Watching now",
-                            13.0,
-                            Weight::Regular,
-                            theme::MUTED,
-                        ));
-                    });
+                    self.viewer_identity(ui, listening);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if widgets::button(
                             ui,
@@ -1662,16 +1967,17 @@ impl EchobindApp {
                         {
                             self.stop();
                         }
-                        widgets::tag(
-                            ui,
-                            &format!(
+                        let summary = if listening {
+                            "Audio only · Opus".to_owned()
+                        } else {
+                            format!(
                                 "{} · {} FPS · {} Mbps",
                                 self.resolution.label(),
                                 self.frames_per_second,
                                 self.bitrate_mbps
-                            ),
-                            Tone::Neutral,
-                        );
+                            )
+                        };
+                        widgets::tag(ui, &summary, Tone::Neutral);
                     });
                 });
             });
@@ -1679,15 +1985,24 @@ impl EchobindApp {
 
     fn share_idle_stage(&self, ui: &mut Ui, stage: Rect) {
         let summary = self.settings_summary();
+        let (icon, summary_icon, body) = if self.share_audio_only {
+            (
+                Icon::Volume,
+                Icon::Volume,
+                "Your system audio streams once you start sharing and accept a viewer.",
+            )
+        } else {
+            (
+                Icon::Share,
+                Icon::Monitor,
+                "Your primary display streams once you start sharing and accept a viewer.",
+            )
+        };
         centered_block(ui, stage.shrink(32.0), "share-idle", 600.0, |ui| {
             widgets::stack(ui, 24.0, |ui| {
-                widgets::icon_tile(ui, Icon::Share, Tone::Neutral);
-                stage_message(
-                    ui,
-                    "Not sharing",
-                    "Your primary display streams once you start sharing and accept a viewer.",
-                );
-                widgets::summary_pill(ui, Icon::Monitor, &summary);
+                widgets::icon_tile(ui, icon, Tone::Neutral);
+                stage_message(ui, "Not sharing", body);
+                widgets::summary_pill(ui, summary_icon, &summary);
                 widgets::steps(
                     ui,
                     &[
@@ -1732,6 +2047,19 @@ impl EchobindApp {
         let width = 420.0_f32.min(bounds.width() - 32.0);
         let mut accept = false;
         let mut decline = false;
+        let (icon, title, body) = if self.pending_video && !self.share_audio_only {
+            (
+                Icon::Eye,
+                "A viewer wants to watch your screen",
+                "They'll see your primary display and hear system audio until you stop sharing.",
+            )
+        } else {
+            (
+                Icon::Volume,
+                "A listener wants to hear your audio",
+                "They'll hear your system audio until you stop sharing. Your screen isn't captured.",
+            )
+        };
         centered_block(ui, bounds.shrink(16.0), "request-dialog", width, |ui| {
             egui::Frame::new()
                 .fill(theme::SURFACE)
@@ -1743,23 +2071,20 @@ impl EchobindApp {
                     ui.set_width(width - theme::DIALOG_PADDING * 2.0);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         widgets::stack(ui, 20.0, |ui| {
-                            widgets::icon_tile(ui, Icon::Eye, Tone::Signal);
+                            widgets::icon_tile(ui, icon, Tone::Signal);
                             widgets::stack(ui, 8.0, |ui| {
-                                ui.label(widgets::text(
-                                    "A viewer wants to watch your screen",
-                                    18.0,
-                                    Weight::SemiBold,
-                                    theme::TEXT,
-                                ));
-                                widgets::muted(
-                                    ui,
-                                    "They'll see your primary display and hear system audio until you stop sharing.",
-                                    14.0,
-                                );
+                                ui.label(widgets::text(title, 18.0, Weight::SemiBold, theme::TEXT));
+                                widgets::muted(ui, body, 14.0);
                             });
                             theme::inset_frame().show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                widgets::key_value(ui, "Request from", &peer.to_string(), true, 14.0);
+                                widgets::key_value(
+                                    ui,
+                                    "Request from",
+                                    &peer.to_string(),
+                                    true,
+                                    14.0,
+                                );
                             });
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 12.0;
@@ -1996,24 +2321,35 @@ impl EchobindApp {
     }
 }
 
-fn watch_empty_stage(ui: &mut Ui, stage: Rect) {
+fn watch_empty_stage(ui: &mut Ui, stage: Rect, audio_only: bool) {
+    let (icon, title, body, last_step) = if audio_only {
+        (
+            Icon::Volume,
+            "Audio only",
+            "You'll hear the host's system audio as soon as they accept your request.",
+            ("Listen", "System audio streams over UDP."),
+        )
+    } else {
+        (
+            Icon::Monitor,
+            "No stream yet",
+            "The host's screen appears here as soon as they accept your request.",
+            (
+                "Watch and listen",
+                "Video and system audio stream over UDP.",
+            ),
+        )
+    };
     centered_block(ui, stage.shrink(32.0), "watch-empty", 600.0, |ui| {
         widgets::stack(ui, 24.0, |ui| {
-            widgets::icon_tile(ui, Icon::Monitor, Tone::Neutral);
-            stage_message(
-                ui,
-                "No stream yet",
-                "The host's screen appears here as soon as they accept your request.",
-            );
+            widgets::icon_tile(ui, icon, Tone::Neutral);
+            stage_message(ui, title, body);
             widgets::steps(
                 ui,
                 &[
                     ("Enter the host IP", "Port 3013 unless the host changed it."),
                     ("Host accepts", "They approve each viewer by IP."),
-                    (
-                        "Watch and listen",
-                        "Video and system audio stream over UDP.",
-                    ),
+                    last_step,
                 ],
             );
         });
