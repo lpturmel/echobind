@@ -5,9 +5,10 @@ use crate::{
     theme::{self, Tone, Weight},
 };
 use eframe::egui::{
-    self, pos2, text::LayoutJob, vec2, Align, Color32, CornerRadius, FontId, Galley, Id, Key,
-    Layout, Margin, Rect, Response, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, UiBuilder,
-    Vec2, WidgetInfo, WidgetType,
+    self, pos2,
+    text::{LayoutJob, TextFormat},
+    vec2, Align, Color32, CornerRadius, FontId, Galley, Id, Key, Layout, Margin, Rect, Response,
+    RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType,
 };
 use std::{ops::RangeInclusive, sync::Arc};
 
@@ -568,12 +569,53 @@ pub fn slider(
     response
 }
 
+/// A single-line field for addresses and numbers, in the monospace font.
 pub fn text_field(
     ui: &mut Ui,
     value: &mut String,
     hint: &str,
     width: f32,
     invalid: bool,
+) -> Response {
+    field(
+        ui,
+        value,
+        mono_text(hint, 14.0, theme::MUTED),
+        theme::mono(14.0, Weight::Regular),
+        width,
+        invalid,
+        usize::MAX,
+    )
+}
+
+/// A single-line field for a name, in the UI font, at most `limit` characters.
+pub fn name_field(
+    ui: &mut Ui,
+    value: &mut String,
+    hint: &str,
+    width: f32,
+    invalid: bool,
+    limit: usize,
+) -> Response {
+    field(
+        ui,
+        value,
+        text(hint, 14.0, Weight::Regular, theme::MUTED),
+        theme::inter(14.0, Weight::Regular),
+        width,
+        invalid,
+        limit,
+    )
+}
+
+fn field(
+    ui: &mut Ui,
+    value: &mut String,
+    hint: RichText,
+    font: FontId,
+    width: f32,
+    invalid: bool,
+    limit: usize,
 ) -> Response {
     ui.scope(|ui| {
         if invalid {
@@ -589,9 +631,10 @@ pub fn text_field(
         ui.add_sized(
             vec2(width, theme::CONTROL_HEIGHT),
             TextEdit::singleline(value)
-                .font(theme::mono(14.0, Weight::Regular))
+                .font(font)
                 .text_color(theme::TEXT)
-                .hint_text(mono_text(hint, 14.0, theme::MUTED))
+                .hint_text(hint)
+                .char_limit(limit)
                 .margin(Margin::symmetric(12, 0))
                 .vertical_align(Align::Center)
                 .min_size(vec2(width, theme::CONTROL_HEIGHT))
@@ -599,6 +642,115 @@ pub fn text_field(
         )
     })
     .inner
+}
+
+/// A full-width row that acts as one button: a leading icon, a title over a
+/// detail line, and one trailing icon button. Returns the row's response and
+/// the trailing button's.
+/// The badge takes `badge`'s tone, and `status` leads the detail line.
+#[allow(clippy::too_many_arguments)]
+pub fn list_row(
+    ui: &mut Ui,
+    badge: (Icon, Tone),
+    title: &str,
+    status: Option<(&str, Tone)>,
+    detail: &str,
+    note: Option<&str>,
+    action: (Icon, &str),
+    label: &str,
+) -> (Response, Response) {
+    let enabled = ui.is_enabled();
+    let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::click());
+    row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+
+    // The row's hover is the pointer anywhere over it, so it stays lit while
+    // the pointer is on the trailing button that sits on top of it.
+    let hovered = enabled && ui.rect_contains_pointer(rect);
+    let pressed = enabled && row.is_pointer_button_down_on();
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(theme::RADIUS_GROUP),
+        if pressed {
+            theme::PRESSED
+        } else if hovered {
+            theme::SELECTED
+        } else {
+            theme::RAISED
+        },
+    );
+    let (icon, tone) = badge;
+    let (badge_fill, badge_color) = match tone {
+        Tone::Neutral => (theme::SELECTED, theme::MUTED),
+        tone => (theme::tint(tone.color(), 0.12), tone.color()),
+    };
+    let badge = Rect::from_center_size(
+        pos2(rect.left() + 12.0 + 16.0, rect.center().y),
+        Vec2::splat(32.0),
+    );
+    ui.painter()
+        .rect_filled(badge, CornerRadius::same(theme::RADIUS_CONTROL), badge_fill);
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(badge.center(), Vec2::splat(16.0)),
+        icon,
+        badge_color,
+    );
+
+    let button_rect = Rect::from_center_size(
+        pos2(
+            rect.right() - 8.0 - theme::CONTROL_HEIGHT / 2.0,
+            rect.center().y,
+        ),
+        Vec2::splat(theme::CONTROL_HEIGHT),
+    );
+    let left = badge.right() + 12.0;
+    let text_width = button_rect.left() - 8.0 - left;
+    let title_galley = truncated_galley(
+        ui,
+        title,
+        theme::inter(14.0, Weight::SemiBold),
+        theme::TEXT,
+        text_width,
+    );
+    let mut job = LayoutJob::default();
+    if let Some((status, tone)) = status {
+        job.append(
+            status,
+            0.0,
+            TextFormat::simple(theme::inter(12.0, Weight::Medium), tone.color()),
+        );
+        job.append(
+            " · ",
+            0.0,
+            TextFormat::simple(theme::inter(12.0, Weight::Regular), theme::MUTED),
+        );
+    }
+    job.append(
+        detail,
+        0.0,
+        TextFormat::simple(theme::mono(12.0, Weight::Regular), theme::MUTED),
+    );
+    if let Some(note) = note {
+        job.append(
+            &format!(" · {note}"),
+            0.0,
+            TextFormat::simple(theme::inter(12.0, Weight::Regular), theme::MUTED),
+        );
+    }
+    job.wrap = egui::text::TextWrapping::truncate_at_width(text_width.max(0.0));
+    let detail_galley = ui.painter().layout_job(job);
+    let gap = 2.0;
+    let top = rect.center().y - (title_galley.size().y + gap + detail_galley.size().y) / 2.0;
+    let detail_top = top + title_galley.size().y + gap;
+    ui.painter()
+        .galley(pos2(left, top), title_galley, theme::TEXT);
+    ui.painter()
+        .galley(pos2(left, detail_top), detail_galley, theme::MUTED);
+
+    // A detached child, so placing the button never moves the row's layout.
+    let mut button_ui = ui.new_child(UiBuilder::new().max_rect(button_rect));
+    let button = icon_button(&mut button_ui, action.0, action.1, IconButtonKind::Ghost);
+    (row, button)
 }
 
 /// A select-style trigger; pair it with [`egui::Popup::menu`].

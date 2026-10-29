@@ -1,7 +1,7 @@
 use crate::video::I420Frame;
 use echobind_core::{
     protocol::{
-        CursorPosition, Packet, ServerStats, JUMBO_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE,
+        CursorPosition, HostPresence, Packet, ServerStats, JUMBO_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE,
         STANDARD_DATAGRAM_SIZE,
     },
     video::{fragment_video_frame_with_datagram_size, VideoFrame, VideoReassembler},
@@ -23,6 +23,7 @@ use scap::{
 use socket2::SockRef;
 use std::{
     collections::{BTreeMap, VecDeque},
+    io,
     net::{SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -62,7 +63,17 @@ mod hardware_macos;
 mod hardware_windows;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const RECONNECT_GRACE: Duration = Duration::from_secs(30);
+/// How long a host restores a returning viewer without asking for approval.
+pub const RECONNECT_GRACE: Duration = Duration::from_secs(30);
+/// A viewer that hears nothing from the host for this long starts
+/// reconnecting. The host waits longer before it drops the viewer, so the
+/// first Hellos of a reconnect usually find the viewer's slot still held.
+const HOST_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A viewer gives up reconnecting once the host would no longer restore it
+/// without a fresh approval.
+const RECONNECT_WINDOW: Duration = RECONNECT_GRACE;
+/// UDP can drop any one datagram, so a farewell is sent more than once.
+const GOODBYE_COPIES: usize = 3;
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
 const VIDEO_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(5);
@@ -447,7 +458,15 @@ pub enum SessionEvent {
         video: bool,
     },
     ConnectionRejected(String),
+    /// The peer stopped responding. A viewer keeps reconnecting on its own;
+    /// a host keeps sharing and restores the viewer if it returns.
     Disconnected(String),
+    /// The connected viewer disconnected on purpose.
+    ViewerLeft(SocketAddr),
+    /// A viewer waiting for approval cancelled its request.
+    RequestWithdrawn(SocketAddr),
+    /// The viewer's network thread ended the session on its own.
+    ViewerEnded(ViewerEnd),
     CaptureReady,
     VideoConfigured {
         width: u32,
@@ -474,6 +493,18 @@ pub enum SessionEvent {
         datagram_size: usize,
     },
     Error(String),
+}
+
+/// Why a viewer's session ended without the user stopping it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewerEnd {
+    /// The host stopped sharing or quit Echobind.
+    HostStopped,
+    /// Nothing listens at the host's address and port.
+    HostNotSharing,
+    /// The host stayed silent for the whole reconnect window.
+    HostUnreachable,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1118,10 +1149,13 @@ fn spawn_host_network(
                                 let _ = events.send(SessionEvent::PeerMedia { video });
                             }
                         }
+                        // A viewer restarted within the grace window comes back
+                        // from a new ephemeral port, so the grace follows the
+                        // IP, as the endpoint migration above does.
                         Packet::Hello { .. }
                             if current_peer.is_none()
                                 && reconnect_peer.is_some_and(|(trusted, _, _, since)| {
-                                    trusted == peer && since.elapsed() < RECONNECT_GRACE
+                                    trusted.ip() == peer.ip() && since.elapsed() < RECONNECT_GRACE
                                 }) =>
                         {
                             let (_, datagram_size, video, _) = reconnect_peer
@@ -1180,6 +1214,37 @@ fn spawn_host_network(
                             keyframe_requests = keyframe_requests.saturating_add(1);
                             force_keyframe.store(true, Ordering::Relaxed);
                         }
+                        Packet::Goodbye if current_peer == Some(peer) => {
+                            // A viewer that left on purpose gets no reconnect
+                            // grace; a later request needs approval again.
+                            replace_active_peer(&peers, None);
+                            active_datagram_size.store(STANDARD_DATAGRAM_SIZE, Ordering::Release);
+                            last_seen = None;
+                            reconnect_peer = None;
+                            let _ = events.send(SessionEvent::ViewerLeft(peer));
+                        }
+                        Packet::Goodbye
+                            if pending_peer.is_some_and(|(pending, ..)| pending == peer) =>
+                        {
+                            pending_peer = None;
+                            let _ = events.send(SessionEvent::RequestWithdrawn(peer));
+                        }
+                        Packet::Goodbye
+                            if reconnect_peer.is_some_and(|(trusted, ..)| trusted == peer) =>
+                        {
+                            reconnect_peer = None;
+                        }
+                        // Anyone may ask whether this host is sharing, so a
+                        // saved session can show it online. The answer never
+                        // touches the session or a pending request.
+                        Packet::Probe => {
+                            Packet::ProbeReply(HostPresence {
+                                video: configs.video,
+                                busy: current_peer.is_some(),
+                            })
+                            .encode(&mut response);
+                            let _ = socket.send_to(&response, peer);
+                        }
                         Packet::Clipboard(_)
                         | Packet::Audio(_)
                         | Packet::Video(_)
@@ -1189,12 +1254,20 @@ fn spawn_host_network(
                         | Packet::Pong(_)
                         | Packet::Ping(_)
                         | Packet::VideoKeyframeRequest
-                        | Packet::ConnectionRejected(_) => {}
+                        | Packet::ConnectionRejected(_)
+                        | Packet::Goodbye
+                        | Packet::ProbeReply(_) => {}
                     }
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || error.kind() == std::io::ErrorKind::TimedOut => {}
+                // Windows reports an ICMP port-unreachable reply to an earlier
+                // send as a reset, even on this unconnected socket. It means a
+                // viewer vanished without a goodbye, never that the host failed.
+                Err(error) if peer_port_closed(&error) => {
+                    debug!("A viewer's port closed: {error}");
+                }
                 Err(error) => {
                     let _ = events.send(SessionEvent::Error(format!(
                         "Server receive failed: {error}"
@@ -1233,7 +1306,8 @@ fn spawn_host_network(
                         Instant::now(),
                     ));
                     let _ = events.send(SessionEvent::Disconnected(format!(
-                        "{peer} stopped responding"
+                        "{peer} stopped responding. It can rejoin without approval for {} s.",
+                        RECONNECT_GRACE.as_secs()
                     )));
                 }
                 last_seen = None;
@@ -1243,7 +1317,39 @@ fn spawn_host_network(
                 active_datagram_size.store(STANDARD_DATAGRAM_SIZE, Ordering::Release);
             }
         }
+
+        // Sharing stopped: tell the viewer, or one still waiting for
+        // approval, so it ends at once instead of reconnecting to nothing.
+        let viewer = (*peers.active.lock().unwrap()).or(pending_peer.map(|(peer, ..)| peer));
+        if let Some(viewer) = viewer {
+            Packet::Goodbye.encode(&mut response);
+            for _ in 0..GOODBYE_COPIES {
+                let _ = socket.send_to(&response, viewer);
+            }
+        }
     })
+}
+
+/// A UDP socket reports an ICMP port-unreachable reply to an earlier send as
+/// a refused (BSD) or reset (Windows) connection: nothing listens there now.
+fn peer_port_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Errors a viewer rides out while the network comes back, such as a Wi-Fi
+/// drop or a machine waking from sleep.
+fn network_interrupted(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::Interrupted
+    )
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]
@@ -1546,6 +1652,10 @@ fn spawn_client_network(
         let mut packet_buffer = [0_u8; MAX_DATAGRAM_SIZE];
         let mut outgoing = Vec::with_capacity(MAX_DATAGRAM_SIZE);
         let mut accepted = false;
+        // Whether the host ever accepted this viewer, and since when the
+        // viewer has been trying to get back after the host went silent.
+        let mut was_connected = false;
+        let mut reconnecting_since = None::<Instant>;
         let mut last_hello = Instant::now() - HELLO_INTERVAL;
         let mut last_ping = Instant::now() - HEARTBEAT_INTERVAL;
         let mut last_server_response = Instant::now();
@@ -1626,11 +1736,21 @@ fn spawn_client_network(
                     audio_only,
                 }
                 .encode(&mut outgoing);
-                if let Err(error) = socket.send(&outgoing) {
-                    let _ = events.send(SessionEvent::Error(format!(
-                        "Connection request failed: {error}"
-                    )));
-                    return;
+                match socket.send(&outgoing) {
+                    Ok(_) => {}
+                    Err(error) if peer_port_closed(&error) => {
+                        let _ = events.send(SessionEvent::ViewerEnded(host_gone(was_connected)));
+                        return;
+                    }
+                    Err(error) if was_connected && network_interrupted(&error) => {
+                        debug!("Reconnect request not sent yet: {error}");
+                    }
+                    Err(error) => {
+                        let _ = events.send(SessionEvent::ViewerEnded(ViewerEnd::Failed(format!(
+                            "Connection request failed: {error}"
+                        ))));
+                        return;
+                    }
                 }
                 last_hello = Instant::now();
             }
@@ -1664,9 +1784,10 @@ fn spawn_client_network(
                             let config: SessionConfig = match serde_json::from_slice(json) {
                                 Ok(config) => config,
                                 Err(error) => {
-                                    let _ = events.send(SessionEvent::Error(format!(
-                                        "Host sent an invalid session config: {error}"
-                                    )));
+                                    let _ =
+                                        events.send(SessionEvent::ViewerEnded(ViewerEnd::Failed(
+                                            format!("Host sent an invalid session config: {error}"),
+                                        )));
                                     return;
                                 }
                             };
@@ -1696,15 +1817,16 @@ fn spawn_client_network(
                                 });
                                 if !accepted {
                                     accepted = true;
+                                    was_connected = true;
+                                    reconnecting_since = None;
                                     let _ = events.send(SessionEvent::Connected(server_addr));
                                     let _ = events.send(SessionEvent::PeerMedia { video: false });
                                 }
                                 continue;
                             };
                             if video.codec != VideoCodec::H264 {
-                                let _ = events.send(SessionEvent::Error(format!(
-                                    "Unsupported video codec: {:?}",
-                                    video.codec
+                                let _ = events.send(SessionEvent::ViewerEnded(ViewerEnd::Failed(
+                                    format!("Unsupported video codec: {:?}", video.codec),
                                 )));
                                 return;
                             }
@@ -1712,8 +1834,10 @@ fn spawn_client_network(
                             if offered_datagram_size != STANDARD_DATAGRAM_SIZE
                                 && offered_datagram_size != JUMBO_DATAGRAM_SIZE
                             {
-                                let _ = events.send(SessionEvent::Error(format!(
-                                    "Host selected unsupported datagram size {offered_datagram_size}"
+                                let _ = events.send(SessionEvent::ViewerEnded(ViewerEnd::Failed(
+                                    format!(
+                                        "Host selected unsupported datagram size {offered_datagram_size}"
+                                    ),
                                 )));
                                 return;
                             }
@@ -1728,6 +1852,8 @@ fn spawn_client_network(
                             video_enabled = true;
                             if !accepted {
                                 accepted = true;
+                                was_connected = true;
+                                reconnecting_since = None;
                                 let _ = events.send(SessionEvent::Connected(server_addr));
                                 let _ = events.send(SessionEvent::PeerMedia { video: true });
                                 request_keyframe(&socket, &mut outgoing);
@@ -1927,30 +2053,56 @@ fn spawn_client_network(
                         Packet::ServerStats(stats) if accepted => {
                             let _ = events.send(SessionEvent::ServerStats(stats));
                         }
+                        Packet::Goodbye => {
+                            let _ = events.send(SessionEvent::ViewerEnded(ViewerEnd::HostStopped));
+                            return;
+                        }
                         Packet::Hello { .. }
                         | Packet::Clipboard(_)
                         | Packet::Audio(_)
                         | Packet::Video(_)
                         | Packet::CursorPosition(_)
                         | Packet::ServerStats(_)
-                        | Packet::VideoKeyframeRequest => {}
+                        | Packet::VideoKeyframeRequest
+                        | Packet::Probe
+                        | Packet::ProbeReply(_) => {}
                     }
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || error.kind() == std::io::ErrorKind::TimedOut => {}
+                // The host machine answered that nothing listens on its port:
+                // Echobind there stopped sharing or quit without a goodbye.
+                Err(error) if peer_port_closed(&error) => {
+                    let _ = events.send(SessionEvent::ViewerEnded(host_gone(was_connected)));
+                    return;
+                }
+                Err(error) if network_interrupted(&error) => {
+                    // Silence handling below turns a lasting outage into a
+                    // reconnect; until then, don't spin on the failing socket.
+                    debug!("Receive interrupted: {error}");
+                    thread::sleep(SOCKET_TIMEOUT);
+                }
                 Err(error) => {
-                    let _ = events.send(SessionEvent::Error(format!(
+                    let _ = events.send(SessionEvent::ViewerEnded(ViewerEnd::Failed(format!(
                         "Video receive failed: {error}"
-                    )));
+                    ))));
                     return;
                 }
             }
 
-            if accepted && last_server_response.elapsed() >= CONNECTION_TIMEOUT {
+            if reconnecting_since.is_some_and(|since| since.elapsed() >= RECONNECT_WINDOW) {
+                // A host that comes back now would show this viewer as a new
+                // request; withdraw it, since nobody is waiting on it.
+                send_goodbye(&socket, &mut outgoing);
+                let _ = events.send(SessionEvent::ViewerEnded(ViewerEnd::HostUnreachable));
+                return;
+            }
+            if accepted && last_server_response.elapsed() >= HOST_SILENCE_TIMEOUT {
                 let _ = events.send(SessionEvent::Disconnected(
                     "Host stopped responding; reconnecting…".to_owned(),
                 ));
+                reconnecting_since = Some(Instant::now());
                 accepted = false;
                 reassembler = VideoReassembler::new(8, VIDEO_REASSEMBLY_AGE);
                 reassembly_started.clear();
@@ -1993,7 +2145,27 @@ fn spawn_client_network(
                 stats_started = Instant::now();
             }
         }
+
+        // The user stopped watching: free the host's slot, or withdraw a
+        // request still waiting for approval, instead of letting it time out.
+        send_goodbye(&socket, &mut outgoing);
     })
+}
+
+fn send_goodbye(socket: &UdpSocket, outgoing: &mut Vec<u8>) {
+    Packet::Goodbye.encode(outgoing);
+    for _ in 0..GOODBYE_COPIES {
+        let _ = socket.send(outgoing);
+    }
+}
+
+/// How a viewer's session ends when the host's port turns out to be closed.
+fn host_gone(was_connected: bool) -> ViewerEnd {
+    if was_connected {
+        ViewerEnd::HostStopped
+    } else {
+        ViewerEnd::HostNotSharing
+    }
 }
 
 fn spawn_video_decoder(
@@ -2146,6 +2318,198 @@ mod tests {
             video: Arc::new(Mutex::new(None)),
             epoch: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The host's network loop alone on loopback, offering an empty session.
+    struct LoopbackHost {
+        // Held so the port stays open after the loop exits: only a goodbye,
+        // never an ICMP port-unreachable reply, can end a viewer's session.
+        socket: Arc<UdpSocket>,
+        running: Arc<AtomicBool>,
+        commands: mpsc::Sender<HostCommand>,
+        events: mpsc::Receiver<SessionEvent>,
+        active: Arc<Mutex<Option<SocketAddr>>>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl LoopbackHost {
+        fn start() -> Self {
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+            socket.set_read_timeout(Some(SOCKET_TIMEOUT)).unwrap();
+            let peers = host_peers();
+            let active = peers.active.clone();
+            let running = Arc::new(AtomicBool::new(true));
+            let (commands, command_rx) = mpsc::channel();
+            let (event_tx, events) = mpsc::channel();
+            let config = b"{}".to_vec();
+            let handle = spawn_host_network(
+                socket.clone(),
+                running.clone(),
+                peers,
+                Arc::new(AtomicBool::new(false)),
+                command_rx,
+                event_tx,
+                HostConfigs {
+                    standard: config.clone(),
+                    jumbo: config.clone(),
+                    audio_only: config,
+                    video: false,
+                },
+                false,
+                Arc::new(AtomicUsize::new(STANDARD_DATAGRAM_SIZE)),
+                Arc::new(Mutex::new(None)),
+            );
+            Self {
+                socket,
+                running,
+                commands,
+                events,
+                active,
+                handle: Some(handle),
+            }
+        }
+
+        fn address(&self) -> SocketAddr {
+            self.socket.local_addr().unwrap()
+        }
+
+        fn next_request(&self) -> SocketAddr {
+            match next_event(&self.events, |event| {
+                matches!(event, SessionEvent::PendingConnection { .. })
+            }) {
+                SessionEvent::PendingConnection { peer, .. } => peer,
+                _ => unreachable!(),
+            }
+        }
+
+        fn stop_sharing(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for LoopbackHost {
+        fn drop(&mut self) {
+            self.stop_sharing();
+        }
+    }
+
+    fn next_event(
+        events: &mpsc::Receiver<SessionEvent>,
+        wanted: impl Fn(&SessionEvent) -> bool,
+    ) -> SessionEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match events.recv_timeout(remaining) {
+                Ok(event) if wanted(&event) => return event,
+                Ok(_) => {}
+                Err(_) => panic!("the expected session event never arrived"),
+            }
+        }
+    }
+
+    fn loopback_viewer(host: SocketAddr) -> DesktopSession {
+        DesktopSession::start_client(host, None, Arc::new(|| {}), true, 1.0).unwrap()
+    }
+
+    fn connected_viewer(host: &LoopbackHost) -> (DesktopSession, SocketAddr) {
+        let viewer = loopback_viewer(host.address());
+        let peer = host.next_request();
+        host.commands.send(HostCommand::Accept(peer)).unwrap();
+        next_event(&viewer.events, |event| {
+            matches!(event, SessionEvent::Connected(_))
+        });
+        (viewer, peer)
+    }
+
+    #[test]
+    fn a_viewer_that_disconnects_frees_the_host_at_once() {
+        let host = LoopbackHost::start();
+        let (mut viewer, peer) = connected_viewer(&host);
+
+        viewer.stop();
+        let left = next_event(&host.events, |event| {
+            matches!(event, SessionEvent::ViewerLeft(_))
+        });
+        assert!(matches!(left, SessionEvent::ViewerLeft(left) if left == peer));
+        assert_eq!(*host.active.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn a_cancelled_request_is_withdrawn_from_the_host() {
+        let host = LoopbackHost::start();
+        let mut viewer = loopback_viewer(host.address());
+        let peer = host.next_request();
+
+        viewer.stop();
+        let withdrawn = next_event(&host.events, |event| {
+            matches!(event, SessionEvent::RequestWithdrawn(_))
+        });
+        assert!(matches!(withdrawn, SessionEvent::RequestWithdrawn(left) if left == peer));
+    }
+
+    #[test]
+    fn stopping_sharing_ends_the_viewers_session() {
+        let mut host = LoopbackHost::start();
+        let (viewer, _) = connected_viewer(&host);
+
+        host.stop_sharing();
+        let ended = next_event(&viewer.events, |event| {
+            matches!(event, SessionEvent::ViewerEnded(_))
+        });
+        assert!(matches!(
+            ended,
+            SessionEvent::ViewerEnded(ViewerEnd::HostStopped)
+        ));
+    }
+
+    #[test]
+    fn a_sharing_host_answers_probes_and_reports_a_viewer() {
+        use crate::presence::{HostStatus, Presence};
+
+        let host = LoopbackHost::start();
+        let presence = Presence::start(Arc::new(|| {}));
+        presence.watch(std::iter::once(host.address()), true);
+        let status_becomes = |wanted: HostStatus| {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while presence.status(host.address()) != wanted {
+                assert!(
+                    Instant::now() < deadline,
+                    "the host never became {wanted:?}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        status_becomes(HostStatus::Online(HostPresence {
+            video: false,
+            busy: false,
+        }));
+
+        let (_viewer, _) = connected_viewer(&host);
+        status_becomes(HostStatus::Online(HostPresence {
+            video: false,
+            busy: true,
+        }));
+    }
+
+    #[test]
+    fn a_viewer_reports_a_host_that_is_not_sharing() {
+        let closed = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let viewer = loopback_viewer(closed);
+
+        let ended = next_event(&viewer.events, |event| {
+            matches!(event, SessionEvent::ViewerEnded(_))
+        });
+        assert!(matches!(
+            ended,
+            SessionEvent::ViewerEnded(ViewerEnd::HostNotSharing)
+        ));
     }
 
     #[test]
