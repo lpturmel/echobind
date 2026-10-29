@@ -134,18 +134,23 @@ const ACCESS_LOST_MAX_RETRY_DELAY_MS: u64 = 200;
 const INACTIVE_PEER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const CURSOR_UPDATE_INTERVAL: Duration = Duration::from_millis(4);
 const CURSOR_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
-// Keep capture/conversion work ahead of a saturated game without using DXGI's
-// absolute realtime priorities, which Microsoft reserves for privileged work
-// and which can make a HAGS system unresponsive when VRAM is exhausted.
+// The highest relative priority inside the capture D3D11 device. Arbitration
+// against a saturated game is decided by the process class below.
 const CAPTURE_GPU_THREAD_PRIORITY: i32 = 7;
-// D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH. Realtime is intentionally not used:
-// NVIDIA documents no contract for it, and production streamers avoid it on
-// HAGS because it can freeze encoding or reset the driver near the VRAM limit.
+// D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME, falling back to HIGH. Measured
+// with HAGS and an uncapped game at 99% GPU (RTX 3060): at HIGH, every NVENC
+// frame waited ~190 ms between submission and completion, which also held
+// back DXGI delivery and capped the stream at ~10 FPS; at REALTIME the wait
+// was ~4 ms at 120 FPS. Sunshine also defaults to realtime on HAGS. NVIDIA
+// drivers have been reported to freeze the encoder at realtime when VRAM is
+// nearly full, so ECHOBIND_GPU_REALTIME=0 keeps the host at HIGH.
+const D3DKMT_PROCESS_GPU_PRIORITY_REALTIME: i32 = 5;
 const D3DKMT_PROCESS_GPU_PRIORITY_HIGH: i32 = 4;
 const D3DKMT_PROCESS_GPU_PRIORITY_ABOVE_NORMAL: i32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessGpuPriority {
+    Realtime,
     High,
     AboveNormal,
     Normal,
@@ -154,6 +159,7 @@ enum ProcessGpuPriority {
 impl ProcessGpuPriority {
     fn label(self) -> &'static str {
         match self {
+            Self::Realtime => "process GPU realtime",
             Self::High => "process GPU high",
             Self::AboveNormal => "process GPU above-normal",
             Self::Normal => "process GPU normal",
@@ -162,6 +168,7 @@ impl ProcessGpuPriority {
 
     fn class(self) -> u64 {
         match self {
+            Self::Realtime => D3DKMT_PROCESS_GPU_PRIORITY_REALTIME as u64,
             Self::High => D3DKMT_PROCESS_GPU_PRIORITY_HIGH as u64,
             Self::AboveNormal => D3DKMT_PROCESS_GPU_PRIORITY_ABOVE_NORMAL as u64,
             Self::Normal => 2,
@@ -1477,6 +1484,19 @@ fn configure_process_gpu_priority() -> ProcessGpuPriority {
             return ProcessGpuPriority::Normal;
         }
     };
+    if gpu_realtime_opted_out(std::env::var("ECHOBIND_GPU_REALTIME").ok().as_deref()) {
+        info!("Realtime capture GPU scheduling priority is disabled by ECHOBIND_GPU_REALTIME");
+    } else {
+        let realtime_status =
+            unsafe { set_priority(GetCurrentProcess(), D3DKMT_PROCESS_GPU_PRIORITY_REALTIME) };
+        if realtime_status >= 0 {
+            return ProcessGpuPriority::Realtime;
+        }
+        warn!(
+            "Realtime capture GPU scheduling priority was refused (NTSTATUS 0x{:08X}); run the host elevated for it. Trying high",
+            realtime_status as u32
+        );
+    }
     let high_status =
         unsafe { set_priority(GetCurrentProcess(), D3DKMT_PROCESS_GPU_PRIORITY_HIGH) };
     if high_status >= 0 {
@@ -1508,6 +1528,15 @@ fn configure_process_gpu_priority() -> ProcessGpuPriority {
         );
         ProcessGpuPriority::Normal
     }
+}
+
+fn gpu_realtime_opted_out(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
 }
 
 fn enable_gpu_scheduling_privilege() {
@@ -3974,6 +4003,16 @@ mod tests {
 
         assert_eq!(config.sliceMode, NVENC_H264_NUM_SLICES_MODE);
         assert_eq!(config.sliceModeData, 1);
+    }
+
+    #[test]
+    fn realtime_gpu_priority_is_the_default_unless_explicitly_disabled() {
+        for value in [None, Some(""), Some("1"), Some("yes"), Some("anything")] {
+            assert!(!gpu_realtime_opted_out(value), "{value:?}");
+        }
+        for value in ["0", "false", "No", " off "] {
+            assert!(gpu_realtime_opted_out(Some(value)), "{value}");
+        }
     }
 
     #[test]

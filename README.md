@@ -66,6 +66,11 @@ send uses the same refresh path when an unchanged desktop has no new bitmap to
 encode. Cursor-only acquisition can provide the initial desktop surface, while
 pointer traffic itself is coalesced off the highest-priority capture thread.
 Device-removal status from D3D11 or NVENC triggers a fresh device/session retry.
+The Windows host requests realtime GPU scheduling priority and falls back to
+high when it isn't elevated. With hardware-accelerated GPU scheduling and an
+uncapped game saturating the GPU, high priority left every NVENC frame waiting
+about 190 ms and capped the stream near 10 FPS; realtime kept 120 FPS with a
+4 ms encode. Set `ECHOBIND_GPU_REALTIME=0` to stay at high priority.
 macOS uses ScreenCaptureKit and a four-frame
 asynchronous VideoToolbox pipeline for hardware encode.
 `VTCompressionSessionCompleteFrames` is used only for final drain rather than
