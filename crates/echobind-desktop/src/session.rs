@@ -31,7 +31,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "windows")]
 use windows::{
@@ -75,6 +75,7 @@ const CLIENT_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const HOST_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const HELLO_INTERVAL: Duration = Duration::from_millis(400);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const KEYFRAME_REQUEST_LOG_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const VIDEO_PACING_RATE_MULTIPLIER: u64 = 4;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -878,6 +879,8 @@ fn spawn_host_network(
         let mut pending_peer = None::<(SocketAddr, usize)>;
         let mut last_seen = None::<Instant>;
         let mut reconnect_peer = None::<(SocketAddr, usize, Instant)>;
+        let mut keyframe_requests = 0_u64;
+        let mut keyframe_requests_since = Instant::now();
 
         while running.load(Ordering::Relaxed) {
             while let Ok(command) = commands.try_recv() {
@@ -1034,6 +1037,7 @@ fn spawn_host_network(
                         }
                         Packet::VideoKeyframeRequest if current_peer == Some(peer) => {
                             last_seen = Some(Instant::now());
+                            keyframe_requests = keyframe_requests.saturating_add(1);
                             force_keyframe.store(true, Ordering::Relaxed);
                         }
                         Packet::Clipboard(_)
@@ -1065,6 +1069,19 @@ fn spawn_host_network(
                 if let Err(error) = socket.send_to(&response, peer) {
                     warn!("Server stats send to {peer} failed: {error}");
                 }
+            }
+            if keyframe_requests_since.elapsed() >= KEYFRAME_REQUEST_LOG_INTERVAL {
+                // Every viewer request becomes a host IDR. Reporting the
+                // request rate separates viewer-side loss from IDRs that the
+                // host pipeline forces on its own.
+                if keyframe_requests > 0 {
+                    info!(
+                        "Viewer requested {keyframe_requests} keyframe(s) in the last {:.1} s",
+                        keyframe_requests_since.elapsed().as_secs_f32()
+                    );
+                }
+                keyframe_requests = 0;
+                keyframe_requests_since = Instant::now();
             }
 
             if last_seen.is_some_and(|seen| seen.elapsed() >= CONNECTION_TIMEOUT) {

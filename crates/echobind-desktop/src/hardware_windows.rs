@@ -35,7 +35,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use tracing::warn;
+use tracing::{info, warn};
 use windows::{
     core::{w, Interface},
     Win32::{
@@ -2667,6 +2667,12 @@ fn spawn_hardware_sender(
             if frame_sent {
                 last_sent_frame = Some(frame.frame_id);
                 stats.frames = stats.frames.saturating_add(1);
+                stats.encoded_bytes = stats.encoded_bytes.saturating_add(frame.data.len() as u64);
+                if frame.is_keyframe {
+                    stats.keyframes = stats.keyframes.saturating_add(1);
+                    stats.keyframe_bytes =
+                        stats.keyframe_bytes.saturating_add(frame.data.len() as u64);
+                }
                 stats.capture_us = stats.capture_us.saturating_add(frame.capture_us);
                 stats.gpu_wait_us = stats.gpu_wait_us.saturating_add(frame.gpu_wait_us);
                 stats.gpu_lock_us = stats.gpu_lock_us.saturating_add(frame.gpu_lock_us);
@@ -2736,6 +2742,9 @@ struct HardwareSenderStats {
     started: Instant,
     frames: u64,
     bytes: u64,
+    encoded_bytes: u64,
+    keyframes: u64,
+    keyframe_bytes: u64,
     capture_us: u64,
     gpu_wait_us: u64,
     gpu_lock_us: u64,
@@ -2763,6 +2772,9 @@ impl HardwareSenderStats {
             started: Instant::now(),
             frames: 0,
             bytes: 0,
+            encoded_bytes: 0,
+            keyframes: 0,
+            keyframe_bytes: 0,
             capture_us: 0,
             gpu_wait_us: 0,
             gpu_lock_us: 0,
@@ -2802,6 +2814,20 @@ fn report_sender_stats(
     }
     let seconds = elapsed.as_secs_f32();
     let source_frames = metrics.source_frames.swap(0, Ordering::Relaxed);
+    if stats.keyframes > 0 {
+        // After startup every IDR is a recovery. Each one is coded inside the
+        // one-frame VBV and visibly resets picture quality, so a steady stream
+        // of these lines identifies a recovery storm rather than an encoder or
+        // capture throughput problem.
+        let delta_frames = stats.frames.saturating_sub(stats.keyframes);
+        let delta_bytes = stats.encoded_bytes.saturating_sub(stats.keyframe_bytes);
+        info!(
+            "Windows host sent {} IDR frame(s) in {seconds:.1} s: IDR avg {:.1} KB, P-frame avg {:.1} KB",
+            stats.keyframes,
+            average_kilobytes(stats.keyframe_bytes, stats.keyframes),
+            average_kilobytes(delta_bytes, delta_frames),
+        );
+    }
     publish_server_stats(
         events,
         pending_server_stats,
@@ -2852,6 +2878,14 @@ fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
         0.0
     } else {
         total_us as f32 / samples as f32 / 1_000.0
+    }
+}
+
+fn average_kilobytes(total_bytes: u64, samples: u64) -> f32 {
+    if samples == 0 {
+        0.0
+    } else {
+        total_bytes as f32 / samples as f32 / 1_000.0
     }
 }
 
