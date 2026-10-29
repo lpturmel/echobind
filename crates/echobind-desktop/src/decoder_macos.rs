@@ -47,7 +47,11 @@ pub(super) fn run_decoder(
     let mut decoder_generation = decode_queue.generation();
 
     while running.load(Ordering::Relaxed) {
-        let generation = decode_queue.generation();
+        let Some((received, generation)) = decode_queue.pop_timeout(Duration::from_millis(20))
+        else {
+            continue;
+        };
+        // Use the generation popped with the frame (see DecodeQueue::pop_timeout).
         if generation != decoder_generation {
             decoder = None;
             format_description = None;
@@ -55,9 +59,6 @@ pub(super) fn run_decoder(
             decode_started.lock().unwrap().clear();
             decoder_generation = generation;
         }
-        let Some(received) = decode_queue.pop_timeout(Duration::from_millis(20)) else {
-            continue;
-        };
         let queue_elapsed = received.received_at.elapsed();
         if queue_elapsed > VIDEO_STALE_AGE {
             metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
