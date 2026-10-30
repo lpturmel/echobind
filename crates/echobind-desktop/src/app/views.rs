@@ -4,20 +4,22 @@ use super::{
 };
 use crate::{
     icons::{self, Icon},
-    session::VideoResolution,
+    presence::HostStatus,
+    saved::NAME_LIMIT,
+    session::{VideoResolution, RECONNECT_GRACE},
     theme::{self, Tone, Weight},
     widgets::{self, ButtonKind, Dot, IconButtonKind, Segment, SegmentTrack, StepState},
 };
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, CornerRadius, Id, Layout, Margin, Rect, RectAlign,
-    Response, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
+    self, pos2, vec2, Align, Align2, Color32, CornerRadius, Id, Key, Layout, Margin, Rect,
+    RectAlign, Response, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
 };
 use std::time::Instant;
 
 const FRAME_RATES: [u32; 4] = [30, 60, 90, 120];
 const TOOLBAR_FILL: Color32 = Color32::from_rgba_premultiplied(12, 13, 16, 240);
 const HUD_FILL: Color32 = Color32::from_rgba_premultiplied(8, 8, 10, 240);
-const DIM_FILL: Color32 = Color32::from_rgba_premultiplied(7, 7, 9, 209);
+pub(super) const DIM_FILL: Color32 = Color32::from_rgba_premultiplied(7, 7, 9, 209);
 
 fn child<R>(ui: &mut Ui, rect: Rect, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.scope_builder(
@@ -199,18 +201,12 @@ impl EchobindApp {
         }
         match self.mode {
             Mode::Connect if self.reconnecting => (Tone::Caution, "Reconnecting", None, Dot::Pulse),
-            Mode::Connect if self.has_video() => (
-                Tone::Signal,
-                "Connected",
-                self.target.map(|target| target.to_string()),
-                Dot::Solid,
-            ),
-            Mode::Connect if self.peer.is_some() && self.audio_only_session() => (
-                Tone::Signal,
-                "Listening",
-                self.target.map(|target| target.to_string()),
-                Dot::Solid,
-            ),
+            Mode::Connect if self.has_video() => {
+                (Tone::Signal, "Connected", self.host_detail(), Dot::Solid)
+            }
+            Mode::Connect if self.peer.is_some() && self.audio_only_session() => {
+                (Tone::Signal, "Listening", self.host_detail(), Dot::Solid)
+            }
             Mode::Connect => (Tone::Caution, "Waiting for host", None, Dot::Pulse),
             Mode::Host if self.pending_peer.is_some() => {
                 (Tone::Caution, "1 request", None, Dot::Pulse)
@@ -226,6 +222,13 @@ impl EchobindApp {
             }
             Mode::Host => (Tone::Neutral, "Starting…", None, Dot::Hollow),
         }
+    }
+
+    /// The status pill's detail: the saved name, else the full address.
+    fn host_detail(&self) -> Option<String> {
+        self.session_name
+            .clone()
+            .or_else(|| self.target.map(|target| target.to_string()))
     }
 
     pub(super) fn show_top_bar(&mut self, ui: &mut Ui) {
@@ -441,9 +444,15 @@ impl EchobindApp {
                     });
                 },
             );
-            return;
+        } else {
+            self.show_watch_panels(ui, area, waiting);
         }
+        if self.editor.is_some() {
+            self.saved_editor_dialog(ui, area.expand(theme::GUTTER));
+        }
+    }
 
+    fn show_watch_panels(&mut self, ui: &mut Ui, area: Rect, waiting: bool) {
         let (panel, stage) = split_left(area, theme::PANEL_WIDTH);
         let footer_height = if waiting {
             theme::CONTROL_HEIGHT
@@ -469,19 +478,268 @@ impl EchobindApp {
                 "Watch a screen",
                 "Connect to a host on your network. Streaming starts once they accept.",
             );
-            widgets::stack(ui, theme::FIELD_GAP, |ui| {
-                ui.add_enabled_ui(!waiting, |ui| {
-                    widgets::stack(ui, theme::FIELD_GAP, |ui| {
-                        self.watch_session_field(ui);
-                        self.address_fields(ui, "Host IP", "192.168.1.10");
-                        self.audio_output_field(ui);
+            // Above the saved list and form, so why a session ended is in
+            // view without scrolling.
+            self.show_notice(ui);
+            let show_saved = !waiting && !self.saved.sessions().is_empty();
+            if show_saved {
+                section(ui, "Saved sessions", |ui| self.saved_sessions_list(ui));
+            }
+            let form = |app: &mut Self, ui: &mut Ui| {
+                widgets::stack(ui, theme::FIELD_GAP, |ui| {
+                    ui.add_enabled_ui(!waiting, |ui| {
+                        widgets::stack(ui, theme::FIELD_GAP, |ui| {
+                            app.watch_session_field(ui);
+                            app.address_fields(ui, "Host IP", "192.168.1.10");
+                            app.save_name_field(ui);
+                            app.audio_output_field(ui);
+                        });
+                    });
+                    // Volume stays adjustable while the request is pending.
+                    app.watch_volume_control(ui);
+                });
+            };
+            if show_saved {
+                section(ui, "Connection", |ui| form(self, ui));
+            } else {
+                form(self, ui);
+            }
+        });
+    }
+
+    /// One row per saved session: the row connects, its pencil edits.
+    fn saved_sessions_list(&mut self, ui: &mut Ui) {
+        let mut connect = None;
+        let mut edit = None;
+        widgets::stack(ui, 8.0, |ui| {
+            for saved in self.saved.sessions() {
+                let (icon, note) = if saved.audio_only {
+                    (Icon::Volume, Some("Audio only"))
+                } else {
+                    (Icon::Monitor, None)
+                };
+                let (tone, status, hint) = match self.presence.status(saved.address) {
+                    HostStatus::Checking => (Tone::Neutral, "Checking…", "Connect"),
+                    HostStatus::Online(presence) if presence.busy => (
+                        Tone::Caution,
+                        "In use",
+                        "Someone else is watching. The host takes one viewer at a time.",
+                    ),
+                    HostStatus::Online(_) => (Tone::Signal, "Online", "Connect"),
+                    HostStatus::Offline => (
+                        Tone::Neutral,
+                        "Offline",
+                        "Not sharing right now. Connect anyway",
+                    ),
+                };
+                let (row, action) = widgets::list_row(
+                    ui,
+                    (icon, tone),
+                    &saved.name,
+                    Some((status, tone)),
+                    &saved.address.to_string(),
+                    note,
+                    (Icon::Edit, "Edit saved session"),
+                    &format!("Connect to {}, {}", saved.name, status.to_lowercase()),
+                );
+                if action.clicked() {
+                    edit = Some(saved.clone());
+                } else if row.on_hover_text(hint).clicked() {
+                    connect = Some(saved.clone());
+                }
+            }
+        });
+        if let Some(saved) = edit {
+            self.open_editor(&saved);
+        } else if let Some(saved) = connect {
+            let context = ui.ctx().clone();
+            self.connect_saved(saved, &context);
+        }
+    }
+
+    fn save_name_field(&mut self, ui: &mut Ui) {
+        widgets::stack(ui, theme::LABEL_GAP, |ui| {
+            ui.horizontal(|ui| {
+                widgets::field_label(ui, "Name");
+                ui.label(widgets::text(
+                    "Optional",
+                    12.0,
+                    Weight::Regular,
+                    theme::MUTED,
+                ));
+            });
+            let width = ui.available_width();
+            widgets::name_field(
+                ui,
+                &mut self.save_name,
+                "Living room PC",
+                width,
+                false,
+                NAME_LIMIT,
+            );
+            widgets::muted(ui, "Named hosts are saved for one-click connect.", 13.0);
+        });
+    }
+
+    /// The modal editor for one saved session: rename it, change its
+    /// address or session type, or remove it.
+    fn saved_editor_dialog(&mut self, ui: &mut Ui, bounds: Rect) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        ui.painter().rect_filled(bounds, 0, DIM_FILL);
+        ui.interact(bounds, Id::new("editor-dim"), Sense::click());
+
+        let width = 440.0_f32.min(bounds.width() - 32.0);
+        let mut save = false;
+        let mut remove = false;
+        let mut cancel = ui.input(|input| input.key_pressed(Key::Escape));
+        centered_block(ui, bounds.shrink(16.0), "saved-editor", width, |ui| {
+            egui::Frame::new()
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::CONTROL_BORDER))
+                .corner_radius(theme::RADIUS_SURFACE)
+                .inner_margin(theme::DIALOG_PADDING as i8)
+                .shadow(theme::overlay_shadow())
+                .show(ui, |ui| {
+                    let inner = width - theme::DIALOG_PADDING * 2.0;
+                    ui.set_width(inner);
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        widgets::stack(ui, 20.0, |ui| {
+                            let icon = if editor.audio_only {
+                                Icon::Volume
+                            } else {
+                                Icon::Monitor
+                            };
+                            widgets::icon_tile(ui, icon, Tone::Signal);
+                            widgets::stack(ui, 8.0, |ui| {
+                                ui.label(widgets::text(
+                                    "Edit saved session",
+                                    18.0,
+                                    Weight::SemiBold,
+                                    theme::TEXT,
+                                ));
+                                widgets::muted(
+                                    ui,
+                                    "Changes apply the next time you connect.",
+                                    14.0,
+                                );
+                            });
+                            widgets::stack(ui, theme::FIELD_GAP, |ui| {
+                                widgets::stack(ui, theme::LABEL_GAP, |ui| {
+                                    widgets::field_label(ui, "Name");
+                                    let changed = widgets::name_field(
+                                        ui,
+                                        &mut editor.name,
+                                        "Living room PC",
+                                        inner,
+                                        false,
+                                        NAME_LIMIT,
+                                    )
+                                    .changed();
+                                    if changed {
+                                        editor.error = None;
+                                    }
+                                });
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 12.0;
+                                    let port_width = 96.0;
+                                    let ip_width = inner - port_width - 12.0;
+                                    let mut changed = false;
+                                    ui.vertical(|ui| {
+                                        ui.set_width(ip_width);
+                                        widgets::stack(ui, theme::LABEL_GAP, |ui| {
+                                            widgets::field_label(ui, "Host IP");
+                                            changed |= widgets::text_field(
+                                                ui,
+                                                &mut editor.ip,
+                                                "192.168.1.10",
+                                                ip_width,
+                                                false,
+                                            )
+                                            .changed();
+                                        });
+                                    });
+                                    ui.vertical(|ui| {
+                                        ui.set_width(port_width);
+                                        widgets::stack(ui, theme::LABEL_GAP, |ui| {
+                                            widgets::field_label(ui, "Port");
+                                            changed |= widgets::text_field(
+                                                ui,
+                                                &mut editor.port,
+                                                "3013",
+                                                port_width,
+                                                false,
+                                            )
+                                            .changed();
+                                        });
+                                    });
+                                    if changed {
+                                        editor.error = None;
+                                    }
+                                });
+                                widgets::stack(ui, theme::LABEL_GAP, |ui| {
+                                    widgets::field_label(ui, "Session");
+                                    widgets::segmented(
+                                        ui,
+                                        "editor-session",
+                                        &mut editor.audio_only,
+                                        &[
+                                            Segment::new(false, "Video + audio")
+                                                .icon(Icon::Monitor),
+                                            Segment::new(true, "Audio only").icon(Icon::Volume),
+                                        ],
+                                        SegmentTrack::Field,
+                                    );
+                                });
+                                if let Some(error) = &editor.error {
+                                    ui.label(widgets::text(
+                                        error,
+                                        12.0,
+                                        Weight::Regular,
+                                        theme::DANGER,
+                                    ));
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 12.0;
+                                remove =
+                                    widgets::button(ui, ButtonKind::Danger, None, "Remove", None)
+                                        .clicked();
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    save = widgets::button(
+                                        ui,
+                                        ButtonKind::Primary,
+                                        Some(Icon::Check),
+                                        "Save",
+                                        None,
+                                    )
+                                    .clicked();
+                                    cancel |= widgets::button(
+                                        ui,
+                                        ButtonKind::Secondary,
+                                        None,
+                                        "Cancel",
+                                        None,
+                                    )
+                                    .clicked();
+                                });
+                            });
+                        });
                     });
                 });
-                // Volume stays adjustable while the request is pending.
-                self.watch_volume_control(ui);
-            });
-            self.show_notice(ui);
         });
+        save |= ui.input(|input| input.key_pressed(Key::Enter));
+
+        if cancel {
+            return;
+        }
+        self.editor = Some(editor);
+        if remove {
+            self.remove_edited();
+        } else if save {
+            self.save_editor();
+        }
     }
 
     fn watch_session_field(&mut self, ui: &mut Ui) {
@@ -520,10 +778,7 @@ impl EchobindApp {
     }
 
     fn show_watch_listening(&mut self, ui: &mut Ui, area: Rect, compact: bool) {
-        let host = self
-            .target
-            .map(|target| target.ip().to_string())
-            .unwrap_or_else(|| "the host".to_owned());
+        let host = self.host_label();
         if compact {
             compact_column(
                 ui,
@@ -561,12 +816,22 @@ impl EchobindApp {
         widgets::stack(ui, theme::SECTION_GAP, |ui| {
             ui.vertical_centered(|ui| {
                 widgets::stack(ui, 16.0, |ui| {
-                    widgets::pulse(ui, Icon::Volume, Tone::Signal);
-                    stage_message(
-                        ui,
-                        &format!("Listening to {host}"),
-                        "Audio only. The host's system audio plays through your output.",
-                    );
+                    if self.reconnecting {
+                        widgets::pulse(ui, Icon::Refresh, Tone::Caution);
+                        stage_message(
+                            ui,
+                            &format!("Reconnecting to {host}"),
+                            &reconnect_body("Audio paused"),
+                        );
+                        self.reconnect_tag(ui);
+                    } else {
+                        widgets::pulse(ui, Icon::Volume, Tone::Signal);
+                        stage_message(
+                            ui,
+                            &format!("Listening to {host}"),
+                            "Audio only. The host's system audio plays through your output.",
+                        );
+                    }
                 });
             });
             let controls = |app: &mut Self, ui: &mut Ui| {
@@ -614,7 +879,11 @@ impl EchobindApp {
             ui.horizontal(|ui| {
                 widgets::heading(ui, "Stream health");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    widgets::tag(ui, "Live", Tone::Signal);
+                    if self.reconnecting {
+                        widgets::tag(ui, "Reconnecting", Tone::Caution);
+                    } else {
+                        widgets::tag(ui, "Live", Tone::Signal);
+                    }
                 });
             });
             widgets::tile_grid(
@@ -675,41 +944,71 @@ impl EchobindApp {
         widgets::stack(ui, 12.0, |ui| {
             let stopping = self.shutdown.is_some();
             let label = if stopping { "Stopping…" } else { "Connect" };
-            let clicked = ui
-                .add_enabled_ui(!stopping, |ui| {
-                    widgets::button(ui, ButtonKind::Primary, None, label, Some(width))
+            let named = !self.save_name.trim().is_empty();
+            let (connect, save) = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let connect = ui
+                        .add_enabled_ui(!stopping, |ui| {
+                            let connect_width = width - theme::CONTROL_HEIGHT - 8.0;
+                            widgets::button(
+                                ui,
+                                ButtonKind::Primary,
+                                None,
+                                label,
+                                Some(connect_width),
+                            )
+                        })
+                        .inner
+                        .clicked();
+                    let save_label = if named {
+                        "Save without connecting"
+                    } else {
+                        "Add a name to save this host"
+                    };
+                    let save = ui
+                        .add_enabled_ui(named, |ui| {
+                            widgets::icon_button(
+                                ui,
+                                Icon::Bookmark,
+                                save_label,
+                                IconButtonKind::Secondary,
+                            )
+                        })
+                        .inner
+                        .clicked();
+                    (connect, save)
                 })
-                .inner
-                .clicked();
-            if clicked {
+                .inner;
+            if connect {
                 let context = ui.ctx().clone();
                 self.connect(&context);
+            } else if save {
+                self.save_form();
             }
             widgets::key_hint(ui, &["F11"], "", "toggles fullscreen while watching");
         });
     }
 
-    fn waiting_copy(&self) -> (String, &'static str, [StepState; 3]) {
-        let host = self
-            .target
-            .map(|target| target.ip().to_string())
-            .unwrap_or_else(|| "the host".to_owned());
+    fn waiting_copy(&self) -> (String, String, [StepState; 3]) {
+        let host = self.host_label();
         if self.reconnecting {
             (
                 format!("Reconnecting to {host}"),
-                "The host stopped responding. Echobind keeps trying while this stays open.",
+                reconnect_body("The stream paused"),
                 [StepState::Done, StepState::Done, StepState::Current],
             )
         } else if self.peer.is_some() {
             (
                 format!("{host} accepted"),
-                "Waiting for the first video frame.",
+                "Waiting for the first video frame.".to_owned(),
                 [StepState::Done, StepState::Done, StepState::Current],
             )
         } else {
             (
                 format!("Waiting for {host} to accept"),
-                "Your request is showing on the host's screen. The stream starts the moment they accept.",
+                "Your request is showing on the host's screen. The stream starts the moment they accept."
+                    .to_owned(),
                 [StepState::Done, StepState::Current, StepState::Pending],
             )
         }
@@ -720,7 +1019,7 @@ impl EchobindApp {
         centered_block(ui, stage.shrink(32.0), "watch-waiting", 560.0, |ui| {
             widgets::stack(ui, 32.0, |ui| {
                 widgets::pulse(ui, Icon::Monitor, Tone::Caution);
-                stage_message(ui, &title, body);
+                stage_message(ui, &title, &body);
                 widgets::progress_steps(
                     ui,
                     &[
@@ -738,7 +1037,7 @@ impl EchobindApp {
         widgets::stack(ui, 16.0, |ui| {
             ui.vertical_centered(|ui| {
                 widgets::pulse(ui, Icon::Monitor, Tone::Caution);
-                stage_message(ui, &title, body);
+                stage_message(ui, &title, &body);
             });
             widgets::progress_steps(
                 ui,
@@ -763,6 +1062,11 @@ impl EchobindApp {
         paint_stage(ui, stage);
         self.paint_video(ui, stage.shrink(1.0));
         mask_stage_corners(ui, stage);
+        if self.reconnecting {
+            ui.painter()
+                .rect_filled(stage, CornerRadius::same(theme::RADIUS_SURFACE), DIM_FILL);
+            self.reconnect_message(ui, stage);
+        }
 
         let mut toolbar_bounds = stage;
         if compact && self.drawer_open {
@@ -981,6 +1285,33 @@ impl EchobindApp {
         );
     }
 
+    /// The reconnect notice over a paused picture, windowed or fullscreen.
+    pub(super) fn reconnect_message(&self, ui: &mut Ui, stage: Rect) {
+        let host = self.host_label();
+        centered_block(ui, stage.shrink(32.0), "watch-reconnecting", 480.0, |ui| {
+            widgets::stack(ui, 24.0, |ui| {
+                widgets::pulse(ui, Icon::Refresh, Tone::Caution);
+                stage_message(
+                    ui,
+                    &format!("Reconnecting to {host}"),
+                    &reconnect_body("The stream paused"),
+                );
+                self.reconnect_tag(ui);
+            });
+        });
+    }
+
+    fn reconnect_tag(&self, ui: &mut Ui) {
+        if let Some(since) = self.reconnecting_since {
+            let elapsed = since.elapsed().as_secs().min(RECONNECT_GRACE.as_secs());
+            widgets::tag(
+                ui,
+                &format!("Retrying · {elapsed} of {} s", RECONNECT_GRACE.as_secs()),
+                Tone::Caution,
+            );
+        }
+    }
+
     fn server_stats_age(&self) -> Option<f32> {
         stale_server_stats_age(self.server_stats_received_at, Instant::now())
             .map(|age| age.as_secs_f32())
@@ -1014,7 +1345,9 @@ impl EchobindApp {
                         {
                             close = true;
                         }
-                        if stale_age.is_some() {
+                        if self.reconnecting {
+                            widgets::tag(ui, "Reconnecting", Tone::Caution);
+                        } else if stale_age.is_some() {
                             widgets::tag(ui, "Stale", Tone::Caution);
                         } else {
                             widgets::tag(ui, "Live", Tone::Signal);
@@ -2319,6 +2652,13 @@ impl EchobindApp {
             });
         });
     }
+}
+
+fn reconnect_body(paused: &str) -> String {
+    format!(
+        "{paused} when the connection dropped. Echobind reconnects on its own for {} s.",
+        RECONNECT_GRACE.as_secs()
+    )
 }
 
 fn watch_empty_stage(ui: &mut Ui, stage: Rect, audio_only: bool) {

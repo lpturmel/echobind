@@ -21,6 +21,8 @@ pub enum Icon {
     ChevronDown,
     ChevronUp,
     VolumeOff,
+    Edit,
+    Bookmark,
 }
 
 struct Grid {
@@ -207,6 +209,20 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             ));
             segment((22.0, 9.0), (16.0, 15.0));
             segment((16.0, 9.0), (22.0, 15.0));
+        }
+        Icon::Edit => {
+            // A pencil leaning right: rounded cap, parallel body, and tip.
+            let mut outline = grid.points(&[(3.0, 21.0), (4.0, 16.5), (16.0, 4.5)]);
+            outline.extend(grid.arc((17.75, 6.25), 2.475, -135.0, 45.0));
+            outline.extend(grid.points(&[(19.5, 8.0), (7.5, 20.0)]));
+            painter.add(Shape::closed_line(outline, stroke));
+            segment((14.0, 6.5), (17.5, 10.0));
+        }
+        Icon::Bookmark => {
+            let mut outline = grid.points(&[(19.0, 21.0), (12.0, 17.0), (5.0, 21.0), (5.0, 5.0)]);
+            outline.extend(grid.arc((7.0, 5.0), 2.0, 180.0, 270.0));
+            outline.extend(grid.arc((17.0, 5.0), 2.0, -90.0, 0.0));
+            painter.add(Shape::closed_line(outline, stroke));
         }
     }
 }

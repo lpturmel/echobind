@@ -1,7 +1,11 @@
 mod views;
 
 use crate::{
-    session::{DesktopSession, DisplayFrameData, SessionEvent, VideoResolution},
+    presence::Presence,
+    saved::{SavedSession, SavedSessions},
+    session::{
+        DesktopSession, DisplayFrameData, SessionEvent, VideoResolution, ViewerEnd, RECONNECT_GRACE,
+    },
     theme::{self, Tone},
 };
 use echobind_core::protocol::{CursorPosition, ServerStats};
@@ -57,6 +61,16 @@ impl Notice {
     }
 }
 
+/// The edit dialog for one saved session, holding unsaved field text.
+struct SavedEditor {
+    original: SocketAddr,
+    name: String,
+    ip: String,
+    port: String,
+    audio_only: bool,
+    error: Option<String>,
+}
+
 struct GpuVideoTexture {
     texture: eframe::wgpu::Texture,
     id: egui::TextureId,
@@ -88,7 +102,18 @@ pub struct EchobindApp {
     target: Option<SocketAddr>,
     peer: Option<SocketAddr>,
     reconnecting: bool,
+    reconnecting_since: Option<Instant>,
     pending_peer: Option<SocketAddr>,
+    saved: SavedSessions,
+    /// The connect form's name. A named connection is saved for next time.
+    save_name: String,
+    /// The saved session the connect form was last loaded from or saved as.
+    form_origin: Option<SocketAddr>,
+    editor: Option<SavedEditor>,
+    /// Whether each saved host is sharing, checked while the list shows.
+    presence: Presence,
+    /// The friendly name of the host being watched, when it was saved.
+    session_name: Option<String>,
     health_open: bool,
     drawer_open: bool,
     watch_audio_only: bool,
@@ -168,6 +193,16 @@ impl EchobindApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         theme::install(&creation_context.egui_ctx);
         let audio_output_devices = DesktopSession::audio_output_devices().unwrap_or_default();
+        let (saved, saved_error) = SavedSessions::load();
+        let repaint_context = creation_context.egui_ctx.clone();
+        let presence = Presence::start(Arc::new(move || repaint_context.request_repaint()));
+        let notice = saved_error.map(|error| {
+            Notice::new(
+                Tone::Caution,
+                "Saved sessions couldn't be read",
+                format!("{error}. The file was set aside and a new list started."),
+            )
+        });
         let render_state = creation_context
             .wgpu_render_state
             .clone()
@@ -205,13 +240,20 @@ impl EchobindApp {
             resolution: VideoResolution::Native,
             jumbo_datagrams: false,
             transport: "Standard MTU".to_owned(),
-            notice: None,
+            notice,
             listen_address: None,
             capture_ready: false,
             target: None,
             peer: None,
             reconnecting: false,
+            reconnecting_since: None,
             pending_peer: None,
+            saved,
+            save_name: String::new(),
+            form_origin: None,
+            editor: None,
+            presence,
+            session_name: None,
             health_open: true,
             drawer_open: false,
             watch_audio_only: false,
@@ -326,6 +368,45 @@ impl EchobindApp {
         }
     }
 
+    /// The watched host as the user knows it: its saved name, else its IP.
+    fn host_label(&self) -> String {
+        self.session_name
+            .clone()
+            .or_else(|| self.target.map(|target| target.ip().to_string()))
+            .unwrap_or_else(|| "the host".to_owned())
+    }
+
+    /// The banner for a viewer session that ended without the user.
+    fn viewer_end_notice(&self, end: ViewerEnd) -> Notice {
+        let host = self.host_label();
+        match end {
+            ViewerEnd::HostStopped => Notice::new(
+                Tone::Caution,
+                format!("{host} stopped sharing"),
+                "The host ended the session. Connect again once it's sharing.",
+            ),
+            ViewerEnd::HostNotSharing => Notice::new(
+                Tone::Caution,
+                format!("{host} isn't sharing"),
+                format!(
+                    "Nothing answered at {}. Start sharing on the host, then connect again.",
+                    self.target
+                        .map(|target| target.to_string())
+                        .unwrap_or_else(|| "that address".to_owned())
+                ),
+            ),
+            ViewerEnd::HostUnreachable => Notice::new(
+                Tone::Danger,
+                format!("Lost connection to {host}"),
+                format!(
+                    "No response for {} s. Check the network and that the host is still sharing.",
+                    RECONNECT_GRACE.as_secs()
+                ),
+            ),
+            ViewerEnd::Failed(error) => Notice::new(Tone::Danger, "Connection ended", error),
+        }
+    }
+
     fn share_phase(&self) -> SharePhase {
         if self.mode != Mode::Host || self.session.is_none() {
             SharePhase::Idle
@@ -360,6 +441,7 @@ impl EchobindApp {
         let events: Vec<_> = session.drain_events().collect();
         let newest_frame = session.take_latest_frame();
         let mut rejected = false;
+        let mut ended = None;
 
         for event in events {
             match event {
@@ -378,6 +460,7 @@ impl EchobindApp {
                     self.peer = Some(peer);
                     self.pending_peer = None;
                     self.reconnecting = false;
+                    self.reconnecting_since = None;
                     self.notice = None;
                 }
                 SessionEvent::ConnectionRejected(reason) => {
@@ -387,17 +470,39 @@ impl EchobindApp {
                     rejected = true;
                 }
                 SessionEvent::Disconnected(reason) => {
-                    let title = if self.mode == Mode::Host {
+                    if self.mode == Mode::Host {
                         self.peer = None;
-                        "Viewer disconnected"
-                    } else {
+                        self.notice =
+                            Some(Notice::new(Tone::Caution, "Viewer connection lost", reason));
+                    } else if !self.reconnecting {
+                        // The stage shows the reconnect, so no banner.
                         self.reconnecting = true;
-                        "Connection lost"
-                    };
-                    self.notice = Some(Notice::new(Tone::Caution, title, reason));
+                        self.reconnecting_since = Some(Instant::now());
+                    }
                     self.pending_peer = None;
                     self.server_stats = None;
                     self.server_stats_received_at = None;
+                }
+                SessionEvent::ViewerLeft(peer) => {
+                    self.peer = None;
+                    self.notice = Some(Notice::new(
+                        Tone::Neutral,
+                        "Viewer left",
+                        format!("{peer} disconnected. Sharing stays on for the next viewer."),
+                    ));
+                }
+                SessionEvent::RequestWithdrawn(peer) => {
+                    if self.pending_peer == Some(peer) {
+                        self.pending_peer = None;
+                        self.notice = Some(Notice::new(
+                            Tone::Neutral,
+                            "Request withdrawn",
+                            format!("{peer} cancelled before you answered."),
+                        ));
+                    }
+                }
+                SessionEvent::ViewerEnded(end) => {
+                    ended = Some(self.viewer_end_notice(end));
                 }
                 SessionEvent::CaptureReady => {
                     self.capture_ready = true;
@@ -506,10 +611,18 @@ impl EchobindApp {
             self.present_stats_at = Instant::now();
         }
 
-        // A rejected viewer's network thread has already exited; release the
-        // socket and audio device instead of leaving a dead session running.
+        // A rejected or ended viewer's network thread has already exited;
+        // release the socket and audio device instead of leaving a dead
+        // session running.
         if rejected {
             self.stop();
+        }
+        if let Some(notice) = ended {
+            self.stop();
+            self.notice = Some(notice);
+            if self.fullscreen {
+                self.set_fullscreen(context, false);
+            }
         }
 
         context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -590,10 +703,124 @@ impl EchobindApp {
             Ok(session) => {
                 self.target = Some(address);
                 self.session = Some(session);
+                self.session_name = self.remember_session(address);
             }
             Err(error) => {
                 self.notice = Some(Notice::new(Tone::Danger, "Couldn't connect", error));
             }
+        }
+    }
+
+    /// Saves the host when the form names it, or marks an already saved
+    /// address as just used, and returns the name to show while watching.
+    fn remember_session(&mut self, address: SocketAddr) -> Option<String> {
+        let typed = self.save_name.trim().to_owned();
+        let name = if typed.is_empty() {
+            self.saved.find(address)?.name.clone()
+        } else {
+            typed
+        };
+        let result = self
+            .saved
+            .remember(&name, address, self.watch_audio_only, self.form_origin);
+        if let Err(error) = result {
+            self.notice = Some(save_failed_notice(error));
+        }
+        self.form_origin = Some(address);
+        self.saved.find(address).map(|saved| saved.name.clone())
+    }
+
+    /// Loads a saved session into the connect form and connects to it.
+    fn connect_saved(&mut self, saved: SavedSession, context: &egui::Context) {
+        self.server_ip = saved.address.ip().to_string();
+        self.port_text = saved.address.port().to_string();
+        self.watch_audio_only = saved.audio_only;
+        self.save_name = saved.name;
+        self.form_origin = Some(saved.address);
+        self.connect(context);
+    }
+
+    /// Saves the connect form under its name without connecting.
+    fn save_form(&mut self) {
+        let name = self.save_name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        let server_ip = self.server_ip.clone();
+        let Some(address) = self.parse_fields(&server_ip) else {
+            return;
+        };
+        let result = self
+            .saved
+            .remember(&name, address, self.watch_audio_only, self.form_origin);
+        if let Err(error) = result {
+            self.notice = Some(save_failed_notice(error));
+        }
+        self.form_origin = Some(address);
+    }
+
+    fn open_editor(&mut self, saved: &SavedSession) {
+        self.editor = Some(SavedEditor {
+            original: saved.address,
+            name: saved.name.clone(),
+            ip: saved.address.ip().to_string(),
+            port: saved.address.port().to_string(),
+            audio_only: saved.audio_only,
+            error: None,
+        });
+    }
+
+    fn save_editor(&mut self) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        let name = editor.name.trim().to_owned();
+        let address = if name.is_empty() {
+            Err("Give this session a name.".to_owned())
+        } else {
+            parse_port(&editor.port).and_then(|port| parse_address(&editor.ip, port))
+        };
+        let address = match address {
+            Ok(address) if self.saved.taken_by_another(editor.original, address) => {
+                editor.error = Some(format!("Another saved session already uses {address}."));
+                return;
+            }
+            Ok(address) => address,
+            Err(error) => {
+                editor.error = Some(error);
+                return;
+            }
+        };
+        let original = editor.original;
+        let edited = SavedSession {
+            name,
+            address,
+            audio_only: editor.audio_only,
+            last_used: 0,
+        };
+        self.editor = None;
+        if let Err(error) = self.saved.update(original, edited.clone()) {
+            self.notice = Some(save_failed_notice(error));
+        }
+        // Keep a form showing this session in step with the edit.
+        if self.form_origin == Some(original) && self.session.is_none() {
+            self.server_ip = address.ip().to_string();
+            self.port_text = address.port().to_string();
+            self.watch_audio_only = edited.audio_only;
+            self.save_name = edited.name;
+            self.form_origin = Some(address);
+        }
+    }
+
+    fn remove_edited(&mut self) {
+        let Some(editor) = self.editor.take() else {
+            return;
+        };
+        if let Err(error) = self.saved.remove(editor.original) {
+            self.notice = Some(save_failed_notice(error));
+        }
+        if self.form_origin == Some(editor.original) {
+            self.form_origin = None;
         }
     }
 
@@ -617,6 +844,8 @@ impl EchobindApp {
         self.target = None;
         self.peer = None;
         self.reconnecting = false;
+        self.reconnecting_since = None;
+        self.session_name = None;
         self.pending_peer = None;
         self.pending_video = true;
         self.peer_video = None;
@@ -893,6 +1122,10 @@ impl EchobindApp {
 }
 
 impl eframe::App for EchobindApp {
+    fn on_exit(&mut self) {
+        self.shut_down();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         let toggle_fullscreen = context.input(|input| input.key_pressed(egui::Key::F11));
@@ -902,6 +1135,11 @@ impl eframe::App for EchobindApp {
             self.set_fullscreen(&context, !self.fullscreen);
         }
         self.process_session_updates(&context);
+        // Saved hosts are probed only while their list is on screen.
+        self.presence.watch(
+            self.saved.sessions().iter().map(|saved| saved.address),
+            self.mode == Mode::Connect && self.session.is_none() && !self.fullscreen,
+        );
 
         if self.fullscreen {
             egui::CentralPanel::default()
@@ -909,6 +1147,10 @@ impl eframe::App for EchobindApp {
                 .show(ui, |ui| {
                     let area = ui.max_rect();
                     self.paint_video(ui, area);
+                    if self.reconnecting {
+                        ui.painter().rect_filled(area, 0, views::DIM_FILL);
+                        self.reconnect_message(ui, area);
+                    }
                 });
             self.show_fullscreen_stats(&context);
             return;
@@ -933,8 +1175,10 @@ impl eframe::App for EchobindApp {
     }
 }
 
-impl Drop for EchobindApp {
-    fn drop(&mut self) {
+impl EchobindApp {
+    /// Stops the session in place, so its peer gets a goodbye before the
+    /// process exits, and waits for any earlier shutdown to finish.
+    fn shut_down(&mut self) {
         if let Some(mut session) = self.session.take() {
             session.stop();
         }
@@ -944,6 +1188,16 @@ impl Drop for EchobindApp {
             }
         }
     }
+}
+
+impl Drop for EchobindApp {
+    fn drop(&mut self) {
+        self.shut_down();
+    }
+}
+
+fn save_failed_notice(error: String) -> Notice {
+    Notice::new(Tone::Danger, "Couldn't save your sessions", error)
 }
 
 fn still_stopping_notice() -> Notice {

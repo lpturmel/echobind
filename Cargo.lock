@@ -907,6 +907,7 @@ dependencies = [
  "rayon",
  "scap",
  "screencapturekit 8.0.1",
+ "serde",
  "serde_json",
  "socket2",
  "tracing",

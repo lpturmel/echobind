@@ -23,15 +23,33 @@ cargo run --release -p echobind-desktop
 
 On the sharing machine:
 
-1. Select **Create server**.
-2. Choose the bind IP and UDP port, then start the server.
+1. Select **Share**.
+2. Choose the bind IP and UDP port, then select **Start sharing**.
 3. Accept the viewer when its IP address appears.
 
 On the viewing machine:
 
-1. Select **Connect**.
-2. Enter the server's IP address and UDP port.
-3. Wait for the server to accept the connection.
+1. Select **Watch**.
+2. Enter the host's IP address and UDP port. Give it a name to save it.
+3. Select **Connect** and wait for the host to accept.
+
+Named hosts appear under **Saved sessions** for one-click connect; the pencil
+edits or removes one. They are stored as JSON in `saved-sessions.json` under
+`~/Library/Application Support/Echobind` on macOS, `%APPDATA%\Echobind` on
+Windows, and `$XDG_CONFIG_HOME/echobind` (or `~/.config/echobind`) elsewhere.
+While the list is on screen, each saved host is probed every two seconds and
+shows **Online**, **In use** (another viewer is connected), or **Offline**.
+Desktop hosts from earlier releases and the CLI server never answer the probe,
+so they show as offline, though connecting to them still works.
+
+If a viewer hears nothing from the host for 5 seconds, the stream pauses and
+the viewer reconnects on its own. The host releases a silent viewer after 10
+seconds but restores it from the same IP without a new approval for 30
+seconds, so the viewer gives up after 30 seconds of reconnecting. Stopping on
+either side sends a goodbye: a viewer ends its session at once when the host
+stops sharing or quits, and a host frees its slot, or withdraws a pending
+request, as soon as the viewer disconnects. A viewer whose host port is closed
+(the host quit without a goodbye) ends its session as well.
 
 The desktop app streams the primary display at native, 720p, or 1080p
 resolution and up to 120 FPS. Windows uses DXGI Desktop Duplication, a
@@ -137,6 +155,7 @@ UDP: 3013
 Echobind uses UDP for setup, heartbeat, media, and clipboard synchronization.
 The client sends a UDP hello to receive the session config, then sends periodic
 UDP pings; either side treats 3 seconds without a UDP response as a disconnect.
+The desktop app's timeouts and reconnects are described above.
 
 Protocol v2 uses 1400-byte media datagrams by default and negotiates optional
 8192-byte video datagrams. Audio frames carry sequence numbers and presentation

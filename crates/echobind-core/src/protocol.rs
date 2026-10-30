@@ -8,6 +8,8 @@ const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
 const HELLO_FLAG_AUDIO_ONLY: u8 = 1;
+const PRESENCE_FLAG_VIDEO: u8 = 1;
+const PRESENCE_FLAG_BUSY: u8 = 1 << 1;
 const LEGACY_SERVER_STATS_LEN: usize = 9 * size_of::<f32>() + 7 * size_of::<u64>();
 const STAGED_SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 9 * size_of::<u64>();
 const NVENC_COUNTER_SERVER_STATS_LEN: usize = 15 * size_of::<f32>() + 11 * size_of::<u64>();
@@ -46,6 +48,21 @@ pub enum Packet<'a> {
     ServerStats(ServerStats),
     VideoKeyframeRequest,
     ConnectionRejected(&'a [u8]),
+    /// Either side is ending the session on purpose: the host stopped sharing
+    /// or the viewer disconnected. Peers that predate it ignore it as invalid.
+    Goodbye,
+    /// Asks a host whether it is sharing, without asking to watch.
+    Probe,
+    /// A sharing host's answer to a probe.
+    ProbeReply(HostPresence),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostPresence {
+    /// The host shares its screen, not only system audio.
+    pub video: bool,
+    /// A viewer is connected, so the host would refuse another request.
+    pub busy: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +152,9 @@ impl Packet<'_> {
     const CONNECTION_REJECTED: u8 = 9;
     const CURSOR_POSITION: u8 = 10;
     const SERVER_STATS: u8 = 11;
+    const GOODBYE: u8 = 12;
+    const PROBE: u8 = 13;
+    const PROBE_REPLY: u8 = 14;
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
@@ -250,6 +270,13 @@ impl Packet<'_> {
             Packet::ConnectionRejected(reason) => {
                 Self::encode_packet(Self::CONNECTION_REJECTED, reason, out);
             }
+            Packet::Goodbye => Self::encode_packet(Self::GOODBYE, &[], out),
+            Packet::Probe => Self::encode_packet(Self::PROBE, &[], out),
+            Packet::ProbeReply(presence) => {
+                let flags = (u8::from(presence.video) * PRESENCE_FLAG_VIDEO)
+                    | (u8::from(presence.busy) * PRESENCE_FLAG_BUSY);
+                Self::encode_packet(Self::PROBE_REPLY, &[flags], out);
+            }
         }
     }
 
@@ -324,6 +351,13 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
                 Ok(Packet::VideoKeyframeRequest)
             }
             Packet::CONNECTION_REJECTED => Ok(Packet::ConnectionRejected(payload)),
+            Packet::GOODBYE if payload.is_empty() => Ok(Packet::Goodbye),
+            Packet::PROBE if payload.is_empty() => Ok(Packet::Probe),
+            // Unknown flag bits are reserved for later presence details.
+            Packet::PROBE_REPLY if payload.len() == 1 => Ok(Packet::ProbeReply(HostPresence {
+                video: payload[0] & PRESENCE_FLAG_VIDEO != 0,
+                busy: payload[0] & PRESENCE_FLAG_BUSY != 0,
+            })),
             _ => Err(PacketParseError::Invalid),
         }
     }
@@ -759,6 +793,45 @@ mod tests {
         assert_eq!(
             Packet::try_from(encoded.as_slice()),
             Ok(Packet::ConnectionRejected(b"busy"))
+        );
+    }
+
+    #[test]
+    fn encodes_and_parses_goodbye() {
+        let encoded = round_trip(Packet::Goodbye);
+        assert_eq!(encoded.len(), HEADER_LEN);
+        assert_eq!(Packet::try_from(encoded.as_slice()), Ok(Packet::Goodbye));
+
+        let mut padded = encoded;
+        padded.push(0);
+        assert_eq!(
+            Packet::try_from(padded.as_slice()),
+            Err(PacketParseError::Invalid)
+        );
+    }
+
+    #[test]
+    fn encodes_and_parses_presence_probes() {
+        let encoded = round_trip(Packet::Probe);
+        assert_eq!(Packet::try_from(encoded.as_slice()), Ok(Packet::Probe));
+
+        for (video, busy) in [(false, false), (true, false), (false, true), (true, true)] {
+            let presence = HostPresence { video, busy };
+            let encoded = round_trip(Packet::ProbeReply(presence));
+            assert_eq!(
+                Packet::try_from(encoded.as_slice()),
+                Ok(Packet::ProbeReply(presence))
+            );
+        }
+
+        let mut future = MAGIC.to_vec();
+        future.extend_from_slice(&[Packet::PROBE_REPLY, 0b100 | PRESENCE_FLAG_VIDEO]);
+        assert_eq!(
+            Packet::try_from(future.as_slice()),
+            Ok(Packet::ProbeReply(HostPresence {
+                video: true,
+                busy: false,
+            }))
         );
     }
 
