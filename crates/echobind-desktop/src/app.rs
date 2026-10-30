@@ -7,8 +7,9 @@ use crate::{
         DesktopSession, DisplayFrameData, SessionEvent, VideoResolution, ViewerEnd, RECONNECT_GRACE,
     },
     theme::{self, Tone},
+    trust::{self, TrustedViewers},
 };
-use echobind_core::protocol::{CursorPosition, ServerStats};
+use echobind_core::protocol::{CursorPosition, ServerStats, ViewerId};
 use eframe::egui;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -104,6 +105,16 @@ pub struct EchobindApp {
     reconnecting: bool,
     reconnecting_since: Option<Instant>,
     pending_peer: Option<SocketAddr>,
+    /// The waiting viewer's identity, when it sent one it can be trusted by.
+    pending_viewer: Option<ViewerId>,
+    /// The request dialog's "Always allow" choice.
+    always_allow: bool,
+    /// The connected viewer's identity, when it sent one.
+    peer_viewer: Option<ViewerId>,
+    /// Viewers this host accepts without asking.
+    trusted: TrustedViewers,
+    /// Who this device is to the hosts it watches.
+    viewer_id: ViewerId,
     saved: SavedSessions,
     /// The connect form's name. A named connection is saved for next time.
     save_name: String,
@@ -194,15 +205,26 @@ impl EchobindApp {
         theme::install(&creation_context.egui_ctx);
         let audio_output_devices = DesktopSession::audio_output_devices().unwrap_or_default();
         let (saved, saved_error) = SavedSessions::load();
+        let (trusted, trusted_error) = TrustedViewers::load();
         let repaint_context = creation_context.egui_ctx.clone();
         let presence = Presence::start(Arc::new(move || repaint_context.request_repaint()));
-        let notice = saved_error.map(|error| {
-            Notice::new(
-                Tone::Caution,
-                "Saved sessions couldn't be read",
-                format!("{error}. The file was set aside and a new list started."),
-            )
-        });
+        let notice = saved_error
+            .map(|error| {
+                Notice::new(
+                    Tone::Caution,
+                    "Saved sessions couldn't be read",
+                    format!("{error}. The file was set aside and a new list started."),
+                )
+            })
+            .or_else(|| {
+                trusted_error.map(|error| {
+                    Notice::new(
+                        Tone::Caution,
+                        "Trusted viewers couldn't be read",
+                        format!("{error}. The file was set aside, so every viewer asks again."),
+                    )
+                })
+            });
         let render_state = creation_context
             .wgpu_render_state
             .clone()
@@ -248,6 +270,11 @@ impl EchobindApp {
             reconnecting: false,
             reconnecting_since: None,
             pending_peer: None,
+            pending_viewer: None,
+            always_allow: false,
+            peer_viewer: None,
+            trusted,
+            viewer_id: trust::local_viewer_id(),
             saved,
             save_name: String::new(),
             form_origin: None,
@@ -449,16 +476,28 @@ impl EchobindApp {
                     self.listen_address = Some(address);
                 }
                 SessionEvent::AwaitingApproval => {}
-                SessionEvent::PendingConnection { peer, video } => {
+                SessionEvent::PendingConnection {
+                    peer,
+                    video,
+                    viewer,
+                } => {
+                    // A new viewer starts unchecked; one that repeats its
+                    // request keeps what the host already chose.
+                    if self.pending_peer != Some(peer) {
+                        self.always_allow = false;
+                    }
                     self.pending_peer = Some(peer);
                     self.pending_video = video;
+                    self.pending_viewer = viewer;
                 }
                 SessionEvent::PeerMedia { video } => {
                     self.peer_video = Some(video);
                 }
                 SessionEvent::Connected(peer) => {
                     self.peer = Some(peer);
+                    self.peer_viewer = None;
                     self.pending_peer = None;
+                    self.pending_viewer = None;
                     self.reconnecting = false;
                     self.reconnecting_since = None;
                     self.notice = None;
@@ -499,6 +538,15 @@ impl EchobindApp {
                             "Request withdrawn",
                             format!("{peer} cancelled before you answered."),
                         ));
+                    }
+                }
+                SessionEvent::ViewerIdentity(viewer) => {
+                    self.peer_viewer = Some(viewer);
+                    // Keep where a trusted viewer was last seen current.
+                    if let Some(peer) = self.peer.filter(|_| self.trusted.contains(viewer)) {
+                        if let Err(error) = self.trusted.trust(viewer, peer.ip()) {
+                            self.notice = Some(trust_failed_notice(error));
+                        }
                     }
                 }
                 SessionEvent::ViewerEnded(end) => {
@@ -669,6 +717,7 @@ impl EchobindApp {
             self.jumbo_datagrams,
             !self.share_audio_only,
             self.volume_gain(),
+            self.trusted.ids(),
         ) {
             Ok(session) => {
                 self.session = Some(session);
@@ -699,6 +748,7 @@ impl EchobindApp {
             frame_notifier,
             self.watch_audio_only,
             self.volume_gain(),
+            self.viewer_id,
         ) {
             Ok(session) => {
                 self.target = Some(address);
@@ -848,6 +898,9 @@ impl EchobindApp {
         self.session_name = None;
         self.pending_peer = None;
         self.pending_video = true;
+        self.pending_viewer = None;
+        self.always_allow = false;
+        self.peer_viewer = None;
         self.peer_video = None;
         self.remote_cursor = None;
         self.clear_texture();
@@ -905,9 +958,31 @@ impl EchobindApp {
     }
 
     fn accept_pending(&mut self) {
-        if let (Some(peer), Some(session)) = (self.pending_peer, &self.session) {
+        let Some(peer) = self.pending_peer else {
+            return;
+        };
+        // Trusting first also lets the host accept the viewer's next Hello
+        // on its own; it connects once either way.
+        if let Some(viewer) = self.pending_viewer.filter(|_| self.always_allow) {
+            if let Err(error) = self.trusted.trust(viewer, peer.ip()) {
+                self.notice = Some(trust_failed_notice(error));
+            }
+        }
+        if let Some(session) = &self.session {
             session.accept(peer);
         }
+    }
+
+    fn forget_viewer(&mut self, viewer: ViewerId) {
+        if let Err(error) = self.trusted.forget(viewer) {
+            self.notice = Some(trust_failed_notice(error));
+        }
+    }
+
+    /// Whether the connected viewer is one this host always allows.
+    fn peer_trusted(&self) -> bool {
+        self.peer_viewer
+            .is_some_and(|viewer| self.trusted.contains(viewer))
     }
 
     fn reject_pending(&mut self) {
@@ -1200,6 +1275,15 @@ fn save_failed_notice(error: String) -> Notice {
     Notice::new(Tone::Danger, "Couldn't save your sessions", error)
 }
 
+/// The change still applies until Echobind quits.
+fn trust_failed_notice(error: String) -> Notice {
+    Notice::new(
+        Tone::Danger,
+        "Couldn't save trusted viewers",
+        format!("{error}. The change lasts until Echobind quits."),
+    )
+}
+
 fn still_stopping_notice() -> Notice {
     Notice::new(
         Tone::Caution,
@@ -1213,6 +1297,18 @@ fn transport_label(datagram_size: usize) -> String {
         format!("Jumbo · {datagram_size} B")
     } else {
         "Standard MTU".to_owned()
+    }
+}
+
+/// When a trusted viewer last connected, from Unix seconds.
+fn seen_label(last_seen: u64, now: u64) -> String {
+    const HOUR: u64 = 60 * 60;
+    const DAY: u64 = 24 * HOUR;
+    match now.saturating_sub(last_seen) {
+        elapsed if elapsed < HOUR => "Seen just now".to_owned(),
+        elapsed if elapsed < DAY => format!("Seen {} h ago", elapsed / HOUR),
+        elapsed if elapsed < 2 * DAY => "Seen 1 day ago".to_owned(),
+        elapsed => format!("Seen {} days ago", elapsed / DAY),
     }
 }
 
@@ -1306,6 +1402,17 @@ mod tests {
     fn labels_jumbo_transport_only_above_standard_datagrams() {
         assert_eq!(transport_label(1400), "Standard MTU");
         assert_eq!(transport_label(8192), "Jumbo · 8192 B");
+    }
+
+    #[test]
+    fn labels_when_a_trusted_viewer_was_seen() {
+        let now = 1_000_000;
+        assert_eq!(seen_label(now - 59 * 60, now), "Seen just now");
+        assert_eq!(seen_label(now - 3 * 60 * 60, now), "Seen 3 h ago");
+        assert_eq!(seen_label(now - 30 * 60 * 60, now), "Seen 1 day ago");
+        assert_eq!(seen_label(now - 9 * 24 * 60 * 60, now), "Seen 9 days ago");
+        // A clock that moved backwards is not a future visit.
+        assert_eq!(seen_label(now + 60, now), "Seen just now");
     }
 
     #[test]

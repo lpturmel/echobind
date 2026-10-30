@@ -168,8 +168,8 @@ impl SavedSessions {
 }
 
 /// Writes beside the destination first so a crash mid-write never leaves a
-/// truncated file in place of the user's sessions.
-fn write_atomically(path: &Path, file: &SavedFile) -> io::Result<()> {
+/// truncated file in place of the user's data.
+pub(crate) fn write_atomically(path: &Path, file: &impl Serialize) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -192,26 +192,26 @@ fn sort_newest_first(sessions: &mut [SavedSession]) {
     });
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 #[cfg(target_os = "macos")]
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
     Some(PathBuf::from(home).join("Library/Application Support/Echobind"))
 }
 
 #[cfg(target_os = "windows")]
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let app_data = std::env::var_os("APPDATA").filter(|dir| !dir.is_empty())?;
     Some(PathBuf::from(app_data).join("Echobind"))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)

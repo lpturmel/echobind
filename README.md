@@ -25,7 +25,8 @@ On the sharing machine:
 
 1. Select **Share**.
 2. Choose the bind IP and UDP port, then select **Start sharing**.
-3. Accept the viewer when its IP address appears.
+3. Accept the viewer when its IP address appears. Turn on **Always allow this
+   device** first to skip this step the next time it connects.
 
 On the viewing machine:
 
@@ -41,6 +42,17 @@ While the list is on screen, each saved host is probed every two seconds and
 shows **Online**, **In use** (another viewer is connected), or **Offline**.
 Desktop hosts from earlier releases and the CLI server never answer the probe,
 so they show as offline, though connecting to them still works.
+
+Each desktop viewer has a random device ID, created on first launch and kept
+in `viewer-id.json` in the same directory, which it sends with its connection
+request. A host that always allows that ID accepts the viewer on its own, from
+any IP address, and lists it under **Trusted viewers** in the Share panel with
+its last IP and when it last connected; its × button forgets it, so it is
+asked about again next time. Trusted IDs are stored in `trusted-viewers.json`. The ID travels
+unencrypted, like the stream itself, so anyone who can capture traffic on your
+network could copy it: it saves an approval click, it does not authenticate
+the viewer. Viewers from earlier releases and the CLI send no ID, so they are
+always asked about.
 
 If a viewer hears nothing from the host for 5 seconds, the stream pauses and
 the viewer reconnects on its own. The host releases a silent viewer after 10

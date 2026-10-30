@@ -1,8 +1,8 @@
-use crate::video::I420Frame;
+use crate::{trust::TrustedIds, video::I420Frame};
 use echobind_core::{
     protocol::{
-        CursorPosition, HostPresence, Packet, ServerStats, JUMBO_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE,
-        STANDARD_DATAGRAM_SIZE,
+        CursorPosition, HostPresence, Packet, ServerStats, ViewerId, JUMBO_DATAGRAM_SIZE,
+        MAX_DATAGRAM_SIZE, STANDARD_DATAGRAM_SIZE,
     },
     video::{fragment_video_frame_with_datagram_size, VideoFrame, VideoReassembler},
     AudioConfig, FrameRate as SessionFrameRate, SessionConfig, VideoCodec, VideoConfig,
@@ -451,8 +451,13 @@ pub enum SessionEvent {
     PendingConnection {
         peer: SocketAddr,
         video: bool,
+        /// The viewer's identity, which a host can choose to always allow.
+        /// Viewers that predate identities send none.
+        viewer: Option<ViewerId>,
     },
     Connected(SocketAddr),
+    /// The identity of the viewer a host just connected, when it sent one.
+    ViewerIdentity(ViewerId),
     /// Whether the connected session carries video, or only audio.
     PeerMedia {
         video: bool,
@@ -559,7 +564,9 @@ impl DesktopSession {
     }
 
     /// Starts a host. With `video` off it shares system audio only and never
-    /// captures the screen.
+    /// captures the screen. Viewers whose IDs are in `trusted` are accepted
+    /// without asking.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_host(
         bind_addr: SocketAddr,
         frames_per_second: u32,
@@ -568,6 +575,7 @@ impl DesktopSession {
         jumbo_datagrams: bool,
         video: bool,
         volume: f32,
+        trusted: TrustedIds,
     ) -> Result<Self, String> {
         let (audio_capture, audio_probe_error) = match audio::discover_system_audio_capture() {
             Ok(settings) => (Some(settings), None),
@@ -668,6 +676,7 @@ impl DesktopSession {
             jumbo_datagrams,
             active_datagram_size.clone(),
             pending_server_stats.clone(),
+            trusted,
         );
         if let Some(error) = audio_probe_error {
             let _ = event_tx.send(SessionEvent::AudioBackend(format!(
@@ -778,13 +787,15 @@ impl DesktopSession {
     }
 
     /// Connects to a host. With `audio_only` set the viewer asks the host to
-    /// skip video and ignores any video it still receives.
+    /// skip video and ignores any video it still receives. `viewer_id` lets a
+    /// host that trusts this device accept it without asking.
     pub fn start_client(
         server_addr: SocketAddr,
         audio_output_device: Option<String>,
         frame_notifier: FrameNotifier,
         audio_only: bool,
         volume: f32,
+        viewer_id: ViewerId,
     ) -> Result<Self, String> {
         let bind_addr = if server_addr.is_ipv4() {
             "0.0.0.0:0"
@@ -822,6 +833,7 @@ impl DesktopSession {
             audio_command_rx,
             audio_only,
             volume.clone(),
+            viewer_id,
         );
         let decoder_handle = spawn_video_decoder(
             running.clone(),
@@ -1033,15 +1045,17 @@ fn spawn_host_network(
     jumbo_requested: bool,
     active_datagram_size: Arc<AtomicUsize>,
     pending_server_stats: PendingServerStats,
+    trusted: TrustedIds,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut packet_buffer = [0_u8; MAX_DATAGRAM_SIZE];
         let mut response = Vec::with_capacity(MAX_DATAGRAM_SIZE);
-        // (peer, advertised datagram size, receives video)
-        let mut pending_peer = None::<(SocketAddr, usize, bool)>;
+        // (peer, advertised datagram size, receives video, identity)
+        let mut pending_peer = None::<(SocketAddr, usize, bool, Option<ViewerId>)>;
         let mut last_seen = None::<Instant>;
-        let mut reconnect_peer = None::<(SocketAddr, usize, bool, Instant)>;
+        let mut reconnect_peer = None::<(SocketAddr, usize, bool, Option<ViewerId>, Instant)>;
         let mut active_video = false;
+        let mut active_viewer = None::<ViewerId>;
         let mut keyframe_requests = 0_u64;
         let mut keyframe_requests_since = Instant::now();
 
@@ -1051,13 +1065,14 @@ fn spawn_host_network(
                     HostCommand::Accept(peer)
                         if pending_peer.is_some_and(|(pending, ..)| pending == peer) =>
                     {
-                        let (_, client_max, video) =
+                        let (_, client_max, video, viewer) =
                             pending_peer.expect("the pending peer was just matched");
                         let datagram_size =
                             negotiated_datagram_size(jumbo_requested, client_max, video);
                         active_datagram_size.store(datagram_size, Ordering::Release);
                         replace_active_peer(&peers, Some((peer, video)));
                         active_video = video;
+                        active_viewer = viewer;
                         pending_peer = None;
                         reconnect_peer = None;
                         last_seen = Some(Instant::now());
@@ -1074,6 +1089,9 @@ fn spawn_host_network(
                             let _ = events.send(SessionEvent::PeerMedia { video });
                             let _ =
                                 events.send(SessionEvent::TransportConfigured { datagram_size });
+                            if let Some(viewer) = viewer {
+                                let _ = events.send(SessionEvent::ViewerIdentity(viewer));
+                            }
                         }
                     }
                     HostCommand::Reject(peer)
@@ -1100,8 +1118,18 @@ fn spawn_host_network(
                     let current_peer = *peers.active.lock().unwrap();
 
                     match packet {
-                        Packet::Hello { audio_only, .. } if current_peer == Some(peer) => {
+                        Packet::Hello {
+                            audio_only,
+                            viewer_id,
+                            ..
+                        } if current_peer == Some(peer) => {
                             last_seen = Some(Instant::now());
+                            // The identified Hello can trail a plain one that
+                            // already restored or migrated this viewer.
+                            if let (Some(viewer), None) = (viewer_id, active_viewer) {
+                                active_viewer = Some(viewer);
+                                let _ = events.send(SessionEvent::ViewerIdentity(viewer));
+                            }
                             // Viewers send a legacy Hello alongside the one that
                             // carries their request, so an audio-only request
                             // sticks: it can downgrade video but never upgrade.
@@ -1123,6 +1151,7 @@ fn spawn_host_network(
                         Packet::Hello {
                             max_datagram_size,
                             audio_only,
+                            viewer_id,
                         } if current_peer.is_some_and(|current| {
                             current != peer && current.ip() == peer.ip()
                         }) =>
@@ -1139,6 +1168,7 @@ fn spawn_host_network(
                             active_datagram_size.store(datagram_size, Ordering::Release);
                             replace_active_peer(&peers, Some((peer, video)));
                             active_video = video;
+                            active_viewer = viewer_id;
                             last_seen = Some(Instant::now());
                             reconnect_peer = None;
                             force_keyframe.store(true, Ordering::Release);
@@ -1147,30 +1177,36 @@ fn spawn_host_network(
                             if socket.send_to(&response, peer).is_ok() {
                                 let _ = events.send(SessionEvent::Connected(peer));
                                 let _ = events.send(SessionEvent::PeerMedia { video });
+                                if let Some(viewer) = viewer_id {
+                                    let _ = events.send(SessionEvent::ViewerIdentity(viewer));
+                                }
                             }
                         }
                         // A viewer restarted within the grace window comes back
                         // from a new ephemeral port, so the grace follows the
                         // IP, as the endpoint migration above does.
-                        Packet::Hello { .. }
+                        Packet::Hello { viewer_id, .. }
                             if current_peer.is_none()
-                                && reconnect_peer.is_some_and(|(trusted, _, _, since)| {
-                                    trusted.ip() == peer.ip() && since.elapsed() < RECONNECT_GRACE
+                                && reconnect_peer.is_some_and(|(returning, .., since)| {
+                                    returning.ip() == peer.ip() && since.elapsed() < RECONNECT_GRACE
                                 }) =>
                         {
-                            let (_, datagram_size, video, _) = reconnect_peer
+                            let (_, datagram_size, video, viewer, _) = reconnect_peer
                                 .take()
                                 .expect("the reconnect peer was just matched");
+                            let viewer = viewer_id.or(viewer);
                             active_datagram_size.store(datagram_size, Ordering::Release);
                             replace_active_peer(&peers, Some((peer, video)));
                             active_video = video;
+                            active_viewer = viewer;
                             last_seen = Some(Instant::now());
                             force_keyframe.store(true, Ordering::Release);
                             Packet::Config(configs.for_viewer(datagram_size, video))
                                 .encode(&mut response);
                             if let Err(error) = socket.send_to(&response, peer) {
                                 replace_active_peer(&peers, None);
-                                reconnect_peer = Some((peer, datagram_size, video, Instant::now()));
+                                reconnect_peer =
+                                    Some((peer, datagram_size, video, viewer, Instant::now()));
                                 last_seen = None;
                                 let _ = events.send(SessionEvent::Error(format!(
                                     "Unable to restore {peer}: {error}"
@@ -1178,25 +1214,80 @@ fn spawn_host_network(
                             } else {
                                 let _ = events.send(SessionEvent::Connected(peer));
                                 let _ = events.send(SessionEvent::PeerMedia { video });
+                                if let Some(viewer) = viewer {
+                                    let _ = events.send(SessionEvent::ViewerIdentity(viewer));
+                                }
+                            }
+                        }
+                        // A viewer the host chose to always allow is accepted
+                        // from any address, as if the host approved it again.
+                        Packet::Hello {
+                            max_datagram_size,
+                            audio_only,
+                            viewer_id: Some(viewer),
+                        } if current_peer.is_none()
+                            && trusted.read().unwrap().contains(&viewer) =>
+                        {
+                            let advertised = usize::from(max_datagram_size)
+                                .clamp(STANDARD_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
+                            let previous = pending_peer.filter(|(pending, ..)| *pending == peer);
+                            let (client_max, video) = merge_pending_hello(
+                                previous.map(|(_, max, video, _)| (max, video)),
+                                advertised,
+                                configs.video && !audio_only,
+                            );
+                            let datagram_size =
+                                negotiated_datagram_size(jumbo_requested, client_max, video);
+                            active_datagram_size.store(datagram_size, Ordering::Release);
+                            replace_active_peer(&peers, Some((peer, video)));
+                            active_video = video;
+                            active_viewer = Some(viewer);
+                            // Another viewer's request is now refused on its
+                            // next Hello, since the host is taken.
+                            pending_peer = None;
+                            reconnect_peer = None;
+                            last_seen = Some(Instant::now());
+                            force_keyframe.store(true, Ordering::Release);
+                            Packet::Config(configs.for_viewer(datagram_size, video))
+                                .encode(&mut response);
+                            if let Err(error) = socket.send_to(&response, peer) {
+                                let _ = events.send(SessionEvent::Error(format!(
+                                    "Unable to accept {peer}: {error}"
+                                )));
+                                replace_active_peer(&peers, None);
+                            } else {
+                                let _ = events.send(SessionEvent::Connected(peer));
+                                let _ = events.send(SessionEvent::PeerMedia { video });
+                                let _ = events
+                                    .send(SessionEvent::TransportConfigured { datagram_size });
+                                let _ = events.send(SessionEvent::ViewerIdentity(viewer));
                             }
                         }
                         Packet::Hello {
                             max_datagram_size,
                             audio_only,
+                            viewer_id,
                         } if current_peer.is_none() => {
                             let advertised = usize::from(max_datagram_size)
                                 .clamp(STANDARD_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE);
                             let previous = pending_peer.filter(|(pending, ..)| *pending == peer);
                             let (advertised, video) = merge_pending_hello(
-                                previous.map(|(_, max, video)| (max, video)),
+                                previous.map(|(_, max, video, _)| (max, video)),
                                 advertised,
                                 configs.video && !audio_only,
                             );
-                            pending_peer = Some((peer, advertised, video));
-                            if previous.is_none_or(|(_, _, previous_video)| previous_video != video)
-                            {
-                                let _ =
-                                    events.send(SessionEvent::PendingConnection { peer, video });
+                            let viewer = viewer_id.or(previous.and_then(|(.., viewer)| viewer));
+                            pending_peer = Some((peer, advertised, video, viewer));
+                            // Ask again whenever the request changes, so the
+                            // host answers what the viewer asks for now.
+                            if previous.is_none_or(|(_, _, previous_video, previous_viewer)| {
+                                previous_video != video || previous_viewer != viewer
+                            }) {
+                                let _ = events.send(SessionEvent::PendingConnection {
+                                    peer,
+                                    video,
+                                    viewer,
+                                });
                             }
                         }
                         Packet::Hello { .. } => {
@@ -1219,6 +1310,7 @@ fn spawn_host_network(
                             // grace; a later request needs approval again.
                             replace_active_peer(&peers, None);
                             active_datagram_size.store(STANDARD_DATAGRAM_SIZE, Ordering::Release);
+                            active_viewer = None;
                             last_seen = None;
                             reconnect_peer = None;
                             let _ = events.send(SessionEvent::ViewerLeft(peer));
@@ -1230,7 +1322,7 @@ fn spawn_host_network(
                             let _ = events.send(SessionEvent::RequestWithdrawn(peer));
                         }
                         Packet::Goodbye
-                            if reconnect_peer.is_some_and(|(trusted, ..)| trusted == peer) =>
+                            if reconnect_peer.is_some_and(|(returning, ..)| returning == peer) =>
                         {
                             reconnect_peer = None;
                         }
@@ -1299,16 +1391,24 @@ fn spawn_host_network(
 
             if last_seen.is_some_and(|seen| seen.elapsed() >= CONNECTION_TIMEOUT) {
                 if let Some(peer) = replace_active_peer(&peers, None) {
+                    let viewer = active_viewer.take();
                     reconnect_peer = Some((
                         peer,
                         active_datagram_size.load(Ordering::Acquire),
                         active_video,
+                        viewer,
                         Instant::now(),
                     ));
-                    let _ = events.send(SessionEvent::Disconnected(format!(
-                        "{peer} stopped responding. It can rejoin without approval for {} s.",
-                        RECONNECT_GRACE.as_secs()
-                    )));
+                    let always_allowed =
+                        viewer.is_some_and(|viewer| trusted.read().unwrap().contains(&viewer));
+                    let _ = events.send(SessionEvent::Disconnected(if always_allowed {
+                        format!("{peer} stopped responding. It's always allowed, so it can rejoin anytime.")
+                    } else {
+                        format!(
+                            "{peer} stopped responding. It can rejoin without approval for {} s.",
+                            RECONNECT_GRACE.as_secs()
+                        )
+                    }));
                 }
                 last_seen = None;
             }
@@ -1644,6 +1744,7 @@ fn spawn_client_network(
     audio_commands: mpsc::Receiver<Option<String>>,
     audio_only: bool,
     volume: audio::AudioGain,
+    viewer_id: ViewerId,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut reassembler = VideoReassembler::new(8, VIDEO_REASSEMBLY_AGE);
@@ -1722,18 +1823,30 @@ fn spawn_client_network(
                 }
             }
             if !accepted && last_hello.elapsed() >= HELLO_INTERVAL {
-                // Send the legacy empty hello first so standard-MTU ECB2 hosts
-                // still see the request, then advertise jumbo capability and
-                // any audio-only request to upgraded hosts.
+                // The identified Hello goes first, so a host that always
+                // allows this device accepts it before a plain Hello can show
+                // the host an approval prompt. Hosts that predate identities
+                // ignore it. The legacy empty hello lets standard-MTU ECB2
+                // hosts see the request, then the last one advertises jumbo
+                // capability and any audio-only request to upgraded hosts.
+                Packet::Hello {
+                    max_datagram_size: MAX_DATAGRAM_SIZE as u16,
+                    audio_only,
+                    viewer_id: Some(viewer_id),
+                }
+                .encode(&mut outgoing);
+                let _ = socket.send(&outgoing);
                 Packet::Hello {
                     max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
                     audio_only: false,
+                    viewer_id: None,
                 }
                 .encode(&mut outgoing);
                 let _ = socket.send(&outgoing);
                 Packet::Hello {
                     max_datagram_size: MAX_DATAGRAM_SIZE as u16,
                     audio_only,
+                    viewer_id: None,
                 }
                 .encode(&mut outgoing);
                 match socket.send(&outgoing) {
@@ -2311,6 +2424,7 @@ fn average_milliseconds(total_us: u64, samples: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
 
     fn host_peers() -> HostPeers {
         HostPeers {
@@ -2334,6 +2448,11 @@ mod tests {
 
     impl LoopbackHost {
         fn start() -> Self {
+            Self::start_trusting(TrustedIds::default())
+        }
+
+        /// A host that always allows the viewers in `trusted`.
+        fn start_trusting(trusted: TrustedIds) -> Self {
             let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
             socket.set_read_timeout(Some(SOCKET_TIMEOUT)).unwrap();
             let peers = host_peers();
@@ -2358,6 +2477,7 @@ mod tests {
                 false,
                 Arc::new(AtomicUsize::new(STANDARD_DATAGRAM_SIZE)),
                 Arc::new(Mutex::new(None)),
+                trusted,
             );
             Self {
                 socket,
@@ -2411,8 +2531,18 @@ mod tests {
         }
     }
 
+    const LAPTOP: ViewerId = ViewerId([0x1a; 16]);
+
     fn loopback_viewer(host: SocketAddr) -> DesktopSession {
-        DesktopSession::start_client(host, None, Arc::new(|| {}), true, 1.0).unwrap()
+        loopback_viewer_as(host, LAPTOP)
+    }
+
+    fn loopback_viewer_as(host: SocketAddr, viewer_id: ViewerId) -> DesktopSession {
+        DesktopSession::start_client(host, None, Arc::new(|| {}), true, 1.0, viewer_id).unwrap()
+    }
+
+    fn trusting(viewers: &[ViewerId]) -> TrustedIds {
+        Arc::new(RwLock::new(viewers.iter().copied().collect()))
     }
 
     fn connected_viewer(host: &LoopbackHost) -> (DesktopSession, SocketAddr) {
@@ -2423,6 +2553,89 @@ mod tests {
             matches!(event, SessionEvent::Connected(_))
         });
         (viewer, peer)
+    }
+
+    #[test]
+    fn an_always_allowed_viewer_connects_without_asking() {
+        let host = LoopbackHost::start_trusting(trusting(&[LAPTOP]));
+        let viewer = loopback_viewer(host.address());
+
+        // The identified Hello leads, so the host never shows a prompt.
+        let first = next_event(&host.events, |event| {
+            matches!(
+                event,
+                SessionEvent::Connected(_) | SessionEvent::PendingConnection { .. }
+            )
+        });
+        assert!(matches!(first, SessionEvent::Connected(_)), "{first:?}");
+        let identity = next_event(&host.events, |event| {
+            matches!(event, SessionEvent::ViewerIdentity(_))
+        });
+        assert!(matches!(identity, SessionEvent::ViewerIdentity(id) if id == LAPTOP));
+        next_event(&viewer.events, |event| {
+            matches!(event, SessionEvent::Connected(_))
+        });
+    }
+
+    #[test]
+    fn other_viewers_still_ask_and_report_who_they_are() {
+        let phone = ViewerId([0x2b; 16]);
+        let host = LoopbackHost::start_trusting(trusting(&[LAPTOP]));
+        let viewer = loopback_viewer_as(host.address(), phone);
+
+        let request = next_event(&host.events, |event| {
+            matches!(
+                event,
+                SessionEvent::PendingConnection {
+                    viewer: Some(_),
+                    ..
+                }
+            )
+        });
+        let SessionEvent::PendingConnection {
+            peer, viewer: id, ..
+        } = request
+        else {
+            unreachable!()
+        };
+        assert_eq!(id, Some(phone));
+        assert_eq!(*host.active.lock().unwrap(), None);
+
+        host.commands.send(HostCommand::Accept(peer)).unwrap();
+        let identity = next_event(&host.events, |event| {
+            matches!(event, SessionEvent::ViewerIdentity(_))
+        });
+        assert!(matches!(identity, SessionEvent::ViewerIdentity(id) if id == phone));
+        next_event(&viewer.events, |event| {
+            matches!(event, SessionEvent::Connected(_))
+        });
+    }
+
+    #[test]
+    fn allowing_a_waiting_viewer_lets_it_in_and_forgetting_asks_again() {
+        let trusted = trusting(&[]);
+        let host = LoopbackHost::start_trusting(trusted.clone());
+        let mut viewer = loopback_viewer(host.address());
+        let first = host.next_request();
+
+        // The app trusts the viewer as it accepts; whichever reaches the
+        // host first lets the viewer in, once.
+        trusted.write().unwrap().insert(LAPTOP);
+        next_event(&viewer.events, |event| {
+            matches!(event, SessionEvent::Connected(_))
+        });
+        viewer.stop();
+        next_event(&host.events, |event| {
+            matches!(event, SessionEvent::ViewerLeft(_))
+        });
+
+        trusted.write().unwrap().remove(&LAPTOP);
+        let _viewer = loopback_viewer(host.address());
+        next_event(
+            &host.events,
+            |event| matches!(event, SessionEvent::PendingConnection { peer, .. } if *peer != first),
+        );
+        assert_eq!(*host.active.lock().unwrap(), None);
     }
 
     #[test]

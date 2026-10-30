@@ -644,9 +644,9 @@ fn field(
     .inner
 }
 
-/// A full-width row that acts as one button: a leading icon, a title over a
-/// detail line, and one trailing icon button. Returns the row's response and
-/// the trailing button's.
+/// A full-width row with a leading icon, a title over a detail line, and one
+/// trailing icon button. A `clickable` row also acts as one button. Returns
+/// the row's response and the trailing button's.
 /// The badge takes `badge`'s tone, and `status` leads the detail line.
 #[allow(clippy::too_many_arguments)]
 pub fn list_row(
@@ -658,15 +658,26 @@ pub fn list_row(
     note: Option<&str>,
     action: (Icon, &str),
     label: &str,
+    clickable: bool,
 ) -> (Response, Response) {
     let enabled = ui.is_enabled();
-    let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::click());
-    row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    let sense = if clickable {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), sense);
+    let kind = if clickable {
+        WidgetType::Button
+    } else {
+        WidgetType::Label
+    };
+    row.widget_info(|| WidgetInfo::labeled(kind, enabled, label));
 
     // The row's hover is the pointer anywhere over it, so it stays lit while
     // the pointer is on the trailing button that sits on top of it.
-    let hovered = enabled && ui.rect_contains_pointer(rect);
-    let pressed = enabled && row.is_pointer_button_down_on();
+    let hovered = clickable && enabled && ui.rect_contains_pointer(rect);
+    let pressed = clickable && enabled && row.is_pointer_button_down_on();
     ui.painter().rect_filled(
         rect,
         CornerRadius::same(theme::RADIUS_GROUP),
