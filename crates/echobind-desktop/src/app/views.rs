@@ -1,11 +1,11 @@
 use super::{
-    gpu_priority_label, nvenc_busy_skips, nvenc_slot_label, stale_server_stats_age, EchobindApp,
-    Mode, SharePhase, WatchPhase,
+    gpu_priority_label, nvenc_busy_skips, nvenc_slot_label, seen_label, stale_server_stats_age,
+    EchobindApp, Mode, SharePhase, WatchPhase,
 };
 use crate::{
     icons::{self, Icon},
     presence::HostStatus,
-    saved::NAME_LIMIT,
+    saved::{unix_now, NAME_LIMIT},
     session::{VideoResolution, RECONNECT_GRACE},
     theme::{self, Tone, Weight},
     widgets::{self, ButtonKind, Dot, IconButtonKind, Segment, SegmentTrack, StepState},
@@ -541,6 +541,7 @@ impl EchobindApp {
                     note,
                     (Icon::Edit, "Edit saved session"),
                     &format!("Connect to {}, {}", saved.name, status.to_lowercase()),
+                    true,
                 );
                 if action.clicked() {
                     edit = Some(saved.clone());
@@ -1898,7 +1899,7 @@ impl EchobindApp {
                 panel_header(
                     ui,
                     "Share your screen",
-                    "Viewers on your network can ask to watch. You approve each one.",
+                    "Viewers on your network can ask to watch. You approve each one or always allow it.",
                 );
                 section(ui, "Session", |ui| {
                     widgets::segmented(
@@ -1935,6 +1936,7 @@ impl EchobindApp {
                     );
                 });
                 section(ui, "Transport", |ui| self.transport_settings(ui));
+                self.trusted_viewers_section(ui);
                 self.show_notice(ui);
             }
             SharePhase::Listening => {
@@ -1977,6 +1979,7 @@ impl EchobindApp {
                 section(ui, "Stream settings", |ui| {
                     self.stream_settings_summary(ui, false)
                 });
+                self.trusted_viewers_section(ui);
                 self.show_notice(ui);
             }
             SharePhase::Live => {
@@ -2267,17 +2270,56 @@ impl EchobindApp {
                     .font(theme::mono(14.0, Weight::Medium))
                     .color(theme::TEXT),
             );
-            ui.label(widgets::text(
-                if listening {
-                    "Listening now"
-                } else {
-                    "Watching now"
-                },
-                13.0,
-                Weight::Regular,
-                theme::MUTED,
-            ));
+            let activity = if listening {
+                "Listening now"
+            } else {
+                "Watching now"
+            };
+            let status = if self.peer_trusted() {
+                format!("Always allowed · {activity}")
+            } else {
+                activity.to_owned()
+            };
+            ui.label(widgets::text(status, 13.0, Weight::Regular, theme::MUTED));
         });
+    }
+
+    /// One row per viewer this host always allows; its button forgets it.
+    fn trusted_viewers_section(&mut self, ui: &mut Ui) {
+        if self.trusted.viewers().is_empty() {
+            return;
+        }
+        let mut forget = None;
+        section(ui, "Trusted viewers", |ui| {
+            widgets::stack(ui, 8.0, |ui| {
+                let now = unix_now();
+                for viewer in self.trusted.viewers() {
+                    let address = viewer.address.to_string();
+                    let (_, action) = widgets::list_row(
+                        ui,
+                        (Icon::Check, Tone::Signal),
+                        &address,
+                        None,
+                        &format!("ID {}", viewer.id.short()),
+                        Some(&seen_label(viewer.last_seen, now)),
+                        (Icon::Close, "Forget this viewer"),
+                        &format!("Trusted viewer last seen at {address}"),
+                        false,
+                    );
+                    if action.clicked() {
+                        forget = Some(viewer.id);
+                    }
+                }
+            });
+            widgets::muted(
+                ui,
+                "These connect without asking. Forget one to approve it again next time.",
+                13.0,
+            );
+        });
+        if let Some(viewer) = forget {
+            self.forget_viewer(viewer);
+        }
     }
 
     fn share_session_bar(&mut self, ui: &mut Ui, listening: bool) {
@@ -2411,14 +2453,30 @@ impl EchobindApp {
                             });
                             theme::inset_frame().show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                widgets::key_value(
-                                    ui,
-                                    "Request from",
-                                    &peer.to_string(),
-                                    true,
-                                    14.0,
-                                );
+                                widgets::stack(ui, 4.0, |ui| {
+                                    widgets::key_value(
+                                        ui,
+                                        "Request from",
+                                        &peer.to_string(),
+                                        true,
+                                        14.0,
+                                    );
+                                    if let Some(viewer) = self.pending_viewer {
+                                        widgets::key_value(
+                                            ui,
+                                            "Device ID",
+                                            &viewer.short(),
+                                            true,
+                                            14.0,
+                                        );
+                                    }
+                                });
                             });
+                            // Viewers from earlier releases send no identity
+                            // to remember them by.
+                            if self.pending_viewer.is_some() {
+                                self.always_allow_switch(ui);
+                            }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 12.0;
                                 let half = (ui.available_width() - 12.0) / 2.0;
@@ -2448,6 +2506,29 @@ impl EchobindApp {
         } else if decline {
             self.reject_pending();
         }
+    }
+
+    fn always_allow_switch(&mut self, ui: &mut Ui) {
+        ui.horizontal_top(|ui| {
+            let text_width = ui.available_width() - 40.0 - 16.0;
+            ui.vertical(|ui| {
+                ui.set_width(text_width);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(widgets::text(
+                    "Always allow this device",
+                    14.0,
+                    Weight::Medium,
+                    theme::TEXT,
+                ));
+                widgets::muted(
+                    ui,
+                    "It connects without asking next time. Forget it anytime under Trusted viewers.",
+                    13.0,
+                );
+            });
+            ui.add_space(16.0 - ui.spacing().item_spacing.x);
+            widgets::switch(ui, &mut self.always_allow, "Always allow this device");
+        });
     }
 
     fn host_health(&self, ui: &mut Ui, columns: usize) {

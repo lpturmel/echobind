@@ -4,6 +4,7 @@ mod presence;
 mod saved;
 mod session;
 mod theme;
+mod trust;
 mod video;
 #[cfg(target_os = "macos")]
 mod video_renderer_macos;

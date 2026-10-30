@@ -1,4 +1,5 @@
-use std::{borrow::Cow, convert::TryInto, fmt};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use std::{borrow::Cow, convert::TryInto, fmt, str::FromStr};
 
 const MAGIC: &[u8; 4] = b"ECB2";
 const HEADER_LEN: usize = MAGIC.len() + 1;
@@ -8,6 +9,9 @@ const CLIPBOARD_HEADER_LEN: usize = 12;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
 const HELLO_FLAG_AUDIO_ONLY: u8 = 1;
+const HELLO_CAPABILITY_LEN: usize = 3;
+const HELLO_IDENTIFIED_LEN: usize = HELLO_CAPABILITY_LEN + VIEWER_ID_LEN;
+const VIEWER_ID_LEN: usize = 16;
 const PRESENCE_FLAG_VIDEO: u8 = 1;
 const PRESENCE_FLAG_BUSY: u8 = 1 << 1;
 const LEGACY_SERVER_STATS_LEN: usize = 9 * size_of::<f32>() + 7 * size_of::<u64>();
@@ -33,10 +37,13 @@ pub const MAX_VIDEO_FRAGMENTS: usize =
 
 #[derive(Debug, PartialEq)]
 pub enum Packet<'a> {
-    /// `audio_only` asks the host to skip video for this viewer.
+    /// `audio_only` asks the host to skip video for this viewer. A Hello
+    /// that carries `viewer_id` is longer than older hosts accept, so a
+    /// viewer sends it in addition to its plain Hellos.
     Hello {
         max_datagram_size: u16,
         audio_only: bool,
+        viewer_id: Option<ViewerId>,
     },
     Config(&'a [u8]),
     Ping(u64),
@@ -55,6 +62,62 @@ pub enum Packet<'a> {
     Probe,
     /// A sharing host's answer to a probe.
     ProbeReply(HostPresence),
+}
+
+/// A viewer's random, persistent identity, so a host can recognize it from
+/// any address. It travels unencrypted, like the stream itself: it lets a
+/// host skip the approval prompt, not authenticate a viewer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ViewerId(pub [u8; VIEWER_ID_LEN]);
+
+impl ViewerId {
+    /// The first eight hex digits, enough to tell viewers apart on screen.
+    pub fn short(&self) -> String {
+        self.to_string()[..8].to_owned()
+    }
+}
+
+impl fmt::Display for ViewerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl fmt::Debug for ViewerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ViewerId({self})")
+    }
+}
+
+impl FromStr for ViewerId {
+    type Err = PacketParseError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        // `from_str_radix` alone would also take a sign, as in "+f".
+        if text.len() != VIEWER_ID_LEN * 2 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(PacketParseError::Invalid);
+        }
+        let mut bytes = [0_u8; VIEWER_ID_LEN];
+        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+            let pair = std::str::from_utf8(pair).map_err(|_| PacketParseError::Invalid)?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| PacketParseError::Invalid)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for ViewerId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ViewerId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse()
+            .map_err(|_| de::Error::custom("a viewer ID is 32 hex digits"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,8 +224,15 @@ impl Packet<'_> {
             Packet::Hello {
                 max_datagram_size,
                 audio_only,
+                viewer_id,
             } => {
-                if *audio_only {
+                if let Some(viewer_id) = viewer_id {
+                    let [high, low] = max_datagram_size.to_be_bytes();
+                    Self::begin_packet(Self::HELLO, out);
+                    let flags = u8::from(*audio_only) * HELLO_FLAG_AUDIO_ONLY;
+                    out.extend_from_slice(&[high, low, flags]);
+                    out.extend_from_slice(&viewer_id.0);
+                } else if *audio_only {
                     let [high, low] = max_datagram_size.to_be_bytes();
                     Self::encode_packet(Self::HELLO, &[high, low, HELLO_FLAG_AUDIO_ONLY], out);
                 } else if usize::from(*max_datagram_size) <= STANDARD_DATAGRAM_SIZE {
@@ -328,17 +398,28 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
                 // Legacy peers did not advertise transport capabilities.
                 max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
                 audio_only: false,
+                viewer_id: None,
             }),
-            Packet::HELLO if payload.len() == 2 || payload.len() == 3 => Ok(Packet::Hello {
-                max_datagram_size: u16::from_be_bytes(
-                    payload[..2]
-                        .try_into()
-                        .map_err(|_| PacketParseError::Invalid)?,
-                ),
-                audio_only: payload
-                    .get(2)
-                    .is_some_and(|flags| flags & HELLO_FLAG_AUDIO_ONLY != 0),
-            }),
+            Packet::HELLO
+                if payload.len() == 2
+                    || payload.len() == HELLO_CAPABILITY_LEN
+                    || payload.len() == HELLO_IDENTIFIED_LEN =>
+            {
+                Ok(Packet::Hello {
+                    max_datagram_size: u16::from_be_bytes(
+                        payload[..2]
+                            .try_into()
+                            .map_err(|_| PacketParseError::Invalid)?,
+                    ),
+                    audio_only: payload
+                        .get(2)
+                        .is_some_and(|flags| flags & HELLO_FLAG_AUDIO_ONLY != 0),
+                    viewer_id: payload
+                        .get(HELLO_CAPABILITY_LEN..)
+                        .and_then(|id| id.try_into().ok())
+                        .map(ViewerId),
+                })
+            }
             Packet::CONFIG => Ok(Packet::Config(payload)),
             Packet::PING => parse_u64(payload).map(Packet::Ping),
             Packet::PONG => parse_u64(payload).map(Packet::Pong),
@@ -646,6 +727,7 @@ mod tests {
         let hello = Packet::Hello {
             max_datagram_size: JUMBO_DATAGRAM_SIZE as u16,
             audio_only: false,
+            viewer_id: None,
         };
         let encoded = round_trip(hello);
         assert_eq!(
@@ -653,6 +735,7 @@ mod tests {
             Ok(Packet::Hello {
                 max_datagram_size: JUMBO_DATAGRAM_SIZE as u16,
                 audio_only: false,
+                viewer_id: None,
             })
         );
 
@@ -663,6 +746,7 @@ mod tests {
             Ok(Packet::Hello {
                 max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
                 audio_only: false,
+                viewer_id: None,
             })
         );
     }
@@ -672,6 +756,7 @@ mod tests {
         let hello = Packet::Hello {
             max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
             audio_only: true,
+            viewer_id: None,
         };
         let encoded = round_trip(hello);
         assert_eq!(encoded.len(), HEADER_LEN + 3);
@@ -680,6 +765,7 @@ mod tests {
             Ok(Packet::Hello {
                 max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
                 audio_only: true,
+                viewer_id: None,
             })
         );
 
@@ -693,8 +779,77 @@ mod tests {
             Ok(Packet::Hello {
                 max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
                 audio_only: false,
+                viewer_id: None,
             })
         );
+    }
+
+    #[test]
+    fn hello_carries_the_viewer_identity() {
+        let viewer_id = ViewerId(*b"0123456789abcdef");
+        for audio_only in [false, true] {
+            let hello = Packet::Hello {
+                max_datagram_size: JUMBO_DATAGRAM_SIZE as u16,
+                audio_only,
+                viewer_id: Some(viewer_id),
+            };
+            let encoded = round_trip(hello);
+            // Hosts that predate identities reject this length, so they only
+            // ever see a viewer's plain Hellos.
+            assert_eq!(encoded.len(), HEADER_LEN + HELLO_IDENTIFIED_LEN);
+            assert_eq!(
+                Packet::try_from(encoded.as_slice()),
+                Ok(Packet::Hello {
+                    max_datagram_size: JUMBO_DATAGRAM_SIZE as u16,
+                    audio_only,
+                    viewer_id: Some(viewer_id),
+                })
+            );
+        }
+
+        let mut truncated = round_trip(Packet::Hello {
+            max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+            audio_only: false,
+            viewer_id: Some(viewer_id),
+        });
+        truncated.pop();
+        assert_eq!(
+            Packet::try_from(truncated.as_slice()),
+            Err(PacketParseError::Invalid)
+        );
+    }
+
+    #[test]
+    fn viewer_ids_round_trip_as_hex() {
+        let viewer_id = ViewerId([
+            0x00, 0x1f, 0xa0, 0xff, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ]);
+        let text = viewer_id.to_string();
+        assert_eq!(text, "001fa0ff0102030405060708090a0b0c");
+        assert_eq!(text.parse(), Ok(viewer_id));
+        assert_eq!(viewer_id.short(), "001fa0ff");
+        assert_eq!(
+            text.to_uppercase().parse::<ViewerId>(),
+            Ok(viewer_id),
+            "hex digits are case-insensitive"
+        );
+
+        let json = serde_json::to_string(&viewer_id).unwrap();
+        assert_eq!(json, format!("\"{text}\""));
+        assert_eq!(serde_json::from_str::<ViewerId>(&json).unwrap(), viewer_id);
+
+        for invalid in [
+            "",
+            "001fa0ff",
+            &format!("{text}00"),
+            &"zz".repeat(16),
+            &"+f".repeat(16),
+        ] {
+            assert!(invalid.parse::<ViewerId>().is_err(), "{invalid:?}");
+        }
+        assert!(serde_json::from_str::<ViewerId>("\"001f\"").is_err());
+        // A multi-byte character must not split a hex pair.
+        assert!(format!("é{}", &text[2..]).parse::<ViewerId>().is_err());
     }
 
     #[test]
