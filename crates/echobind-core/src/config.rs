@@ -6,6 +6,10 @@ pub struct SessionConfig {
     pub audio: Option<AudioConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<VideoConfig>,
+    /// The host accepts keyboard, mouse, and clipboard input from this
+    /// viewer. Hosts that predate remote control never set it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_control: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +72,7 @@ mod tests {
                 },
             }),
             video: None,
+            remote_control: false,
         };
 
         let json = serde_json::to_vec(&config).unwrap();
@@ -92,6 +97,7 @@ mod tests {
                 bitrate_bps: 6_000_000,
                 datagram_size: default_video_datagram_size(),
             }),
+            remote_control: true,
         };
 
         let json = serde_json::to_vec(&config).unwrap();
@@ -113,6 +119,7 @@ mod tests {
             }
         }"#;
         let config: SessionConfig = serde_json::from_slice(json).unwrap();
+        assert!(!config.remote_control);
         assert_eq!(
             config.video.unwrap().datagram_size,
             crate::protocol::STANDARD_DATAGRAM_SIZE as u16

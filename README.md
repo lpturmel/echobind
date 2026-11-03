@@ -54,6 +54,35 @@ network could copy it: it saves an approval click, it does not authenticate
 the viewer. Viewers from earlier releases and the CLI send no ID, so they are
 always asked about.
 
+### Remote control
+
+With **Let viewers control this computer** on (the default, under **Remote
+control** in the Share panel), a viewer drives the host's keyboard and mouse.
+The viewer's own cursor is the pointer: moving it over the video moves the
+host's pointer to the same spot, with no cursor drawn into the stream. Click
+the video to give the host the keyboard; click anywhere else in Echobind, or
+switch apps, to take it back. Fullscreen always forwards the keyboard. F11,
+F10, and Escape in fullscreen stay with Echobind.
+
+Keys travel as physical key positions, so the host's own keyboard layout
+decides what they type. Copy, cut, and paste use the host's shortcut, so
+Command-C on a Mac viewer copies on a Windows host: pasting sends the viewer's
+clipboard text (up to 256 KiB) to the host first, and copying brings the
+host's new clipboard text back to the viewer. The host's clipboard is only
+sent after a copy or cut the viewer made.
+
+Input uses a small acknowledged stream on the same UDP socket, so a lost
+datagram can't leave a key or button stuck down, and the host releases
+everything the viewer held when it disconnects. Each UI frame sends at most
+one pointer position. The host applies input on its own thread, apart from
+capture, encoding, and sending. A macOS host needs Echobind turned on under
+System Settings › Privacy & Security › Accessibility; it asks the first time
+it shares with control on. Windows can't inject input into elevated windows
+or the lock screen unless Echobind itself runs elevated.
+
+Press F10 while watching, or use the activity button in the toolbar, to hide
+or show the stream statistics, in fullscreen as well.
+
 If a viewer hears nothing from the host for 5 seconds, the stream pauses and
 the viewer reconnects on its own. The host releases a silent viewer after 10
 seconds but restores it from the same IP without a new approval for 30
@@ -61,7 +90,11 @@ seconds, so the viewer gives up after 30 seconds of reconnecting. Stopping on
 either side sends a goodbye: a viewer ends its session at once when the host
 stops sharing or quits, and a host frees its slot, or withdraws a pending
 request, as soon as the viewer disconnects. A viewer whose host port is closed
-(the host quit without a goodbye) ends its session as well.
+(the host quit without a goodbye) ends its session as well. Any other socket
+error, such as Windows reporting an operation still in progress after the
+machine idles, no longer ends a session: both sides retry, and a viewer whose
+socket keeps failing for a second opens a new one, which the host accepts as
+the same viewer.
 
 The desktop app streams the primary display at native, 720p, or 1080p
 resolution and up to 120 FPS. Windows uses DXGI Desktop Duplication, a

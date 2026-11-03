@@ -1,5 +1,6 @@
 use crate::{trust::TrustedIds, video::I420Frame};
 use echobind_core::{
+    input::{ClipboardAssembler, EventReceiver, EventSender, RemoteEvent},
     protocol::{
         CursorPosition, HostPresence, Packet, ServerStats, ViewerId, JUMBO_DATAGRAM_SIZE,
         MAX_DATAGRAM_SIZE, STANDARD_DATAGRAM_SIZE,
@@ -50,6 +51,9 @@ use windows::{
 #[path = "audio.rs"]
 mod audio;
 
+#[path = "remote_input.rs"]
+mod remote_input;
+
 #[cfg(target_os = "macos")]
 #[path = "decoder_macos.rs"]
 mod decoder_macos;
@@ -75,6 +79,10 @@ const RECONNECT_WINDOW: Duration = RECONNECT_GRACE;
 /// UDP can drop any one datagram, so a farewell is sent more than once.
 const GOODBYE_COPIES: usize = 3;
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// A viewer replaces a socket whose receives keep failing for this long.
+const SOCKET_REBUILD_AFTER: Duration = Duration::from_secs(1);
+/// How often a host logs a socket error that keeps repeating.
+const SOCKET_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
 const VIDEO_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(5);
 const VIDEO_REASSEMBLY_AGE: Duration = Duration::from_millis(100);
@@ -480,6 +488,12 @@ pub enum SessionEvent {
     VideoBackend(String),
     AudioBackend(String),
     CursorPosition(CursorPosition),
+    /// Text the host copied at the viewer's request, for the viewer's own
+    /// clipboard.
+    RemoteClipboard(String),
+    /// The host offers remote control, but this computer won't accept
+    /// injected input yet.
+    ControlUnavailable(String),
     Stats(ServerStats),
     ServerStats(ServerStats),
     ClientStats {
@@ -512,6 +526,84 @@ pub enum ViewerEnd {
     Failed(String),
 }
 
+/// Input the viewer forwards to a host that allows remote control.
+#[derive(Clone, Debug)]
+pub enum ControlInput {
+    Event(RemoteEvent),
+    /// Pastes this text on the host: it becomes the host's clipboard, then
+    /// the host performs its paste shortcut.
+    Paste(String),
+}
+
+/// A viewer's outgoing remote-control stream. The UI thread queues and sends
+/// input itself, so a key press never waits for the network thread's next
+/// wake-up; the network thread handles acknowledgements and resends.
+struct InputLink {
+    /// A clone of the network thread's socket, replaced when it rebuilds it.
+    socket: Mutex<UdpSocket>,
+    sender: Mutex<EventSender>,
+    /// The host accepted this viewer and allows remote control.
+    enabled: AtomicBool,
+}
+
+impl InputLink {
+    fn send(&self, inputs: impl IntoIterator<Item = ControlInput>) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let mut sender = self.sender.lock().unwrap();
+        for input in inputs {
+            match input {
+                ControlInput::Event(event) => {
+                    if !sender.push(&event) {
+                        warn!("The host stopped acknowledging input; released held keys");
+                    }
+                }
+                ControlInput::Paste(text) => {
+                    if sender.push_clipboard(&text) {
+                        sender.push(&RemoteEvent::Shortcut(
+                            echobind_core::input::Shortcut::Paste,
+                        ));
+                    } else {
+                        warn!("Not pasting {} bytes: too large to send", text.len());
+                    }
+                }
+            }
+        }
+        let mut packet = Vec::with_capacity(STANDARD_DATAGRAM_SIZE);
+        let socket = self.socket.lock().unwrap();
+        sender.send_new(&mut packet, |datagram| {
+            let _ = socket.send(datagram);
+        });
+    }
+
+    fn acknowledge(&self, sequence: u64, packet: &mut Vec<u8>) {
+        let mut sender = self.sender.lock().unwrap();
+        sender.acknowledge(sequence);
+        let socket = self.socket.lock().unwrap();
+        sender.send_new(packet, |datagram| {
+            let _ = socket.send(datagram);
+        });
+    }
+
+    fn resend_if_due(&self, packet: &mut Vec<u8>) {
+        let mut sender = self.sender.lock().unwrap();
+        if sender.retransmit_due(Instant::now()) {
+            let socket = self.socket.lock().unwrap();
+            sender.retransmit(packet, |datagram| {
+                let _ = socket.send(datagram);
+            });
+        }
+    }
+
+    /// Stops forwarding and drops queued input; a release-all goes out first
+    /// thing once the host accepts this viewer again.
+    fn suspend(&self) {
+        self.enabled.store(false, Ordering::Release);
+        self.sender.lock().unwrap().discard();
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum HostCommand {
     Accept(SocketAddr),
@@ -526,6 +618,7 @@ pub struct DesktopSession {
     latest_frame: LatestFrame,
     capture_slot: Option<CaptureSlot>,
     decode_queue: Option<DecodeQueue>,
+    input: Option<Arc<InputLink>>,
     volume: audio::AudioGain,
     handles: Vec<JoinHandle<()>>,
 }
@@ -536,6 +629,13 @@ struct HostPeers {
     active: Arc<Mutex<Option<SocketAddr>>>,
     video: Arc<Mutex<Option<SocketAddr>>>,
     epoch: Arc<AtomicU64>,
+}
+
+/// A host's remote-control plumbing: events for the injector thread, and
+/// text it copied for the viewer.
+struct HostControl {
+    injector: mpsc::Sender<remote_input::InjectorCommand>,
+    clipboard: mpsc::Receiver<String>,
 }
 
 /// The serialized session configs a host offers, chosen per viewer.
@@ -565,7 +665,8 @@ impl DesktopSession {
 
     /// Starts a host. With `video` off it shares system audio only and never
     /// captures the screen. Viewers whose IDs are in `trusted` are accepted
-    /// without asking.
+    /// without asking. With `remote_control` on, a video viewer's keyboard,
+    /// mouse, and clipboard drive this computer.
     #[allow(clippy::too_many_arguments)]
     pub fn start_host(
         bind_addr: SocketAddr,
@@ -576,7 +677,9 @@ impl DesktopSession {
         video: bool,
         volume: f32,
         trusted: TrustedIds,
+        remote_control: bool,
     ) -> Result<Self, String> {
+        let remote_control = remote_control && video && remote_input::SUPPORTED;
         let (audio_capture, audio_probe_error) = match audio::discover_system_audio_capture() {
             Ok(settings) => (Some(settings), None),
             Err(error) => (None, Some(error)),
@@ -641,6 +744,7 @@ impl DesktopSession {
                 bitrate_bps,
                 datagram_size: STANDARD_DATAGRAM_SIZE as u16,
             }),
+            remote_control,
         };
         let serialize = |config: &SessionConfig| {
             serde_json::to_vec(config)
@@ -653,6 +757,7 @@ impl DesktopSession {
         let audio_only_config = SessionConfig {
             audio: session_config.audio.clone(),
             video: None,
+            remote_control: false,
         };
         let configs = HostConfigs {
             standard: serialize(&session_config)?,
@@ -661,6 +766,20 @@ impl DesktopSession {
             video,
         };
 
+        let mut control_handles = Vec::new();
+        let control = remote_control.then(|| {
+            let (injector_tx, injector_rx) = mpsc::channel();
+            let (clipboard_tx, clipboard_rx) = mpsc::channel();
+            control_handles.push(remote_input::spawn_injector(
+                injector_rx,
+                clipboard_tx,
+                event_tx.clone(),
+            ));
+            HostControl {
+                injector: injector_tx,
+                clipboard: clipboard_rx,
+            }
+        });
         let network_handle = spawn_host_network(
             socket.clone(),
             running.clone(),
@@ -677,6 +796,7 @@ impl DesktopSession {
             active_datagram_size.clone(),
             pending_server_stats.clone(),
             trusted,
+            control,
         );
         if let Some(error) = audio_probe_error {
             let _ = event_tx.send(SessionEvent::AudioBackend(format!(
@@ -700,6 +820,9 @@ impl DesktopSession {
                     resolution,
                     active_datagram_size.clone(),
                     pending_server_stats.clone(),
+                    // A controlling viewer sees its own cursor in place of
+                    // the host's, which would trail it by the stream latency.
+                    !remote_control,
                 );
                 (None::<CaptureSlot>, vec![hardware_handle])
             }
@@ -771,7 +894,9 @@ impl DesktopSession {
         if let Some((width, height)) = dimensions {
             let _ = event_tx.send(SessionEvent::VideoConfigured { width, height });
         }
+        // The injector ends once the network thread drops its sender.
         let mut handles = vec![network_handle];
+        handles.append(&mut control_handles);
         handles.append(&mut media_handles);
         Ok(Self {
             running,
@@ -781,6 +906,7 @@ impl DesktopSession {
             latest_frame,
             capture_slot,
             decode_queue: None,
+            input: None,
             volume,
             handles,
         })
@@ -797,20 +923,7 @@ impl DesktopSession {
         volume: f32,
         viewer_id: ViewerId,
     ) -> Result<Self, String> {
-        let bind_addr = if server_addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let socket = UdpSocket::bind(bind_addr)
-            .map_err(|error| format!("Unable to create client socket: {error}"))?;
-        configure_socket_buffers(&socket, CLIENT_SOCKET_BUFFER_SIZE)?;
-        socket
-            .connect(server_addr)
-            .map_err(|error| format!("Unable to connect to {server_addr}: {error}"))?;
-        socket
-            .set_read_timeout(Some(SOCKET_TIMEOUT))
-            .map_err(|error| format!("Unable to configure client socket: {error}"))?;
+        let socket = open_client_socket(server_addr)?;
 
         let running = Arc::new(AtomicBool::new(true));
         let latest_frame = Arc::new(Mutex::new(None));
@@ -820,6 +933,15 @@ impl DesktopSession {
         let (event_tx, event_rx) = mpsc::channel();
         let (audio_command_tx, audio_command_rx) = mpsc::channel();
         let volume = audio::AudioGain::new(volume);
+        let input = Arc::new(InputLink {
+            socket: Mutex::new(
+                socket
+                    .try_clone()
+                    .map_err(|error| format!("Unable to share the client socket: {error}"))?,
+            ),
+            sender: Mutex::new(EventSender::new()),
+            enabled: AtomicBool::new(false),
+        });
         let network_handle = spawn_client_network(
             socket,
             server_addr,
@@ -834,6 +956,7 @@ impl DesktopSession {
             audio_only,
             volume.clone(),
             viewer_id,
+            input.clone(),
         );
         let decoder_handle = spawn_video_decoder(
             running.clone(),
@@ -853,6 +976,7 @@ impl DesktopSession {
             latest_frame,
             capture_slot: None,
             decode_queue: Some(decode_queue),
+            input: Some(input),
             volume,
             handles: vec![network_handle, decoder_handle],
         })
@@ -862,6 +986,20 @@ impl DesktopSession {
     /// on a viewer. Takes effect on the next audio buffer.
     pub fn set_volume(&self, gain: f32) {
         self.volume.set(gain);
+    }
+
+    /// Whether a viewer's input currently reaches the host.
+    pub fn remote_control(&self) -> bool {
+        self.input
+            .as_ref()
+            .is_some_and(|input| input.enabled.load(Ordering::Acquire))
+    }
+
+    /// Forwards a viewer's input to the host, if it allows remote control.
+    pub fn send_input(&self, inputs: Vec<ControlInput>) {
+        if let Some(input) = &self.input {
+            input.send(inputs);
+        }
     }
 
     pub fn accept(&self, peer: SocketAddr) {
@@ -907,6 +1045,25 @@ impl DesktopSession {
             let _ = handle.join();
         }
     }
+}
+
+/// A viewer's socket, connected to the host on a fresh ephemeral port.
+fn open_client_socket(server_addr: SocketAddr) -> Result<UdpSocket, String> {
+    let bind_addr = if server_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)
+        .map_err(|error| format!("Unable to create client socket: {error}"))?;
+    configure_socket_buffers(&socket, CLIENT_SOCKET_BUFFER_SIZE)?;
+    socket
+        .connect(server_addr)
+        .map_err(|error| format!("Unable to connect to {server_addr}: {error}"))?;
+    socket
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|error| format!("Unable to configure client socket: {error}"))?;
+    Ok(socket)
 }
 
 fn configure_socket_buffers(socket: &UdpSocket, requested_size: usize) -> Result<(), String> {
@@ -1046,10 +1203,18 @@ fn spawn_host_network(
     active_datagram_size: Arc<AtomicUsize>,
     pending_server_stats: PendingServerStats,
     trusted: TrustedIds,
+    control: Option<HostControl>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut packet_buffer = [0_u8; MAX_DATAGRAM_SIZE];
         let mut response = Vec::with_capacity(MAX_DATAGRAM_SIZE);
+        // The viewer's input, and clipboard text going back to it. Both
+        // streams start over whenever the viewer changes.
+        let mut input_events = EventReceiver::new();
+        let mut clipboard_events = EventSender::new();
+        let mut control_packet = Vec::with_capacity(STANDARD_DATAGRAM_SIZE);
+        let mut control_epoch = peers.epoch.load(Ordering::Acquire);
+        let mut last_socket_error_log = None::<Instant>;
         // (peer, advertised datagram size, receives video, identity)
         let mut pending_peer = None::<(SocketAddr, usize, bool, Option<ViewerId>)>;
         let mut last_seen = None::<Instant>;
@@ -1103,6 +1268,18 @@ fn spawn_host_network(
                         pending_peer = None;
                     }
                     HostCommand::Accept(_) | HostCommand::Reject(_) => {}
+                }
+            }
+
+            let epoch = peers.epoch.load(Ordering::Acquire);
+            if epoch != control_epoch {
+                control_epoch = epoch;
+                input_events.reset();
+                clipboard_events = EventSender::new();
+                if let Some(control) = &control {
+                    let _ = control
+                        .injector
+                        .send(remote_input::InjectorCommand::ReleaseAll);
                 }
             }
 
@@ -1326,6 +1503,35 @@ fn spawn_host_network(
                         {
                             reconnect_peer = None;
                         }
+                        Packet::Events {
+                            base,
+                            first,
+                            payload,
+                        } if current_peer == Some(peer) => {
+                            last_seen = Some(Instant::now());
+                            let mut batch = Vec::new();
+                            let applied = input_events.receive(base, first, payload, |event| {
+                                batch.push(event);
+                            });
+                            // Acknowledged even when ignored, so a viewer that
+                            // isn't allowed control stops resending.
+                            if let Some(control) = control.as_ref().filter(|_| active_video) {
+                                if !batch.is_empty() {
+                                    let _ = control
+                                        .injector
+                                        .send(remote_input::InjectorCommand::Events(batch));
+                                }
+                            }
+                            Packet::EventsAck(applied).encode(&mut response);
+                            let _ = socket.send_to(&response, peer);
+                        }
+                        Packet::EventsAck(sequence) if current_peer == Some(peer) => {
+                            last_seen = Some(Instant::now());
+                            clipboard_events.acknowledge(sequence);
+                            clipboard_events.send_new(&mut control_packet, |datagram| {
+                                let _ = socket.send_to(datagram, peer);
+                            });
+                        }
                         // Anyone may ask whether this host is sharing, so a
                         // saved session can show it online. The answer never
                         // touches the session or a pending request.
@@ -1348,7 +1554,9 @@ fn spawn_host_network(
                         | Packet::VideoKeyframeRequest
                         | Packet::ConnectionRejected(_)
                         | Packet::Goodbye
-                        | Packet::ProbeReply(_) => {}
+                        | Packet::ProbeReply(_)
+                        | Packet::Events { .. }
+                        | Packet::EventsAck(_) => {}
                     }
                 }
                 Err(error)
@@ -1360,11 +1568,36 @@ fn spawn_host_network(
                 Err(error) if peer_port_closed(&error) => {
                     debug!("A viewer's port closed: {error}");
                 }
+                // Sharing outlives a socket error: Windows can report an
+                // operation still in progress after the machine idles, and
+                // a network change surfaces as several kinds. A viewer that
+                // stays silent meanwhile is handled by the timeouts below.
                 Err(error) => {
-                    let _ = events.send(SessionEvent::Error(format!(
-                        "Server receive failed: {error}"
-                    )));
-                    break;
+                    if last_socket_error_log
+                        .is_none_or(|logged| logged.elapsed() >= SOCKET_ERROR_LOG_INTERVAL)
+                    {
+                        warn!("Server receive failed, retrying: {error}");
+                        last_socket_error_log = Some(Instant::now());
+                    }
+                    thread::sleep(SOCKET_TIMEOUT);
+                }
+            }
+
+            if let Some(control) = &control {
+                let viewer = *peers.active.lock().unwrap();
+                while let Ok(text) = control.clipboard.try_recv() {
+                    if viewer.is_some() && !clipboard_events.push_clipboard(&text) {
+                        warn!("Not sending {} bytes of copied text: too large", text.len());
+                    }
+                }
+                if let Some(viewer) = viewer {
+                    let send = |datagram: &[u8]| {
+                        let _ = socket.send_to(datagram, viewer);
+                    };
+                    clipboard_events.send_new(&mut control_packet, send);
+                    if clipboard_events.retransmit_due(Instant::now()) {
+                        clipboard_events.retransmit(&mut control_packet, send);
+                    }
                 }
             }
 
@@ -1745,8 +1978,16 @@ fn spawn_client_network(
     audio_only: bool,
     volume: audio::AudioGain,
     viewer_id: ViewerId,
+    input: Arc<InputLink>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let mut socket = socket;
+        // Since when every receive has failed, if they are failing.
+        let mut socket_failing_since = None::<Instant>;
+        // Clipboard text the host sends back after a forwarded copy.
+        let mut host_events = EventReceiver::new();
+        let mut host_clipboard = ClipboardAssembler::default();
+        let mut control_packet = Vec::with_capacity(STANDARD_DATAGRAM_SIZE);
         let mut reassembler = VideoReassembler::new(8, VIDEO_REASSEMBLY_AGE);
         // Set from the host's config; an audio-only viewer never enables it.
         let mut video_enabled = false;
@@ -1823,39 +2064,15 @@ fn spawn_client_network(
                 }
             }
             if !accepted && last_hello.elapsed() >= HELLO_INTERVAL {
-                // The identified Hello goes first, so a host that always
-                // allows this device accepts it before a plain Hello can show
-                // the host an approval prompt. Hosts that predate identities
-                // ignore it. The legacy empty hello lets standard-MTU ECB2
-                // hosts see the request, then the last one advertises jumbo
-                // capability and any audio-only request to upgraded hosts.
-                Packet::Hello {
-                    max_datagram_size: MAX_DATAGRAM_SIZE as u16,
-                    audio_only,
-                    viewer_id: Some(viewer_id),
-                }
-                .encode(&mut outgoing);
-                let _ = socket.send(&outgoing);
-                Packet::Hello {
-                    max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
-                    audio_only: false,
-                    viewer_id: None,
-                }
-                .encode(&mut outgoing);
-                let _ = socket.send(&outgoing);
-                Packet::Hello {
-                    max_datagram_size: MAX_DATAGRAM_SIZE as u16,
-                    audio_only,
-                    viewer_id: None,
-                }
-                .encode(&mut outgoing);
-                match socket.send(&outgoing) {
+                match send_hellos(&socket, &mut outgoing, audio_only, viewer_id) {
                     Ok(_) => {}
                     Err(error) if peer_port_closed(&error) => {
                         let _ = events.send(SessionEvent::ViewerEnded(host_gone(was_connected)));
                         return;
                     }
-                    Err(error) if was_connected && network_interrupted(&error) => {
+                    // A viewer that was watching keeps trying for the whole
+                    // reconnect window, whatever the socket reports.
+                    Err(error) if was_connected => {
                         debug!("Reconnect request not sent yet: {error}");
                     }
                     Err(error) => {
@@ -1880,6 +2097,7 @@ fn spawn_client_network(
 
             match socket.recv(&mut packet_buffer) {
                 Ok(size) => {
+                    socket_failing_since = None;
                     metrics
                         .received_bytes
                         .fetch_add(size as u64, Ordering::Relaxed);
@@ -1904,6 +2122,7 @@ fn spawn_client_network(
                                     return;
                                 }
                             };
+                            let remote_control = config.remote_control && !audio_only;
                             if !audio_configured {
                                 audio_configured = true;
                                 audio_config = config.audio.clone();
@@ -1923,6 +2142,7 @@ fn spawn_client_network(
                             // Older hosts ignore the audio-only request, so an
                             // audio-only viewer also drops any video offer.
                             let Some(video) = config.video.filter(|_| !audio_only) else {
+                                input.enabled.store(false, Ordering::Release);
                                 video_enabled = false;
                                 negotiated_datagram_size = STANDARD_DATAGRAM_SIZE;
                                 let _ = events.send(SessionEvent::TransportConfigured {
@@ -1963,6 +2183,7 @@ fn spawn_client_network(
                                 height: video.height,
                             });
                             video_enabled = true;
+                            input.enabled.store(remote_control, Ordering::Release);
                             if !accepted {
                                 accepted = true;
                                 was_connected = true;
@@ -2166,6 +2387,28 @@ fn spawn_client_network(
                         Packet::ServerStats(stats) if accepted => {
                             let _ = events.send(SessionEvent::ServerStats(stats));
                         }
+                        Packet::EventsAck(sequence) if accepted => {
+                            input.acknowledge(sequence, &mut control_packet);
+                        }
+                        Packet::Events {
+                            base,
+                            first,
+                            payload,
+                        } if accepted => {
+                            let mut copied = None;
+                            let applied = host_events.receive(base, first, payload, |event| {
+                                if let RemoteEvent::ClipboardText { first, last, chunk } = event {
+                                    copied =
+                                        host_clipboard.push(first, last, &chunk).or(copied.take());
+                                }
+                            });
+                            Packet::EventsAck(applied).encode(&mut outgoing);
+                            let _ = socket.send(&outgoing);
+                            if let Some(text) = copied {
+                                let _ = events.send(SessionEvent::RemoteClipboard(text));
+                                frame_notifier();
+                            }
+                        }
                         Packet::Goodbye => {
                             let _ = events.send(SessionEvent::ViewerEnded(ViewerEnd::HostStopped));
                             return;
@@ -2178,29 +2421,64 @@ fn spawn_client_network(
                         | Packet::ServerStats(_)
                         | Packet::VideoKeyframeRequest
                         | Packet::Probe
-                        | Packet::ProbeReply(_) => {}
+                        | Packet::ProbeReply(_)
+                        | Packet::Events { .. }
+                        | Packet::EventsAck(_) => {}
                     }
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut => {}
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    socket_failing_since = None;
+                }
                 // The host machine answered that nothing listens on its port:
                 // Echobind there stopped sharing or quit without a goodbye.
                 Err(error) if peer_port_closed(&error) => {
                     let _ = events.send(SessionEvent::ViewerEnded(host_gone(was_connected)));
                     return;
                 }
-                Err(error) if network_interrupted(&error) => {
-                    // Silence handling below turns a lasting outage into a
-                    // reconnect; until then, don't spin on the failing socket.
-                    debug!("Receive interrupted: {error}");
-                    thread::sleep(SOCKET_TIMEOUT);
-                }
+                // Any other error is ridden out rather than ending the
+                // session. Network loss and sleep surface as several kinds, and
+                // Windows can report an operation as still in progress (os
+                // error 997 or 10036) after the machine idles. Silence handling
+                // below turns a lasting outage into a reconnect; until then,
+                // don't spin on the failing socket.
                 Err(error) => {
-                    let _ = events.send(SessionEvent::ViewerEnded(ViewerEnd::Failed(format!(
-                        "Video receive failed: {error}"
-                    ))));
-                    return;
+                    let since = *socket_failing_since.get_or_insert_with(Instant::now);
+                    if network_interrupted(&error) {
+                        debug!("Receive interrupted: {error}");
+                    } else if since.elapsed() < SOCKET_TIMEOUT {
+                        warn!("Receive failed, retrying: {error}");
+                    }
+                    thread::sleep(SOCKET_TIMEOUT);
+                    // A socket that keeps failing is replaced. The host sees
+                    // the new port as the same viewer moving, as after a
+                    // restart, and carries on without asking for approval.
+                    if since.elapsed() >= SOCKET_REBUILD_AFTER {
+                        match open_client_socket(server_addr).and_then(|fresh| {
+                            let clone = fresh.try_clone().map_err(|error| {
+                                format!("Unable to share the client socket: {error}")
+                            })?;
+                            Ok((fresh, clone))
+                        }) {
+                            Ok((fresh, clone)) => {
+                                info!("Replaced the viewer socket after: {error}");
+                                socket = fresh;
+                                *input.socket.lock().unwrap() = clone;
+                                socket_failing_since = None;
+                                if was_connected {
+                                    let _ =
+                                        send_hellos(&socket, &mut outgoing, audio_only, viewer_id);
+                                    last_hello = Instant::now();
+                                }
+                            }
+                            Err(rebuild_error) => {
+                                debug!("Viewer socket not replaced yet: {rebuild_error}");
+                                socket_failing_since = Some(Instant::now());
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2217,6 +2495,8 @@ fn spawn_client_network(
                 ));
                 reconnecting_since = Some(Instant::now());
                 accepted = false;
+                input.suspend();
+                host_events.reset();
                 reassembler = VideoReassembler::new(8, VIDEO_REASSEMBLY_AGE);
                 reassembly_started.clear();
                 completed_frames.clear();
@@ -2225,6 +2505,10 @@ fn spawn_client_network(
                 waiting_for_keyframe = true;
                 last_hello = Instant::now() - HELLO_INTERVAL;
                 last_server_response = Instant::now();
+            }
+
+            if accepted {
+                input.resend_if_due(&mut control_packet);
             }
 
             let elapsed = stats_started.elapsed();
@@ -2261,8 +2545,45 @@ fn spawn_client_network(
 
         // The user stopped watching: free the host's slot, or withdraw a
         // request still waiting for approval, instead of letting it time out.
+        input.enabled.store(false, Ordering::Release);
         send_goodbye(&socket, &mut outgoing);
     })
+}
+
+/// Asks the host to accept this viewer, or to take it back after a reconnect.
+fn send_hellos(
+    socket: &UdpSocket,
+    outgoing: &mut Vec<u8>,
+    audio_only: bool,
+    viewer_id: ViewerId,
+) -> io::Result<usize> {
+    // The identified Hello goes first, so a host that always allows this
+    // device accepts it before a plain Hello can show the host an approval
+    // prompt. Hosts that predate identities ignore it. The legacy empty hello
+    // lets standard-MTU ECB2 hosts see the request, then the last one
+    // advertises jumbo capability and any audio-only request to upgraded
+    // hosts.
+    Packet::Hello {
+        max_datagram_size: MAX_DATAGRAM_SIZE as u16,
+        audio_only,
+        viewer_id: Some(viewer_id),
+    }
+    .encode(outgoing);
+    let _ = socket.send(outgoing);
+    Packet::Hello {
+        max_datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+        audio_only: false,
+        viewer_id: None,
+    }
+    .encode(outgoing);
+    let _ = socket.send(outgoing);
+    Packet::Hello {
+        max_datagram_size: MAX_DATAGRAM_SIZE as u16,
+        audio_only,
+        viewer_id: None,
+    }
+    .encode(outgoing);
+    socket.send(outgoing)
 }
 
 fn send_goodbye(socket: &UdpSocket, outgoing: &mut Vec<u8>) {
@@ -2453,6 +2774,16 @@ mod tests {
 
         /// A host that always allows the viewers in `trusted`.
         fn start_trusting(trusted: TrustedIds) -> Self {
+            Self::start_with(trusted, b"{}".to_vec(), None)
+        }
+
+        /// A host offering `config` to every viewer, and video when the
+        /// config has it.
+        fn start_with(trusted: TrustedIds, config: Vec<u8>, control: Option<HostControl>) -> Self {
+            let video = serde_json::from_slice::<SessionConfig>(&config)
+                .unwrap()
+                .video
+                .is_some();
             let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
             socket.set_read_timeout(Some(SOCKET_TIMEOUT)).unwrap();
             let peers = host_peers();
@@ -2460,7 +2791,6 @@ mod tests {
             let running = Arc::new(AtomicBool::new(true));
             let (commands, command_rx) = mpsc::channel();
             let (event_tx, events) = mpsc::channel();
-            let config = b"{}".to_vec();
             let handle = spawn_host_network(
                 socket.clone(),
                 running.clone(),
@@ -2472,12 +2802,13 @@ mod tests {
                     standard: config.clone(),
                     jumbo: config.clone(),
                     audio_only: config,
-                    video: false,
+                    video,
                 },
                 false,
                 Arc::new(AtomicUsize::new(STANDARD_DATAGRAM_SIZE)),
                 Arc::new(Mutex::new(None)),
                 trusted,
+                control,
             );
             Self {
                 socket,
@@ -2553,6 +2884,91 @@ mod tests {
             matches!(event, SessionEvent::Connected(_))
         });
         (viewer, peer)
+    }
+
+    #[test]
+    fn a_controlling_viewers_input_and_the_hosts_copies_cross_in_order() {
+        let (injector, injected) = mpsc::channel();
+        let (copied, clipboard) = mpsc::channel();
+        let config = serde_json::to_vec(&SessionConfig {
+            audio: None,
+            video: Some(VideoConfig {
+                codec: VideoCodec::H264,
+                width: 64,
+                height: 64,
+                frame_rate: SessionFrameRate {
+                    numerator: 60,
+                    denominator: 1,
+                },
+                bitrate_bps: 1_000_000,
+                datagram_size: STANDARD_DATAGRAM_SIZE as u16,
+            }),
+            remote_control: true,
+        })
+        .unwrap();
+        let host = LoopbackHost::start_with(
+            TrustedIds::default(),
+            config,
+            Some(HostControl {
+                injector,
+                clipboard,
+            }),
+        );
+        let viewer =
+            DesktopSession::start_client(host.address(), None, Arc::new(|| {}), false, 1.0, LAPTOP)
+                .unwrap();
+        let peer = host.next_request();
+        host.commands.send(HostCommand::Accept(peer)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !viewer.remote_control() {
+            assert!(Instant::now() < deadline, "the viewer never got control");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        viewer.send_input(vec![
+            ControlInput::Event(RemoteEvent::Key {
+                code: 4,
+                pressed: true,
+            }),
+            ControlInput::Event(RemoteEvent::Key {
+                code: 4,
+                pressed: false,
+            }),
+            ControlInput::Paste("from the viewer".to_owned()),
+        ]);
+        let mut received = Vec::new();
+        while received.len() < 4 {
+            match injected.recv_timeout(Duration::from_secs(5)) {
+                Ok(remote_input::InjectorCommand::Events(batch)) => received.extend(batch),
+                Ok(remote_input::InjectorCommand::ReleaseAll) => {}
+                Err(_) => panic!("the host never applied the viewer's input"),
+            }
+        }
+        assert_eq!(
+            received,
+            [
+                RemoteEvent::Key {
+                    code: 4,
+                    pressed: true
+                },
+                RemoteEvent::Key {
+                    code: 4,
+                    pressed: false
+                },
+                RemoteEvent::ClipboardText {
+                    first: true,
+                    last: true,
+                    chunk: b"from the viewer".to_vec(),
+                },
+                RemoteEvent::Shortcut(echobind_core::input::Shortcut::Paste),
+            ]
+        );
+
+        copied.send("from the host".to_owned()).unwrap();
+        let text = next_event(&viewer.events, |event| {
+            matches!(event, SessionEvent::RemoteClipboard(_))
+        });
+        assert!(matches!(text, SessionEvent::RemoteClipboard(text) if text == "from the host"));
     }
 
     #[test]

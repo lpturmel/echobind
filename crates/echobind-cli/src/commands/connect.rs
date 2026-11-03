@@ -180,7 +180,9 @@ fn run_once(
                         | Ok(Packet::ConnectionRejected(_))
                         | Ok(Packet::Goodbye)
                         | Ok(Packet::Probe)
-                        | Ok(Packet::ProbeReply(_)) => {}
+                        | Ok(Packet::ProbeReply(_))
+                        | Ok(Packet::Events { .. })
+                        | Ok(Packet::EventsAck(_)) => {}
                         Err(_) => warn!("Ignoring invalid UDP packet from server"),
                     },
                     Err(ref e)
@@ -326,7 +328,9 @@ fn request_config(socket: &UdpSocket) -> Result<AudioConfig> {
                 | Ok(Packet::VideoKeyframeRequest)
                 | Ok(Packet::Goodbye)
                 | Ok(Packet::Probe)
-                | Ok(Packet::ProbeReply(_)) => {}
+                | Ok(Packet::ProbeReply(_))
+                | Ok(Packet::Events { .. })
+                | Ok(Packet::EventsAck(_)) => {}
                 Err(_) => warn!("Ignoring invalid UDP packet while waiting for config"),
             },
             Err(ref err)
