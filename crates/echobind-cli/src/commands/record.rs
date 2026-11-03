@@ -114,6 +114,7 @@ pub fn exec(cmd: &RecordCmd) -> Result<()> {
             buffer_size: BufferSize { min, max },
         }),
         video: None,
+        remote_control: false,
     })?;
     let mut config_packet = Vec::new();
     Packet::Config(&config_data).encode(&mut config_packet);

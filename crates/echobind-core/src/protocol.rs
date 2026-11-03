@@ -6,6 +6,7 @@ const HEADER_LEN: usize = MAGIC.len() + 1;
 const AUDIO_HEADER_LEN: usize = 12;
 const VIDEO_HEADER_LEN: usize = 21;
 const CLIPBOARD_HEADER_LEN: usize = 12;
+const EVENTS_HEADER_LEN: usize = 16;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_RECOVERY: u8 = 1 << 1;
 const HELLO_FLAG_AUDIO_ONLY: u8 = 1;
@@ -27,6 +28,8 @@ pub const STANDARD_DATAGRAM_SIZE: usize = 1400;
 pub const JUMBO_DATAGRAM_SIZE: usize = 8192;
 pub const MAX_DATAGRAM_SIZE: usize = JUMBO_DATAGRAM_SIZE;
 pub const MAX_CLIPBOARD_CHUNK_PAYLOAD: usize = 1024;
+/// Remote-control events always fit a standard datagram.
+pub const MAX_EVENTS_PAYLOAD: usize = STANDARD_DATAGRAM_SIZE - HEADER_LEN - EVENTS_HEADER_LEN;
 pub const MAX_AUDIO_FRAME_PAYLOAD: usize = STANDARD_DATAGRAM_SIZE - HEADER_LEN - AUDIO_HEADER_LEN;
 pub const STANDARD_VIDEO_FRAGMENT_PAYLOAD: usize =
     STANDARD_DATAGRAM_SIZE - HEADER_LEN - VIDEO_HEADER_LEN;
@@ -62,6 +65,16 @@ pub enum Packet<'a> {
     Probe,
     /// A sharing host's answer to a probe.
     ProbeReply(HostPresence),
+    /// Remote-control events in sequence, starting at `first`; see
+    /// [`crate::input`]. `base` is the oldest event the sender still waits
+    /// to have acknowledged.
+    Events {
+        base: u64,
+        first: u64,
+        payload: &'a [u8],
+    },
+    /// Every event up to this sequence was applied.
+    EventsAck(u64),
 }
 
 /// A viewer's random, persistent identity, so a host can recognize it from
@@ -218,6 +231,8 @@ impl Packet<'_> {
     const GOODBYE: u8 = 12;
     const PROBE: u8 = 13;
     const PROBE_REPLY: u8 = 14;
+    const EVENTS: u8 = 15;
+    const EVENTS_ACK: u8 = 16;
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
@@ -347,6 +362,19 @@ impl Packet<'_> {
                     | (u8::from(presence.busy) * PRESENCE_FLAG_BUSY);
                 Self::encode_packet(Self::PROBE_REPLY, &[flags], out);
             }
+            Packet::Events {
+                base,
+                first,
+                payload,
+            } => {
+                Self::begin_packet(Self::EVENTS, out);
+                out.extend_from_slice(&base.to_be_bytes());
+                out.extend_from_slice(&first.to_be_bytes());
+                out.extend_from_slice(payload);
+            }
+            Packet::EventsAck(sequence) => {
+                Self::encode_packet(Self::EVENTS_ACK, &sequence.to_be_bytes(), out);
+            }
         }
     }
 
@@ -439,9 +467,31 @@ impl<'a> TryFrom<&'a [u8]> for Packet<'a> {
                 video: payload[0] & PRESENCE_FLAG_VIDEO != 0,
                 busy: payload[0] & PRESENCE_FLAG_BUSY != 0,
             })),
+            Packet::EVENTS => parse_events(payload),
+            Packet::EVENTS_ACK => parse_u64(payload).map(Packet::EventsAck),
             _ => Err(PacketParseError::Invalid),
         }
     }
+}
+
+fn parse_events(payload: &[u8]) -> Result<Packet<'_>, PacketParseError> {
+    if payload.len() <= EVENTS_HEADER_LEN {
+        return Err(PacketParseError::TooShort);
+    }
+    if payload.len() - EVENTS_HEADER_LEN > MAX_EVENTS_PAYLOAD {
+        return Err(PacketParseError::TooLarge);
+    }
+    let base = parse_u64(&payload[..8])?;
+    let first = parse_u64(&payload[8..EVENTS_HEADER_LEN])?;
+    // Sequences start at 1, and a packet never starts before its base.
+    if base == 0 || first < base {
+        return Err(PacketParseError::Invalid);
+    }
+    Ok(Packet::Events {
+        base,
+        first,
+        payload: &payload[EVENTS_HEADER_LEN..],
+    })
 }
 
 fn parse_server_stats(payload: &[u8]) -> Result<ServerStats, PacketParseError> {
@@ -987,6 +1037,45 @@ mod tests {
                 video: true,
                 busy: false,
             }))
+        );
+    }
+
+    #[test]
+    fn encodes_and_parses_remote_control_events() {
+        let packet = || Packet::Events {
+            base: 3,
+            first: 5,
+            payload: &[7, 7],
+        };
+        let encoded = round_trip(packet());
+        assert_eq!(Packet::try_from(encoded.as_slice()), Ok(packet()));
+
+        let encoded = round_trip(Packet::EventsAck(9));
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Ok(Packet::EventsAck(9))
+        );
+
+        for (base, first) in [(0, 0), (4, 3)] {
+            let encoded = round_trip(Packet::Events {
+                base,
+                first,
+                payload: &[7],
+            });
+            assert_eq!(
+                Packet::try_from(encoded.as_slice()),
+                Err(PacketParseError::Invalid)
+            );
+        }
+        let oversized = vec![7; MAX_EVENTS_PAYLOAD + 1];
+        let encoded = round_trip(Packet::Events {
+            base: 1,
+            first: 1,
+            payload: &oversized,
+        });
+        assert_eq!(
+            Packet::try_from(encoded.as_slice()),
+            Err(PacketParseError::TooLarge)
         );
     }
 

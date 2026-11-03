@@ -1061,7 +1061,11 @@ impl EchobindApp {
         };
 
         paint_stage(ui, stage);
-        self.paint_video(ui, stage.shrink(1.0));
+        let video = self.paint_video(ui, stage.shrink(1.0));
+        self.control.stage = Some(super::control::Stage {
+            video,
+            blockers: Vec::new(),
+        });
         mask_stage_corners(ui, stage);
         if self.reconnecting {
             ui.painter()
@@ -1091,6 +1095,7 @@ impl EchobindApp {
             );
             // Swallow clicks on the drawer so they never reach the video.
             ui.interact(drawer, Id::new("health-drawer"), Sense::click());
+            self.control.block(drawer);
             let mut close = false;
             scroll_child(ui, drawer.shrink(16.0), "health-drawer", |ui| {
                 close = self.viewer_health(ui, true);
@@ -1111,6 +1116,8 @@ impl EchobindApp {
 
     fn stream_toolbar(&mut self, ui: &mut Ui, bounds: Rect, compact: bool) {
         let icons_only = compact && self.drawer_open;
+        // Hiding stream health (F10) hides these numbers too.
+        let show_readout = !icons_only && self.health_open;
         let fps = if self.present_fps > 0.0 {
             self.present_fps
         } else {
@@ -1121,7 +1128,7 @@ impl EchobindApp {
             (format!("{:.1}", self.stream_mbps), "Mbps"),
             (format!("{:.1}", self.rtt_ms), "ms RTT"),
         ];
-        let readout_galleys: Vec<_> = if icons_only {
+        let readout_galleys: Vec<_> = if !show_readout {
             Vec::new()
         } else {
             readout
@@ -1183,6 +1190,7 @@ impl EchobindApp {
             StrokeKind::Inside,
         );
         ui.interact(rect, Id::new("stream-toolbar"), Sense::click());
+        self.control.block(rect);
 
         let inner = rect.shrink(8.0);
         ui.scope_builder(
@@ -1250,7 +1258,7 @@ impl EchobindApp {
                 } else {
                     IconButtonKind::Ghost
                 };
-                if widgets::icon_button(ui, Icon::Activity, "Stream health", kind).clicked() {
+                if widgets::icon_button(ui, Icon::Activity, "Stream health (F10)", kind).clicked() {
                     if compact {
                         self.drawer_open = !self.drawer_open;
                     } else {
@@ -1579,7 +1587,7 @@ impl EchobindApp {
     }
 
     pub(super) fn show_fullscreen_stats(&self, context: &egui::Context) {
-        if self.mode != Mode::Connect {
+        if self.mode != Mode::Connect || !self.health_open {
             return;
         }
 
@@ -1654,6 +1662,7 @@ impl EchobindApp {
                                 }
                             });
                             widgets::key_hint(ui, &["F11", "Esc"], "or", "to exit fullscreen");
+                            widgets::key_hint(ui, &["F10"], "", "hides these stats");
                         });
                     });
             });
@@ -1920,6 +1929,9 @@ impl EchobindApp {
                         );
                     }
                 });
+                if !self.share_audio_only {
+                    section(ui, "Remote control", |ui| self.remote_control_setting(ui));
+                }
                 section(ui, "Network", |ui| {
                     self.address_fields(ui, "Bind IP", "0.0.0.0");
                     widgets::muted(ui, "0.0.0.0 listens on every network interface.", 13.0);
@@ -2148,6 +2160,42 @@ impl EchobindApp {
                 );
             }
         });
+    }
+
+    fn remote_control_setting(&mut self, ui: &mut Ui) {
+        theme::inset_frame()
+            .inner_margin(12)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_top(|ui| {
+                    let text_width = ui.available_width() - 40.0 - 16.0;
+                    ui.vertical(|ui| {
+                        ui.set_width(text_width);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(widgets::text(
+                            "Let viewers control this computer",
+                            14.0,
+                            Weight::Medium,
+                            theme::TEXT,
+                        ));
+                        widgets::muted(
+                            ui,
+                            if cfg!(target_os = "macos") {
+                                "Keyboard, mouse, copy and paste. macOS asks you to allow Echobind under Accessibility."
+                            } else {
+                                "Keyboard, mouse, copy and paste, from any viewer you accept."
+                            },
+                            13.0,
+                        );
+                    });
+                    ui.add_space(16.0 - ui.spacing().item_spacing.x);
+                    widgets::switch(
+                        ui,
+                        &mut self.share_remote_control,
+                        "Let viewers control this computer",
+                    );
+                });
+            });
     }
 
     fn transport_settings(&mut self, ui: &mut Ui) {

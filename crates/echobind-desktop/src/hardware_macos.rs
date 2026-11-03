@@ -63,6 +63,7 @@ pub(super) fn spawn_hardware_pipeline(
     resolution: VideoResolution,
     active_datagram_size: Arc<AtomicUsize>,
     pending_server_stats: PendingServerStats,
+    shows_cursor: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let result = run_hardware_pipeline(
@@ -76,6 +77,7 @@ pub(super) fn spawn_hardware_pipeline(
             resolution,
             active_datagram_size.clone(),
             pending_server_stats.clone(),
+            shows_cursor,
         );
         if let Err(error) = result {
             if !running.load(Ordering::Relaxed) {
@@ -117,6 +119,7 @@ fn run_hardware_pipeline(
     resolution: VideoResolution,
     active_datagram_size: Arc<AtomicUsize>,
     pending_server_stats: PendingServerStats,
+    shows_cursor: bool,
 ) -> Result<(), String> {
     let content = SCShareableContent::get().map_err(|error| {
         format!(
@@ -142,7 +145,7 @@ fn run_hardware_pipeline(
         .with_height(height)
         .with_scales_to_fit(true)
         .with_pixel_format(PixelFormat::YCbCr_420v)
-        .with_shows_cursor(true)
+        .with_shows_cursor(shows_cursor)
         // Keep enough IOSurfaces available for VideoToolbox to overlap capture
         // and encode. The application slot below still retains only the newest
         // not-yet-submitted sample, so this does not create a latency backlog.

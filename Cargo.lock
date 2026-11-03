@@ -894,6 +894,7 @@ name = "echobind-desktop"
 version = "0.3.0"
 dependencies = [
  "apple-cf",
+ "clipboard-win",
  "cpal",
  "echobind-core",
  "eframe",
@@ -901,6 +902,8 @@ dependencies = [
  "libloading 0.8.9",
  "moq-nvenc",
  "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
  "openh264",
  "opus",

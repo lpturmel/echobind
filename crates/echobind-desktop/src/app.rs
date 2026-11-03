@@ -1,3 +1,4 @@
+mod control;
 mod views;
 
 use crate::{
@@ -122,6 +123,9 @@ pub struct EchobindApp {
     drawer_open: bool,
     watch_audio_only: bool,
     share_audio_only: bool,
+    /// Whether viewers may drive this computer's keyboard and mouse.
+    share_remote_control: bool,
+    control: control::RemoteControl,
     watch_volume: u32,
     watch_muted: bool,
     share_volume: u32,
@@ -290,6 +294,8 @@ impl EchobindApp {
             drawer_open: false,
             watch_audio_only: false,
             share_audio_only: false,
+            share_remote_control: true,
+            control: control::RemoteControl::default(),
             watch_volume: 100,
             watch_muted: false,
             share_volume: 100,
@@ -573,6 +579,16 @@ impl EchobindApp {
                 SessionEvent::CursorPosition(position) => {
                     self.remote_cursor = Some(position);
                 }
+                SessionEvent::RemoteClipboard(text) => {
+                    context.copy_text(text);
+                }
+                SessionEvent::ControlUnavailable(reason) => {
+                    self.notice = Some(Notice::new(
+                        Tone::Caution,
+                        "Viewers can't control this computer yet",
+                        reason,
+                    ));
+                }
                 SessionEvent::Stats(stats) => {
                     self.stream_fps = stats.fps;
                     self.received_fps = stats.fps;
@@ -723,6 +739,7 @@ impl EchobindApp {
             !self.share_audio_only,
             self.volume_gain(),
             self.trusted.ids(),
+            self.share_remote_control,
         ) {
             Ok(session) => {
                 self.session = Some(session);
@@ -908,6 +925,7 @@ impl EchobindApp {
         self.peer_viewer = None;
         self.peer_video = None;
         self.remote_cursor = None;
+        self.control = control::RemoteControl::default();
         self.clear_texture();
         self.stream_fps = 0.0;
         self.received_fps = 0.0;
@@ -1130,7 +1148,12 @@ impl EchobindApp {
         video_rect
     }
 
+    /// Draws the host's pointer for a viewer that only watches. A viewer in
+    /// control uses its own native cursor, which the host's pointer follows.
     fn paint_remote_cursor(&self, ui: &egui::Ui, video_rect: egui::Rect) {
+        if self.controlling() {
+            return;
+        }
         let Some(cursor) = self.remote_cursor.filter(|cursor| cursor.visible) else {
             return;
         };
@@ -1181,7 +1204,11 @@ impl eframe::App for EchobindApp {
         if toggle_fullscreen || exit_fullscreen {
             self.set_fullscreen(&context, !self.fullscreen);
         }
+        if self.mode == Mode::Connect && context.input(|input| input.key_pressed(egui::Key::F10)) {
+            self.health_open = !self.health_open;
+        }
         self.process_session_updates(&context);
+        self.forward_input(&context);
         // Saved hosts are probed only while their list is on screen.
         self.presence.watch(
             self.saved.sessions().iter().map(|saved| saved.address),
@@ -1193,7 +1220,11 @@ impl eframe::App for EchobindApp {
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(ui, |ui| {
                     let area = ui.max_rect();
-                    self.paint_video(ui, area);
+                    let video = self.paint_video(ui, area);
+                    self.control.stage = Some(control::Stage {
+                        video,
+                        blockers: Vec::new(),
+                    });
                     if self.reconnecting {
                         ui.painter().rect_filled(area, 0, views::DIM_FILL);
                         self.reconnect_message(ui, area);
