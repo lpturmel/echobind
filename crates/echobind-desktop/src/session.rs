@@ -1,4 +1,8 @@
-use crate::{trust::TrustedIds, video::I420Frame};
+use crate::{
+    trust::TrustedIds,
+    video::I420Frame,
+    video_renderer::{YuvFrame, YuvPlane},
+};
 use echobind_core::{
     protocol::{
         CursorPosition, HostPresence, Packet, ServerStats, ViewerId, JUMBO_DATAGRAM_SIZE,
@@ -53,6 +57,10 @@ mod audio;
 #[cfg(target_os = "macos")]
 #[path = "decoder_macos.rs"]
 mod decoder_macos;
+
+#[cfg(target_os = "windows")]
+#[path = "decoder_windows.rs"]
+mod decoder_windows;
 
 #[cfg(target_os = "macos")]
 #[path = "hardware_macos.rs"]
@@ -329,13 +337,13 @@ pub(super) struct DisplayFrame {
     pub width: usize,
     pub height: usize,
     pub data: DisplayFrameData,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub published_at: Instant,
 }
 
 #[derive(Clone, Debug)]
 pub(super) enum DisplayFrameData {
-    Rgba(Vec<u8>),
+    /// Decoded planes the GPU converts to RGB while drawing.
+    Yuv(YuvFrame),
     #[cfg(target_os = "macos")]
     Nv12(apple_cf::cv::CVPixelBuffer),
 }
@@ -2313,6 +2321,28 @@ fn spawn_video_decoder(
             }
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            match decoder_windows::run_decoder(
+                running.clone(),
+                decode_queue.clone(),
+                latest_frame.clone(),
+                metrics.clone(),
+                needs_keyframe.clone(),
+                events.clone(),
+                frame_notifier.clone(),
+            ) {
+                Ok(()) => return,
+                Err(error) => {
+                    warn!("Media Foundation decoder unavailable: {error}");
+                    let _ = events.send(SessionEvent::VideoBackend(format!(
+                        "OpenH264 fallback (Media Foundation unavailable: {error})"
+                    )));
+                    needs_keyframe.store(true, Ordering::Release);
+                }
+            }
+        }
+
         if let Err(error) = run_software_video_decoder(
             running,
             decode_queue,
@@ -2371,13 +2401,20 @@ fn run_software_video_decoder(
         let decode_started = Instant::now();
         match decoder.decode(&frame.payload) {
             Ok(Some(decoded)) => {
+                // Hand the planes to the GPU as decoded; converting to RGBA
+                // here cost as much as decoding at 1440p.
                 let (width, height) = decoded.dimensions();
-                let mut rgba = vec![0; width * height * 4];
-                decoded.write_rgba8(&mut rgba);
+                let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+                let (y_stride, u_stride, v_stride) = decoded.strides();
+                let yuv = YuvFrame::I420 {
+                    y: YuvPlane::copy_rows(decoded.y(), y_stride, width, height),
+                    u: YuvPlane::copy_rows(decoded.u(), u_stride, chroma_width, chroma_height),
+                    v: YuvPlane::copy_rows(decoded.v(), v_stride, chroma_width, chroma_height),
+                };
                 *latest_frame.lock().unwrap() = Some(DisplayFrame {
                     width,
                     height,
-                    data: DisplayFrameData::Rgba(rgba),
+                    data: DisplayFrameData::Yuv(yuv),
                     published_at: Instant::now(),
                 });
                 frame_notifier();
@@ -2413,6 +2450,11 @@ const OPENH264_MAX_LEVEL_IDC: u8 = 52;
 /// picture. The level only states the decoder throughput a stream needs;
 /// OpenH264 still checks the picture size itself against level 5.2.
 fn cap_sps_level_for_openh264(payload: &mut [u8]) {
+    cap_sps_level(payload, OPENH264_MAX_LEVEL_IDC);
+}
+
+/// Lowers any SPS level above `max_level_idc` to it.
+pub(super) fn cap_sps_level(payload: &mut [u8], max_level_idc: u8) {
     let mut position = 0;
     while let Some(offset) = payload
         .get(position..)
@@ -2423,8 +2465,8 @@ fn cap_sps_level_for_openh264(payload: &mut [u8]) {
         // nonzero profile_idc means no emulation-prevention byte comes first.
         if payload.get(header).is_some_and(|nal| nal & 0x1f == 7) {
             if let Some(level) = payload.get_mut(header + 3) {
-                if *level > OPENH264_MAX_LEVEL_IDC {
-                    *level = OPENH264_MAX_LEVEL_IDC;
+                if *level > max_level_idc {
+                    *level = max_level_idc;
                 }
             }
         }
