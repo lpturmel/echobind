@@ -72,13 +72,6 @@ struct SavedEditor {
     error: Option<String>,
 }
 
-struct GpuVideoTexture {
-    texture: eframe::wgpu::Texture,
-    id: egui::TextureId,
-    width: usize,
-    height: usize,
-}
-
 struct SessionShutdown {
     complete: mpsc::Receiver<()>,
     handle: Option<thread::JoinHandle<()>>,
@@ -138,7 +131,8 @@ pub struct EchobindApp {
     pending_video: bool,
     session: Option<DesktopSession>,
     shutdown: Option<SessionShutdown>,
-    texture: Option<GpuVideoTexture>,
+    /// The YUV renderer holds a frame to draw.
+    yuv_ready: bool,
     nv12_ready: bool,
     remote_cursor: Option<CursorPosition>,
     render_state: eframe::egui_wgpu::RenderState,
@@ -231,6 +225,17 @@ impl EchobindApp {
             .expect("Echobind requires the wgpu renderer");
         let presented_frames = Arc::new(AtomicU64::new(0));
         let present_latency_us = Arc::new(AtomicU64::new(0));
+        let yuv_renderer = crate::video_renderer::YuvVideoRenderer::new(
+            &render_state.device,
+            render_state.target_format,
+            presented_frames.clone(),
+            present_latency_us.clone(),
+        );
+        render_state
+            .renderer
+            .write()
+            .callback_resources
+            .insert(yuv_renderer);
         #[cfg(target_os = "macos")]
         {
             let video_renderer = crate::video_renderer_macos::MacVideoRenderer::new(
@@ -293,7 +298,7 @@ impl EchobindApp {
             pending_video: true,
             session: None,
             shutdown: None,
-            texture: None,
+            yuv_ready: false,
             nv12_ready: false,
             remote_cursor: None,
             render_state,
@@ -357,7 +362,7 @@ impl EchobindApp {
     }
 
     fn has_video(&self) -> bool {
-        self.texture.is_some() || self.nv12_ready
+        self.yuv_ready || self.nv12_ready
     }
 
     fn watch_phase(&self) -> WatchPhase {
@@ -995,9 +1000,32 @@ impl EchobindApp {
 
     fn upload_frame(&mut self, frame: crate::session::DisplayFrame) {
         match frame.data {
-            DisplayFrameData::Rgba(rgba) => {
+            DisplayFrameData::Yuv(yuv) => {
+                let upload_result = {
+                    let mut renderer = self.render_state.renderer.write();
+                    renderer
+                        .callback_resources
+                        .get_mut::<crate::video_renderer::YuvVideoRenderer>()
+                        .ok_or_else(|| "YUV video renderer is unavailable".to_owned())
+                        .and_then(|video| {
+                            video.set_frame(
+                                &self.render_state.device,
+                                &self.render_state.queue,
+                                frame.width,
+                                frame.height,
+                                &yuv,
+                                frame.published_at,
+                            )
+                        })
+                };
                 self.nv12_ready = false;
-                self.upload_rgba(frame.width, frame.height, &rgba);
+                match upload_result {
+                    Ok(()) => self.yuv_ready = true,
+                    Err(error) => {
+                        self.yuv_ready = false;
+                        self.notice = Some(Notice::new(Tone::Danger, "Video upload failed", error));
+                    }
+                }
             }
             #[cfg(target_os = "macos")]
             DisplayFrameData::Nv12(pixel_buffer) => {
@@ -1015,13 +1043,9 @@ impl EchobindApp {
                             )
                         })
                 };
+                self.yuv_ready = false;
                 match import_result {
-                    Ok(()) => {
-                        self.nv12_ready = true;
-                        if let Some(texture) = self.texture.take() {
-                            self.render_state.renderer.write().free_texture(&texture.id);
-                        }
-                    }
+                    Ok(()) => self.nv12_ready = true,
                     Err(error) => {
                         self.nv12_ready = false;
                         self.notice = Some(Notice::new(
@@ -1035,71 +1059,17 @@ impl EchobindApp {
         }
     }
 
-    fn upload_rgba(&mut self, width: usize, height: usize, rgba: &[u8]) {
-        let needs_texture = self
-            .texture
-            .as_ref()
-            .is_none_or(|texture| texture.width != width || texture.height != height);
-        if needs_texture {
-            self.clear_texture();
-            let texture =
-                self.render_state
-                    .device
-                    .create_texture(&eframe::wgpu::TextureDescriptor {
-                        label: Some("echobind_remote_video"),
-                        size: eframe::wgpu::Extent3d {
-                            width: width as u32,
-                            height: height as u32,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: eframe::wgpu::TextureDimension::D2,
-                        format: eframe::wgpu::TextureFormat::Rgba8Unorm,
-                        usage: eframe::wgpu::TextureUsages::COPY_DST
-                            | eframe::wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    });
-            let view = texture.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-            let id = self.render_state.renderer.write().register_native_texture(
-                &self.render_state.device,
-                &view,
-                eframe::wgpu::FilterMode::Linear,
-            );
-            self.texture = Some(GpuVideoTexture {
-                texture,
-                id,
-                width,
-                height,
-            });
-        }
-
-        let texture = self.texture.as_ref().expect("video texture was created");
-        self.render_state.queue.write_texture(
-            eframe::wgpu::TexelCopyTextureInfo {
-                texture: &texture.texture,
-                mip_level: 0,
-                origin: eframe::wgpu::Origin3d::ZERO,
-                aspect: eframe::wgpu::TextureAspect::All,
-            },
-            rgba,
-            eframe::wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some((width * 4) as u32),
-                rows_per_image: Some(height as u32),
-            },
-            eframe::wgpu::Extent3d {
-                width: width as u32,
-                height: height as u32,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
     fn clear_texture(&mut self) {
+        self.yuv_ready = false;
         self.nv12_ready = false;
-        if let Some(texture) = self.texture.take() {
-            self.render_state.renderer.write().free_texture(&texture.id);
+        if let Some(renderer) = self
+            .render_state
+            .renderer
+            .write()
+            .callback_resources
+            .get_mut::<crate::video_renderer::YuvVideoRenderer>()
+        {
+            renderer.clear();
         }
         #[cfg(target_os = "macos")]
         if let Some(renderer) = self
@@ -1151,8 +1121,10 @@ impl EchobindApp {
             ui.painter().add(egui::Shape::Callback(
                 crate::video_renderer_macos::paint_callback(video_rect),
             ));
-        } else if let Some(texture) = &self.texture {
-            egui::Image::from_texture((texture.id, source)).paint_at(ui, video_rect);
+        } else if self.yuv_ready {
+            ui.painter().add(egui::Shape::Callback(
+                crate::video_renderer::paint_callback(video_rect),
+            ));
         }
         self.paint_remote_cursor(ui, video_rect);
         video_rect
