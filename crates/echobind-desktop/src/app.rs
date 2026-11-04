@@ -1137,19 +1137,19 @@ impl EchobindApp {
         let source = egui::vec2(self.stream_width as f32, self.stream_height as f32);
         let video_rect = self.frame_video(ui.ctx(), area, source);
         let view = video_rect.intersect(area);
-        // Only the visible part is drawn: the GPU path cannot draw off screen.
-        let uv = framing::visible_uv(video_rect, view);
+        // The clip keeps a filled picture's overflow off the rest of the UI.
+        let painter = ui.painter_at(view);
         if self.nv12_ready {
             #[cfg(target_os = "macos")]
-            ui.painter().add(egui::Shape::Callback(
-                crate::video_renderer_macos::paint_callback(view, uv),
+            painter.add(egui::Shape::Callback(
+                crate::video_renderer_macos::paint_callback(view, video_rect),
             ));
         } else if self.yuv_ready {
-            ui.painter().add(egui::Shape::Callback(
-                crate::video_renderer::paint_callback(view, uv),
+            painter.add(egui::Shape::Callback(
+                crate::video_renderer::paint_callback(view, video_rect),
             ));
         }
-        self.paint_remote_cursor(&ui.painter_at(view), video_rect);
+        self.paint_remote_cursor(&painter, video_rect);
         control::Stage::new(video_rect, view)
     }
 

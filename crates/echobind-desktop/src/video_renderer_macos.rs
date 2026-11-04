@@ -26,9 +26,6 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
-// The part of the frame to show: uv origin in xy, uv size in zw.
-@group(0) @binding(3) var<uniform> crop: vec4<f32>;
-
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     var positions = array<vec2<f32>, 3>(
@@ -43,7 +40,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     );
     var output: VertexOutput;
     output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-    output.uv = crop.xy + uvs[vertex_index] * crop.zw;
+    output.uv = uvs[vertex_index];
     return output;
 }
 
@@ -105,7 +102,6 @@ pub(super) struct MacVideoRenderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    crop: wgpu::Buffer,
     frame: Option<ImportedNv12Frame>,
     presented_frames: Arc<AtomicU64>,
     present_latency_us: Arc<AtomicU64>,
@@ -175,7 +171,6 @@ impl MacVideoRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                crate::video_renderer::crop_layout_entry(3),
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -184,7 +179,6 @@ impl MacVideoRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let crop = crate::video_renderer::create_crop_buffer(device, "echobind_nv12_crop");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("echobind_nv12_shader"),
             source: wgpu::ShaderSource::Wgsl(NV12_SHADER.into()),
@@ -225,7 +219,6 @@ impl MacVideoRenderer {
             pipeline,
             bind_group_layout,
             sampler,
-            crop,
             frame: None,
             presented_frames,
             present_latency_us,
@@ -297,10 +290,6 @@ impl MacVideoRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.crop.as_entire_binding(),
                 },
             ],
         });
@@ -408,34 +397,16 @@ fn import_metal_texture(
     )
 }
 
-/// Paints the part of the frame that `uv` selects.
+/// Paints the frame across `video`, which may reach past the paint's rect.
 #[derive(Clone)]
 pub(super) struct MacVideoPaintCallback {
-    uv: egui::Rect,
+    video: egui::Rect,
 }
 
 impl CallbackTrait for MacVideoPaintCallback {
-    fn prepare(
-        &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(renderer) = callback_resources.get::<MacVideoRenderer>() {
-            queue.write_buffer(
-                &renderer.crop,
-                0,
-                &crate::video_renderer::crop_bytes(self.uv),
-            );
-        }
-        Vec::new()
-    }
-
     fn paint(
         &self,
-        _info: egui::PaintCallbackInfo,
+        info: egui::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &CallbackResources,
     ) {
@@ -445,6 +416,7 @@ impl CallbackTrait for MacVideoPaintCallback {
         let Some(frame) = &renderer.frame else {
             return;
         };
+        crate::video_renderer::set_video_viewport(render_pass, self.video, info.pixels_per_point);
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &frame.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
@@ -462,7 +434,8 @@ impl CallbackTrait for MacVideoPaintCallback {
     }
 }
 
-/// Paints the frame's `uv` region (0 to 1 on each axis) into `rect`.
-pub(super) fn paint_callback(rect: egui::Rect, uv: egui::Rect) -> egui::PaintCallback {
-    egui_wgpu::Callback::new_paint_callback(rect, MacVideoPaintCallback { uv })
+/// Paints the visible `rect` of a frame laid out across `video`. Paint it
+/// with a painter clipped to `rect`.
+pub(super) fn paint_callback(rect: egui::Rect, video: egui::Rect) -> egui::PaintCallback {
+    egui_wgpu::Callback::new_paint_callback(rect, MacVideoPaintCallback { video })
 }

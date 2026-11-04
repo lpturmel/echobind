@@ -132,15 +132,6 @@ pub(super) fn place(source: Vec2, area: Rect, fill: bool, pan: Vec2) -> Rect {
     Rect::from_min_size(area.min + spare * anchor, size)
 }
 
-/// The part of the frame (0 to 1 on each axis) that shows in `view`.
-pub(super) fn visible_uv(video: Rect, view: Rect) -> Rect {
-    let size = video.size().max(Vec2::splat(1.0));
-    Rect::from_min_max(
-        ((view.min - video.min) / size).to_pos2(),
-        ((view.max - video.min) / size).to_pos2(),
-    )
-}
-
 fn edge_band(start: f32, end: f32) -> f32 {
     ((end - start) * EDGE_SHARE).clamp(MIN_EDGE, MAX_EDGE)
 }
@@ -200,10 +191,7 @@ mod tests {
         assert_eq!(left.top(), 0.0);
         assert_eq!(left.left(), 0.0);
         assert!((right.right() - 1920.0).abs() < 0.01);
-        let uv = visible_uv(left, left.intersect(stage()));
-        assert_eq!(uv.min, pos2(0.0, 0.0));
-        assert!((uv.max.x - 1920.0 / 2580.0).abs() < 0.001);
-        assert!((uv.max.y - 1.0).abs() < 0.001);
+        assert_eq!(left.width(), 2580.0);
     }
 
     #[test]

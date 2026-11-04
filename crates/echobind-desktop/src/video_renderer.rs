@@ -24,9 +24,6 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
-// The part of the frame to show: uv origin in xy, uv size in zw.
-@group(0) @binding(4) var<uniform> crop: vec4<f32>;
-
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     var positions = array<vec2<f32>, 3>(
@@ -41,7 +38,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     );
     var output: VertexOutput;
     output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-    output.uv = crop.xy + uvs[vertex_index] * crop.zw;
+    output.uv = uvs[vertex_index];
     return output;
 }
 
@@ -143,7 +140,6 @@ pub(super) struct YuvVideoRenderer {
     i420_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    crop: wgpu::Buffer,
     frame: Option<UploadedFrame>,
     presented_frames: Arc<AtomicU64>,
     present_latency_us: Arc<AtomicU64>,
@@ -178,7 +174,6 @@ impl YuvVideoRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                crop_layout_entry(4),
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -229,7 +224,6 @@ impl YuvVideoRenderer {
             i420_pipeline: pipeline("fs_i420", "echobind_yuv_i420_pipeline"),
             bind_group_layout,
             sampler,
-            crop: create_crop_buffer(device, "echobind_yuv_crop"),
             frame: None,
             presented_frames,
             present_latency_us,
@@ -367,10 +361,6 @@ impl YuvVideoRenderer {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.crop.as_entire_binding(),
-                },
             ],
         });
         UploadedFrame {
@@ -451,79 +441,59 @@ fn write_plane(
     Ok(())
 }
 
-/// The shaders' crop uniform layout entry, read by the vertex stage.
-pub(super) fn crop_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::VERTEX,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
+/// The largest viewport side wgpu accepts on any adapter.
+const MAX_VIEWPORT_PX: f32 = 8192.0;
+
+/// The viewport, in pixels, that stretches the frame across `video`.
+///
+/// egui clamps a callback's viewport to the screen, which would squash a
+/// cropped picture. A viewport may reach past the screen, though, so this one
+/// covers the whole picture and the paint's clip rect keeps only what shows.
+/// None when it is too large for wgpu, which keeps egui's own.
+pub(super) fn video_viewport(video: egui::Rect, pixels_per_point: f32) -> Option<[f32; 4]> {
+    let size = video.size() * pixels_per_point;
+    (size.x <= MAX_VIEWPORT_PX && size.y <= MAX_VIEWPORT_PX).then_some([
+        video.min.x * pixels_per_point,
+        video.min.y * pixels_per_point,
+        size.x,
+        size.y,
+    ])
+}
+
+pub(super) fn set_video_viewport(
+    render_pass: &mut wgpu::RenderPass<'_>,
+    video: egui::Rect,
+    pixels_per_point: f32,
+) {
+    if let Some([x, y, width, height]) = video_viewport(video, pixels_per_point) {
+        render_pass.set_viewport(x, y, width, height, 0.0, 1.0);
     }
 }
 
-/// Creates the crop uniform, showing the whole frame until a paint sets it.
-pub(super) fn create_crop_buffer(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
-    use wgpu::util::DeviceExt;
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: &crop_bytes(egui::Rect::from_min_max(
-            egui::Pos2::ZERO,
-            egui::pos2(1.0, 1.0),
-        )),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    })
-}
-
-/// The crop uniform for the frame's `uv` region: its origin, then its size.
-pub(super) fn crop_bytes(uv: egui::Rect) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    let values = [uv.min.x, uv.min.y, uv.width(), uv.height()];
-    for (chunk, value) in bytes.chunks_exact_mut(4).zip(values) {
-        chunk.copy_from_slice(&value.to_ne_bytes());
-    }
-    bytes
-}
-
-/// Paints the part of the frame that `uv` selects.
+/// Paints the frame across `video`, which may reach past the paint's rect.
 #[derive(Clone)]
 struct YuvVideoPaintCallback {
-    uv: egui::Rect,
+    video: egui::Rect,
 }
 
 impl CallbackTrait for YuvVideoPaintCallback {
-    fn prepare(
-        &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(renderer) = callback_resources.get::<YuvVideoRenderer>() {
-            queue.write_buffer(&renderer.crop, 0, &crop_bytes(self.uv));
-        }
-        Vec::new()
-    }
-
     fn paint(
         &self,
-        _info: egui::PaintCallbackInfo,
+        info: egui::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &CallbackResources,
     ) {
         if let Some(renderer) = callback_resources.get::<YuvVideoRenderer>() {
+            set_video_viewport(render_pass, self.video, info.pixels_per_point);
             renderer.draw(render_pass);
         }
     }
 }
 
-/// Paints the frame's `uv` region (0 to 1 on each axis) into `rect`.
-pub(super) fn paint_callback(rect: egui::Rect, uv: egui::Rect) -> egui::PaintCallback {
-    egui_wgpu::Callback::new_paint_callback(rect, YuvVideoPaintCallback { uv })
+/// Paints the visible `rect` of a frame laid out across `video`. Paint it
+/// with a painter clipped to `rect`.
+pub(super) fn paint_callback(rect: egui::Rect, video: egui::Rect) -> egui::PaintCallback {
+    egui_wgpu::Callback::new_paint_callback(rect, YuvVideoPaintCallback { video })
 }
 
 #[cfg(test)]
@@ -532,6 +502,10 @@ mod tests {
 
     const WIDTH: u32 = 8;
     const HEIGHT: u32 = 4;
+
+    /// Keeps the GPU tests to one device at a time, which a software adapter
+    /// such as WARP on a CI runner handles more reliably.
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -544,13 +518,13 @@ mod tests {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
     }
 
-    /// Renders `frame`'s `uv` region into an RGBA texture and reads back its
-    /// pixels.
+    /// Renders `frame` into an RGBA texture, across `video` when given, and
+    /// reads back its pixels.
     fn render(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         frame: &YuvFrame,
-        uv: Option<egui::Rect>,
+        video: Option<egui::Rect>,
     ) -> Vec<[u8; 4]> {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut renderer = YuvVideoRenderer::new(
@@ -569,9 +543,6 @@ mod tests {
                 Instant::now(),
             )
             .unwrap();
-        if let Some(uv) = uv {
-            queue.write_buffer(&renderer.crop, 0, &crop_bytes(uv));
-        }
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -611,6 +582,9 @@ mod tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(video) = video {
+                set_video_viewport(&mut pass, video, 1.0);
+            }
             renderer.draw(&mut pass);
         }
         encoder.copy_texture_to_buffer(
@@ -671,6 +645,9 @@ mod tests {
 
     #[test]
     fn padded_i420_and_nv12_planes_render_the_same_colour() {
+        let _gpu = GPU
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some((device, queue)) = gpu() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -700,21 +677,24 @@ mod tests {
     }
 
     #[test]
-    fn a_crop_shows_only_its_part_of_the_frame() {
+    fn a_picture_wider_than_the_target_is_cropped_not_squashed() {
+        let _gpu = GPU
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some((device, queue)) = gpu() else {
             eprintln!("skipping: no GPU adapter");
             return;
         };
         let (w, h) = (WIDTH as usize, HEIGHT as usize);
         // Black on the left half, white on the right.
-        let mut y = plane(16, w, w, h);
-        for row in y.data.chunks_mut(w) {
-            row[w / 2..].fill(235);
+        let mut y = plane(16, w, w + 8, h);
+        for row in y.data.chunks_mut(w + 8) {
+            row[w / 2..w].fill(235);
         }
         let frame = YuvFrame::I420 {
             y,
-            u: plane(128, w / 2, w / 2, h / 2),
-            v: plane(128, w / 2, w / 2, h / 2),
+            u: plane(128, w / 2, w / 2 + 8, h / 2),
+            v: plane(128, w / 2, w / 2 + 8, h / 2),
         };
         let columns = |pixels: &[[u8; 4]], range: std::ops::Range<usize>| -> Vec<[u8; 4]> {
             pixels
@@ -725,14 +705,31 @@ mod tests {
 
         let whole = render(&device, &queue, &frame, None);
         assert_close(&columns(&whole, 0..w / 2), [0, 0, 0]);
-        let right = egui::Rect::from_min_max(egui::pos2(0.5, 0.0), egui::pos2(1.0, 1.0));
-        let cropped = render(&device, &queue, &frame, Some(right));
+        // Twice the target's width, panned to its right half.
+        let video = egui::Rect::from_min_size(
+            egui::pos2(-(WIDTH as f32), 0.0),
+            egui::vec2(2.0 * WIDTH as f32, HEIGHT as f32),
+        );
+        let cropped = render(&device, &queue, &frame, Some(video));
         // Column 0 blends with the black texel across the crop's edge.
         assert_close(&columns(&cropped, 1..w), [255, 255, 255]);
     }
 
     #[test]
+    fn viewports_too_large_for_wgpu_are_left_to_egui() {
+        let video = egui::Rect::from_min_size(egui::pos2(-640.0, 0.0), egui::vec2(2580.0, 1080.0));
+        assert_eq!(
+            video_viewport(video, 2.0),
+            Some([-1280.0, 0.0, 5160.0, 2160.0])
+        );
+        assert_eq!(video_viewport(video, 4.0), None);
+    }
+
+    #[test]
     fn short_planes_are_rejected_instead_of_read_past_their_end() {
+        let _gpu = GPU
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some((device, queue)) = gpu() else {
             eprintln!("skipping: no GPU adapter");
             return;
