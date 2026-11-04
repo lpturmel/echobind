@@ -1,4 +1,5 @@
 mod control;
+mod framing;
 mod views;
 
 use crate::{
@@ -133,6 +134,8 @@ pub struct EchobindApp {
     /// Whether viewers may drive this computer's keyboard and mouse.
     share_remote_control: bool,
     control: control::RemoteControl,
+    /// Fit or fill for the remote video, and where a filled one is panned.
+    framing: framing::Framing,
     watch_volume: u32,
     watch_muted: bool,
     share_volume: u32,
@@ -291,6 +294,7 @@ impl EchobindApp {
             share_audio_only: false,
             share_remote_control: true,
             control: control::RemoteControl::default(),
+            framing: framing::Framing::default(),
             watch_volume: 100,
             watch_muted: false,
             share_volume: 100,
@@ -921,6 +925,7 @@ impl EchobindApp {
         self.peer_video = None;
         self.remote_cursor = None;
         self.control = control::RemoteControl::default();
+        self.framing.recenter();
         self.clear_texture();
         self.stream_fps = 0.0;
         self.received_fps = 0.0;
@@ -1154,31 +1159,33 @@ impl EchobindApp {
         context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
     }
 
-    /// Paints the remote video letterboxed inside `area` and returns its rect.
-    fn paint_video(&self, ui: &egui::Ui, area: egui::Rect) -> egui::Rect {
+    /// Paints the remote video inside `area`, letterboxed or filling it.
+    fn paint_video(&mut self, ui: &egui::Ui, area: egui::Rect) -> control::Stage {
         if !self.has_video() || self.stream_width == 0 || self.stream_height == 0 {
-            return egui::Rect::NOTHING;
+            return control::Stage::new(egui::Rect::NOTHING, egui::Rect::NOTHING);
         }
         let source = egui::vec2(self.stream_width as f32, self.stream_height as f32);
-        let scale = (area.width() / source.x)
-            .min(area.height() / source.y)
-            .max(0.01);
-        let video_rect = egui::Rect::from_center_size(area.center(), source * scale);
+        let video_rect = self.frame_video(ui.ctx(), area, source);
+        let view = video_rect.intersect(area);
+        // Only the visible part is drawn: the GPU path cannot draw off screen.
+        let uv = framing::visible_uv(video_rect, view);
         if self.nv12_ready {
             #[cfg(target_os = "macos")]
             ui.painter().add(egui::Shape::Callback(
-                crate::video_renderer_macos::paint_callback(video_rect),
+                crate::video_renderer_macos::paint_callback(view, uv),
             ));
         } else if let Some(texture) = &self.texture {
-            egui::Image::from_texture((texture.id, source)).paint_at(ui, video_rect);
+            egui::Image::from_texture((texture.id, source))
+                .uv(uv)
+                .paint_at(ui, view);
         }
-        self.paint_remote_cursor(ui, video_rect);
-        video_rect
+        self.paint_remote_cursor(&ui.painter_at(view), video_rect);
+        control::Stage::new(video_rect, view)
     }
 
     /// Draws the host's pointer for a viewer that only watches. A viewer in
     /// control uses its own native cursor, which the host's pointer follows.
-    fn paint_remote_cursor(&self, ui: &egui::Ui, video_rect: egui::Rect) {
+    fn paint_remote_cursor(&self, painter: &egui::Painter, video_rect: egui::Rect) {
         if self.controlling() {
             return;
         }
@@ -1211,7 +1218,7 @@ impl EchobindApp {
             origin + egui::vec2(1.5, 22.0),
             origin + egui::vec2(14.0, 14.0),
         ];
-        ui.painter().add(egui::Shape::convex_polygon(
+        painter.add(egui::Shape::convex_polygon(
             points,
             egui::Color32::WHITE,
             egui::Stroke::new(2.0, egui::Color32::BLACK),
@@ -1235,6 +1242,9 @@ impl eframe::App for EchobindApp {
         if self.mode == Mode::Connect && context.input(|input| input.key_pressed(egui::Key::F10)) {
             self.health_open = !self.health_open;
         }
+        if self.mode == Mode::Connect && context.input(|input| input.key_pressed(egui::Key::F9)) {
+            self.framing.fill = !self.framing.fill;
+        }
         self.process_session_updates(&context);
         self.forward_input(&context);
         // Saved hosts are probed only while their list is on screen.
@@ -1248,11 +1258,7 @@ impl eframe::App for EchobindApp {
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(ui, |ui| {
                     let area = ui.max_rect();
-                    let video = self.paint_video(ui, area);
-                    self.control.stage = Some(control::Stage {
-                        video,
-                        blockers: Vec::new(),
-                    });
+                    self.control.stage = Some(self.paint_video(ui, area));
                     if self.reconnecting {
                         ui.painter().rect_filled(area, 0, views::DIM_FILL);
                         self.reconnect_message(ui, area);

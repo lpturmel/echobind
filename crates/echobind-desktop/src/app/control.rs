@@ -17,8 +17,21 @@ const UNITS_PER_NOTCH: f32 = 120.0;
 
 /// Where a frame drew the remote video, and the controls drawn over it.
 pub(super) struct Stage {
+    /// The whole picture, which reaches past `view` when it is cropped.
     pub(super) video: Rect,
+    /// The part of the picture on screen.
+    pub(super) view: Rect,
     pub(super) blockers: Vec<Rect>,
+}
+
+impl Stage {
+    pub(super) fn new(video: Rect, view: Rect) -> Self {
+        Self {
+            video,
+            view,
+            blockers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -27,6 +40,8 @@ pub(super) struct RemoteControl {
     pub(super) stage: Option<Stage>,
     /// The host has the keyboard.
     pub(super) keyboard: bool,
+    /// The last frame's blockers, for panning before this frame draws its own.
+    blockers: Vec<Rect>,
     buttons: Vec<MouseButton>,
     keys: Vec<u16>,
     scroll: Vec2,
@@ -35,6 +50,15 @@ pub(super) struct RemoteControl {
 impl RemoteControl {
     fn holds_anything(&self) -> bool {
         !self.buttons.is_empty() || !self.keys.is_empty()
+    }
+
+    /// A mouse button is down on the host, as in a drag.
+    pub(super) fn dragging(&self) -> bool {
+        !self.buttons.is_empty()
+    }
+
+    pub(super) fn blocked(&self, pos: Pos2) -> bool {
+        self.blockers.iter().any(|blocker| blocker.contains(pos))
     }
 
     /// Registers a control drawn over the video, which keeps its clicks.
@@ -68,8 +92,9 @@ impl EchobindApp {
         if fullscreen {
             self.control.keyboard = true;
         }
+        self.control.blockers.clone_from(&stage.blockers);
         let over_stage = |pos: Pos2| {
-            stage.video.contains(pos)
+            stage.view.contains(pos)
                 && !stage.blockers.iter().any(|blocker| blocker.contains(pos))
                 // Menus and popups float above the video.
                 && context
@@ -223,6 +248,16 @@ impl EchobindApp {
         }
     }
 
+    /// Moves the host's pointer to what is under the viewer's again, after
+    /// the picture panned beneath it.
+    pub(super) fn repoint(&self, video: Rect, pos: Pos2) {
+        let mut inputs = Vec::new();
+        push_move(&mut inputs, video, pos);
+        if let Some(session) = &self.session {
+            session.send_input(inputs);
+        }
+    }
+
     /// Ends forwarding, as when the video goes away or the host disconnects.
     pub(super) fn release_control(&mut self) {
         if self.control.holds_anything() {
@@ -235,9 +270,9 @@ impl EchobindApp {
 }
 
 /// Keys the app keeps for itself: F11 toggles fullscreen, F10 the stream
-/// stats, and Escape leaves fullscreen.
+/// stats, F9 fit or fill, and Escape leaves fullscreen.
 fn reserved(key: Key, fullscreen: bool) -> bool {
-    matches!(key, Key::F10 | Key::F11) || (fullscreen && key == Key::Escape)
+    matches!(key, Key::F9 | Key::F10 | Key::F11) || (fullscreen && key == Key::Escape)
 }
 
 fn push_move(inputs: &mut Vec<ControlInput>, video: Rect, pos: Pos2) {
@@ -390,6 +425,7 @@ mod tests {
     fn only_app_shortcuts_stay_local() {
         assert!(reserved(Key::F11, false));
         assert!(reserved(Key::F10, false));
+        assert!(reserved(Key::F9, false));
         assert!(!reserved(Key::Escape, false));
         assert!(reserved(Key::Escape, true));
         assert!(!reserved(Key::A, true));

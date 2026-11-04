@@ -26,6 +26,9 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
+// The part of the frame to show: uv origin in xy, uv size in zw.
+@group(0) @binding(3) var<uniform> crop: vec4<f32>;
+
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     var positions = array<vec2<f32>, 3>(
@@ -40,7 +43,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     );
     var output: VertexOutput;
     output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-    output.uv = uvs[vertex_index];
+    output.uv = crop.xy + uvs[vertex_index] * crop.zw;
     return output;
 }
 
@@ -102,6 +105,7 @@ pub(super) struct MacVideoRenderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    crop: wgpu::Buffer,
     frame: Option<ImportedNv12Frame>,
     presented_frames: Arc<AtomicU64>,
     present_latency_us: Arc<AtomicU64>,
@@ -171,6 +175,16 @@ impl MacVideoRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -178,6 +192,12 @@ impl MacVideoRenderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
+        });
+        let crop = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("echobind_nv12_crop"),
+            size: CROP_BYTES as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("echobind_nv12_shader"),
@@ -219,6 +239,7 @@ impl MacVideoRenderer {
             pipeline,
             bind_group_layout,
             sampler,
+            crop,
             frame: None,
             presented_frames,
             present_latency_us,
@@ -290,6 +311,10 @@ impl MacVideoRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.crop.as_entire_binding(),
                 },
             ],
         });
@@ -397,10 +422,39 @@ fn import_metal_texture(
     )
 }
 
+const CROP_BYTES: usize = 16;
+
+/// Paints the part of the frame that `uv` selects.
 #[derive(Clone)]
-pub(super) struct MacVideoPaintCallback;
+pub(super) struct MacVideoPaintCallback {
+    uv: egui::Rect,
+}
 
 impl CallbackTrait for MacVideoPaintCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        if let Some(renderer) = callback_resources.get::<MacVideoRenderer>() {
+            let mut bytes = [0; CROP_BYTES];
+            let values = [
+                self.uv.min.x,
+                self.uv.min.y,
+                self.uv.width(),
+                self.uv.height(),
+            ];
+            for (chunk, value) in bytes.chunks_exact_mut(4).zip(values) {
+                chunk.copy_from_slice(&value.to_ne_bytes());
+            }
+            queue.write_buffer(&renderer.crop, 0, &bytes);
+        }
+        Vec::new()
+    }
+
     fn paint(
         &self,
         _info: egui::PaintCallbackInfo,
@@ -430,6 +484,7 @@ impl CallbackTrait for MacVideoPaintCallback {
     }
 }
 
-pub(super) fn paint_callback(rect: egui::Rect) -> egui::PaintCallback {
-    egui_wgpu::Callback::new_paint_callback(rect, MacVideoPaintCallback)
+/// Paints the frame's `uv` region (0 to 1 on each axis) into `rect`.
+pub(super) fn paint_callback(rect: egui::Rect, uv: egui::Rect) -> egui::PaintCallback {
+    egui_wgpu::Callback::new_paint_callback(rect, MacVideoPaintCallback { uv })
 }
