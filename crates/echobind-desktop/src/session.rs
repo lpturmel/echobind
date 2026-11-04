@@ -1,4 +1,8 @@
-use crate::{trust::TrustedIds, video::I420Frame};
+use crate::{
+    trust::TrustedIds,
+    video::I420Frame,
+    video_renderer::{YuvFrame, YuvPlane},
+};
 use echobind_core::{
     input::{ClipboardAssembler, EventReceiver, EventSender, RemoteEvent},
     protocol::{
@@ -57,6 +61,10 @@ mod remote_input;
 #[cfg(target_os = "macos")]
 #[path = "decoder_macos.rs"]
 mod decoder_macos;
+
+#[cfg(target_os = "windows")]
+#[path = "decoder_windows.rs"]
+mod decoder_windows;
 
 #[cfg(target_os = "macos")]
 #[path = "hardware_macos.rs"]
@@ -337,13 +345,13 @@ pub(super) struct DisplayFrame {
     pub width: usize,
     pub height: usize,
     pub data: DisplayFrameData,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub published_at: Instant,
 }
 
 #[derive(Clone, Debug)]
 pub(super) enum DisplayFrameData {
-    Rgba(Vec<u8>),
+    /// Decoded planes the GPU converts to RGB while drawing.
+    Yuv(YuvFrame),
     #[cfg(target_os = "macos")]
     Nv12(apple_cf::cv::CVPixelBuffer),
 }
@@ -2634,6 +2642,28 @@ fn spawn_video_decoder(
             }
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            match decoder_windows::run_decoder(
+                running.clone(),
+                decode_queue.clone(),
+                latest_frame.clone(),
+                metrics.clone(),
+                needs_keyframe.clone(),
+                events.clone(),
+                frame_notifier.clone(),
+            ) {
+                Ok(()) => return,
+                Err(error) => {
+                    warn!("Media Foundation decoder unavailable: {error}");
+                    let _ = events.send(SessionEvent::VideoBackend(format!(
+                        "OpenH264 fallback (Media Foundation unavailable: {error})"
+                    )));
+                    needs_keyframe.store(true, Ordering::Release);
+                }
+            }
+        }
+
         if let Err(error) = run_software_video_decoder(
             running,
             decode_queue,
@@ -2685,17 +2715,27 @@ fn run_software_video_decoder(
             Ordering::Relaxed,
         );
         metrics.decode_queue_samples.fetch_add(1, Ordering::Relaxed);
-        let frame = received.frame;
+        let mut frame = received.frame;
+        if frame.is_keyframe {
+            cap_sps_level_for_openh264(&mut frame.payload);
+        }
         let decode_started = Instant::now();
         match decoder.decode(&frame.payload) {
             Ok(Some(decoded)) => {
+                // Hand the planes to the GPU as decoded; converting to RGBA
+                // here cost as much as decoding at 1440p.
                 let (width, height) = decoded.dimensions();
-                let mut rgba = vec![0; width * height * 4];
-                decoded.write_rgba8(&mut rgba);
+                let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+                let (y_stride, u_stride, v_stride) = decoded.strides();
+                let yuv = YuvFrame::I420 {
+                    y: YuvPlane::copy_rows(decoded.y(), y_stride, width, height),
+                    u: YuvPlane::copy_rows(decoded.u(), u_stride, chroma_width, chroma_height),
+                    v: YuvPlane::copy_rows(decoded.v(), v_stride, chroma_width, chroma_height),
+                };
                 *latest_frame.lock().unwrap() = Some(DisplayFrame {
                     width,
                     height,
-                    data: DisplayFrameData::Rgba(rgba),
+                    data: DisplayFrameData::Yuv(yuv),
                     published_at: Instant::now(),
                 });
                 frame_notifier();
@@ -2718,6 +2758,41 @@ fn run_software_video_decoder(
         }
     }
     Ok(())
+}
+
+/// The highest H.264 level OpenH264 parses (5.2).
+const OPENH264_MAX_LEVEL_IDC: u8 = 52;
+
+/// Lowers any SPS level above 5.2 to 5.2 so OpenH264 accepts the stream.
+///
+/// NVENC picks level 6.x for high resolutions at high frame rates, such as
+/// 1440p or 4K above 60 FPS. OpenH264 rejects every SPS above 5.2, so each
+/// IDR fails and the viewer keeps requesting new ones without ever showing a
+/// picture. The level only states the decoder throughput a stream needs;
+/// OpenH264 still checks the picture size itself against level 5.2.
+fn cap_sps_level_for_openh264(payload: &mut [u8]) {
+    cap_sps_level(payload, OPENH264_MAX_LEVEL_IDC);
+}
+
+/// Lowers any SPS level above `max_level_idc` to it.
+pub(super) fn cap_sps_level(payload: &mut [u8], max_level_idc: u8) {
+    let mut position = 0;
+    while let Some(offset) = payload
+        .get(position..)
+        .and_then(|rest| rest.windows(3).position(|window| window == [0, 0, 1]))
+    {
+        let header = position + offset + 3;
+        // NAL header, profile_idc, constraint flags, then level_idc. A
+        // nonzero profile_idc means no emulation-prevention byte comes first.
+        if payload.get(header).is_some_and(|nal| nal & 0x1f == 7) {
+            if let Some(level) = payload.get_mut(header + 3) {
+                if *level > max_level_idc {
+                    *level = max_level_idc;
+                }
+            }
+        }
+        position = header;
+    }
 }
 
 fn request_keyframe(socket: &UdpSocket, outgoing: &mut Vec<u8>) {
@@ -3305,5 +3380,55 @@ mod tests {
             )),
             DecodeQueuePush::Stale
         );
+    }
+
+    /// One OpenH264-encoded IDR whose SPS claims `level_idc`, as NVENC
+    /// writes for high resolutions at high frame rates.
+    fn idr_with_level(level_idc: u8) -> Vec<u8> {
+        let (width, height) = (64_u32, 64_u32);
+        let mut source = I420Frame::default();
+        source
+            .update_from_nv12(&YUVFrame {
+                display_time: 0,
+                width: width as i32,
+                height: height as i32,
+                luminance_bytes: vec![96; (width * height) as usize],
+                luminance_stride: width as i32,
+                chrominance_bytes: vec![128; (width * height / 2) as usize],
+                chrominance_stride: width as i32,
+            })
+            .unwrap();
+        let mut payload = Encoder::new().unwrap().encode(&source).unwrap().to_vec();
+        let sps = payload
+            .windows(4)
+            .position(|window| window[..3] == [0, 0, 1] && window[3] & 0x1f == 7)
+            .expect("an IDR carries its SPS");
+        payload[sps + 6] = level_idc;
+        payload
+    }
+
+    #[test]
+    fn the_software_decoder_accepts_level_6_streams() {
+        let mut payload = idr_with_level(60);
+        assert!(
+            Decoder::new().unwrap().decode(&payload).is_err(),
+            "OpenH264 rejects level 6.0 as is"
+        );
+
+        cap_sps_level_for_openh264(&mut payload);
+        let mut decoder = Decoder::new().unwrap();
+        let decoded = decoder
+            .decode(&payload)
+            .unwrap()
+            .expect("the capped IDR decodes to a picture");
+        assert_eq!(decoded.dimensions(), (64, 64));
+    }
+
+    #[test]
+    fn capping_leaves_supported_levels_alone() {
+        let mut payload = idr_with_level(51);
+        let original = payload.clone();
+        cap_sps_level_for_openh264(&mut payload);
+        assert_eq!(payload, original);
     }
 }

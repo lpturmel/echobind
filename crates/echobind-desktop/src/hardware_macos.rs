@@ -1118,7 +1118,7 @@ mod tests {
                     .set_frame(&device, pixel_buffer.clone(), decoded.published_at)
                     .expect("NV12 IOSurface should import into Metal without copying");
             }
-            DisplayFrameData::Rgba(_) => panic!("expected zero-copy NV12 output"),
+            DisplayFrameData::Yuv(_) => panic!("expected zero-copy NV12 output"),
         }
     }
 

@@ -175,16 +175,7 @@ impl MacVideoRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                crate::video_renderer::crop_layout_entry(3),
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -193,12 +184,7 @@ impl MacVideoRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let crop = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("echobind_nv12_crop"),
-            size: CROP_BYTES as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let crop = crate::video_renderer::create_crop_buffer(device, "echobind_nv12_crop");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("echobind_nv12_shader"),
             source: wgpu::ShaderSource::Wgsl(NV12_SHADER.into()),
@@ -422,8 +408,6 @@ fn import_metal_texture(
     )
 }
 
-const CROP_BYTES: usize = 16;
-
 /// Paints the part of the frame that `uv` selects.
 #[derive(Clone)]
 pub(super) struct MacVideoPaintCallback {
@@ -440,17 +424,11 @@ impl CallbackTrait for MacVideoPaintCallback {
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if let Some(renderer) = callback_resources.get::<MacVideoRenderer>() {
-            let mut bytes = [0; CROP_BYTES];
-            let values = [
-                self.uv.min.x,
-                self.uv.min.y,
-                self.uv.width(),
-                self.uv.height(),
-            ];
-            for (chunk, value) in bytes.chunks_exact_mut(4).zip(values) {
-                chunk.copy_from_slice(&value.to_ne_bytes());
-            }
-            queue.write_buffer(&renderer.crop, 0, &bytes);
+            queue.write_buffer(
+                &renderer.crop,
+                0,
+                &crate::video_renderer::crop_bytes(self.uv),
+            );
         }
         Vec::new()
     }
