@@ -13,6 +13,7 @@ pub enum Icon {
     Volume,
     Activity,
     Maximize,
+    Fill,
     Close,
     Check,
     Stop,
@@ -161,6 +162,12 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             (6.0, 12.0),
             (2.0, 12.0),
         ])),
+        Icon::Fill => {
+            rounded_rect((2.0, 5.0), (22.0, 19.0), 2.0);
+            segment((6.0, 12.0), (18.0, 12.0));
+            line(grid.points(&[(9.0, 9.0), (6.0, 12.0), (9.0, 15.0)]));
+            line(grid.points(&[(15.0, 9.0), (18.0, 12.0), (15.0, 15.0)]));
+        }
         Icon::Maximize => {
             for (start, center, from, to, end) in [
                 ((8.0, 3.0), (5.0, 5.0), -90.0, -180.0, (3.0, 8.0)),

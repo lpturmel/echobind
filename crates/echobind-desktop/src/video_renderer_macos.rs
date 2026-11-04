@@ -397,13 +397,16 @@ fn import_metal_texture(
     )
 }
 
+/// Paints the frame across `video`, which may reach past the paint's rect.
 #[derive(Clone)]
-pub(super) struct MacVideoPaintCallback;
+pub(super) struct MacVideoPaintCallback {
+    video: egui::Rect,
+}
 
 impl CallbackTrait for MacVideoPaintCallback {
     fn paint(
         &self,
-        _info: egui::PaintCallbackInfo,
+        info: egui::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &CallbackResources,
     ) {
@@ -413,6 +416,7 @@ impl CallbackTrait for MacVideoPaintCallback {
         let Some(frame) = &renderer.frame else {
             return;
         };
+        crate::video_renderer::set_video_viewport(render_pass, self.video, info.pixels_per_point);
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &frame.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
@@ -430,6 +434,8 @@ impl CallbackTrait for MacVideoPaintCallback {
     }
 }
 
-pub(super) fn paint_callback(rect: egui::Rect) -> egui::PaintCallback {
-    egui_wgpu::Callback::new_paint_callback(rect, MacVideoPaintCallback)
+/// Paints the visible `rect` of a frame laid out across `video`. Paint it
+/// with a painter clipped to `rect`.
+pub(super) fn paint_callback(rect: egui::Rect, video: egui::Rect) -> egui::PaintCallback {
+    egui_wgpu::Callback::new_paint_callback(rect, MacVideoPaintCallback { video })
 }

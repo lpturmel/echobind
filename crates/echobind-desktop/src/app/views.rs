@@ -1061,11 +1061,7 @@ impl EchobindApp {
         };
 
         paint_stage(ui, stage);
-        let video = self.paint_video(ui, stage.shrink(1.0));
-        self.control.stage = Some(super::control::Stage {
-            video,
-            blockers: Vec::new(),
-        });
+        self.control.stage = Some(self.paint_video(ui, stage.shrink(1.0)));
         mask_stage_corners(ui, stage);
         if self.reconnecting {
             ui.painter()
@@ -1168,7 +1164,7 @@ impl EchobindApp {
         } else {
             40.0 + 4.0 + volume_slider_width + 4.0 + 28.0
         };
-        let buttons_width = volume_width + 40.0 * 2.0 + disconnect_width + 8.0 * 3.0;
+        let buttons_width = volume_width + 40.0 * 3.0 + disconnect_width + 8.0 * 4.0;
         let width =
             8.0 + if readout_width > 0.0 {
                 readout_width + 8.0 + 1.0 + 8.0
@@ -1264,6 +1260,14 @@ impl EchobindApp {
                     } else {
                         self.health_open = !self.health_open;
                     }
+                }
+                let (fill_kind, fill_tip) = if self.framing.fill {
+                    (IconButtonKind::Pressed, "Fit the whole screen (F9)")
+                } else {
+                    (IconButtonKind::Ghost, "Fill the window (F9)")
+                };
+                if widgets::icon_button(ui, Icon::Fill, fill_tip, fill_kind).clicked() {
+                    self.framing.fill = !self.framing.fill;
                 }
                 if widgets::icon_button(
                     ui,
@@ -1663,6 +1667,7 @@ impl EchobindApp {
                             });
                             widgets::key_hint(ui, &["F11", "Esc"], "or", "to exit fullscreen");
                             widgets::key_hint(ui, &["F10"], "", "hides these stats");
+                            widgets::key_hint(ui, &["F9"], "", "fills or fits the screen");
                         });
                     });
             });

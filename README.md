@@ -62,7 +62,7 @@ The viewer's own cursor is the pointer: moving it over the video moves the
 host's pointer to the same spot, with no cursor drawn into the stream. Click
 the video to give the host the keyboard; click anywhere else in Echobind, or
 switch apps, to take it back. Fullscreen always forwards the keyboard. F11,
-F10, and Escape in fullscreen stay with Echobind.
+F10, F9, and Escape in fullscreen stay with Echobind.
 
 Keys travel as physical key positions, so the host's own keyboard layout
 decides what they type. Copy, cut, and paste use the host's shortcut, so
@@ -82,6 +82,14 @@ or the lock screen unless Echobind itself runs elevated.
 
 Press F10 while watching, or use the activity button in the toolbar, to hide
 or show the stream statistics, in fullscreen as well.
+
+The viewer letterboxes a host screen whose shape differs from its own, such as
+an ultrawide host on a 16:9 viewer. Press F9, or use the fill button in the
+toolbar, to fill the window instead and crop the overflow. A filled picture
+pans to show the rest: in control, push the pointer against a cropped edge to
+scroll that way, and the host's pointer stays on what is under yours; when
+only watching, the view follows the host's pointer. Fill scales the stream up,
+so it is a little softer than fit.
 
 If a viewer hears nothing from the host for 5 seconds, the stream pauses and
 the viewer reconnects on its own. The host releases a silent viewer after 10
